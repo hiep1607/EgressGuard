@@ -11,7 +11,7 @@ Status vocabulary in this report is deliberate: `Verified` means exercised on th
 |---|---|---|
 | Locked restore | Verified | .NET SDK 8.0.423; locked restore completed. |
 | Release build | Verified | 0 warnings, 0 errors. |
-| Executable tests | Verified | 32/32 passed, including graceful cancellation, process-tree cleanup, exact-rule reconciliation, concurrency and automatic firewall rollback regressions. |
+| Executable tests | Verified | 34/34 passed, including graceful cancellation, process-tree cleanup, complete firewall semantics, exact-rule reconciliation, concurrency and automatic firewall rollback regressions. |
 | Format verification | Verified | `dotnet format --verify-no-changes --no-restore` exited 0. |
 | Event architecture | Integration tested | Real Named Pipe subscription, reconnect, sequence, bounded overflow/resync and slow-client tests passed. |
 | Authenticode behavior | Verified | Embedded-signed .NET host, catalog-signed Windows binary, unsigned apphost, tampered signed file and missing file are covered. |
@@ -72,6 +72,14 @@ Phase 3.5.1 changes only the PowerShell/firewall mutation runner and the service
 A fresh 2-minute smoke run `20260809T153826754Z-44c3679c3f324a6c9a5b528ecf4f05d9` completed 40 traffic/IPC cycles, 8 service restarts, 14 UI opens, 13 scheduled closes and 0 failures. The database lock was released; both strict inspections succeeded with zero EgressGuard process and zero owned firewall rule. A separate post-smoke inspection also found zero SCM service, UI/service process, test-owned PowerShell process and owned rule.
 
 The 30-minute soak was not repeated because neither the soak harness nor lifecycle/reconnect behavior changed. Targeted process-tree tests, the real firewall cancellation integration and the 2-minute lifecycle smoke cover the Phase 3.5.1 risk. The earlier 30-minute evidence remains scoped only to tested commit `c7273caac1106d54d5b327bfde20b13c7c2187f3`.
+
+## Post-merge pre-reboot checkpoint
+
+Source commit `c7689c4ba33dcfb9809163173a7e82a655a8c8ea` was rebuilt on branch `acceptance/post-merge-windows`. Locked restore and format verification passed; the Release build completed with 0 warnings and 0 errors, all 34 executable tests passed, and the vulnerable dependency audit was clean. The 30-minute soak was not repeated.
+
+A fresh framework-dependent service artifact was published to a new isolated runtime directory. `EgressGuard.Service.exe` SHA-256 is `CE8CE2AEB3C67508966B0FA5F0244232FA645D5270C74625E468842CE0DEF8E7`; `EgressGuard.Service.dll` SHA-256 is `E16A797BEB0170C93EEF2C8182435ABE8785A9954AF76FC752EBAFD62A86679E`. Both files are `NotSigned`; read-only inspection found no eligible code-signing certificate with a private key, so production signing remains blocked pending owner/administrator action.
+
+Before the manual reboot, SCM reported the service `Running`, automatic start, `LocalSystem`, the expected artifact path, recovery restarts after 5 and 15 seconds, and failure actions enabled for non-crash failures. The UI connected and displayed `Service online · Monitor · dropped 0`; a graceful UI close left the service running and no UI process. No firewall rule was created for reboot preparation. The sanitized continuation state is recorded in [`docs/evidence/post-merge-acceptance-state.json`](evidence/post-merge-acceptance-state.json) with stage `AwaitingManualReboot`. Reboot acceptance remains `NotVerified` until the recorded boot time advances and the post-boot checklist passes.
 
 ## Remaining manual acceptance
 
