@@ -73,7 +73,7 @@ Every firewall test must have cleanup. The Phase 3.5 framework-dependent service
 
 Firewall PowerShell mutations have finite timeouts and owned process-tree cleanup. An interrupted create is reconciled against the exact rule identity and ownership marker before cancellation is returned to the caller.
 
-The soak harness creates an isolated run/database directory for every invocation and treats a failed process or firewall cleanup inspection as a test failure. Sanitized, reviewable Phase 3.5 validation output is published in [`docs/evidence/phase-3.5-validation.json`](docs/evidence/phase-3.5-validation.json); runtime artifacts remain ignored.
+The soak harness creates an isolated run/database directory for every invocation and treats a failed process or firewall cleanup inspection as a test failure. Sanitized, reviewable evidence is published separately for [Phase 3.5](docs/evidence/phase-3.5-validation.json) and [Phase 3.5.1](docs/evidence/phase-3.5.1-validation.json); runtime artifacts remain ignored.
 
 ## Current limitations
 

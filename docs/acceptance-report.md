@@ -3,6 +3,7 @@
 Date: 2026-08-09. Host: Windows 11 x64. Session administrator: yes.
 Tested source baseline: `0c12bbd8fffe13426344d701c665198bf31f4e9a`, followed by the Phase 3.5 changes on `hardening/phase-3-5-acceptance`.
 The Phase 3.5 30-minute-soak evidence remains [`docs/evidence/phase-3.5-validation.json`](evidence/phase-3.5-validation.json) and identifies tested commit `c7273caac1106d54d5b327bfde20b13c7c2187f3`. It must not be interpreted as a 30-minute run on the later Phase 3.5.1 source.
+Phase 3.5.1 targeted-test, real-firewall-integration and smoke evidence is recorded separately in [`docs/evidence/phase-3.5.1-validation.json`](evidence/phase-3.5.1-validation.json).
 
 Status vocabulary in this report is deliberate: `Verified` means exercised on the current Windows host, `Integration tested` means exercised without the full production boundary, `Not verified` means no real test was performed, and `Blocked` requires owner or administrator action.
 
