@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <!-- Legacy Stage 0 source files are compiled by EgressGuard.Windows so Core stays platform-neutral. -->
+    <Compile Remove="ConnectionSnapshotService.cs" />
+    <Compile Remove="ExecutableMetadataProvider.cs" />
+    <Compile Remove="NativeMethods.cs" />
+    <Compile Remove="NativeNetworkTableReader.cs" />
+    <Compile Remove="ProcessSnapshotCollector.cs" />
+    <Compile Remove="WindowsFirewallManager.cs" />
+  </ItemGroup>
+</Project>

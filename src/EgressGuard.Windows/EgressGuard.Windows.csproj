@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\EgressGuard.Core\EgressGuard.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="..\EgressGuard.Core\ConnectionSnapshotService.cs" Link="Compatibility\ConnectionSnapshotService.cs" />
+    <Compile Include="..\EgressGuard.Core\ExecutableMetadataProvider.cs" Link="Compatibility\ExecutableMetadataProvider.cs" />
+    <Compile Include="..\EgressGuard.Core\NativeMethods.cs" Link="Compatibility\NativeMethods.cs" />
+    <Compile Include="..\EgressGuard.Core\NativeNetworkTableReader.cs" Link="Compatibility\NativeNetworkTableReader.cs" />
+    <Compile Include="..\EgressGuard.Core\ProcessSnapshotCollector.cs" Link="Compatibility\ProcessSnapshotCollector.cs" />
+    <Compile Include="..\EgressGuard.Core\WindowsFirewallManager.cs" Link="Compatibility\WindowsFirewallManager.cs" />
+  </ItemGroup>
+</Project>

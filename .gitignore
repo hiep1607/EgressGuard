@@ -1,0 +1,31 @@
+**/bin/
+**/obj/
+**/publish/
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Runtime state
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+logs/
+runtime/
+
+# Certificates and private keys must never be committed
+*.pfx
+*.p12
+*.pem
+*.key
+*.cer
+*.crt
+
+# Local tooling and test artifacts
+.dotnet/
+TestResults/
+coverage/
+*.trx

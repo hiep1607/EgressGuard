@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\EgressGuard.Core\EgressGuard.Core.csproj" />
+    <ProjectReference Include="..\EgressGuard.Windows\EgressGuard.Windows.csproj" />
+    <ProjectReference Include="..\EgressGuard.Persistence\EgressGuard.Persistence.csproj" />
+    <ProjectReference Include="..\EgressGuard.Protocol\EgressGuard.Protocol.csproj" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.1" />
+  </ItemGroup>
+</Project>

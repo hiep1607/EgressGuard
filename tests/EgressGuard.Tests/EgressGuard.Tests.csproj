@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\EgressGuard.Core\EgressGuard.Core.csproj" />
+    <ProjectReference Include="..\..\src\EgressGuard.Windows\EgressGuard.Windows.csproj" />
+    <ProjectReference Include="..\..\src\EgressGuard.Persistence\EgressGuard.Persistence.csproj" />
+    <ProjectReference Include="..\..\src\EgressGuard.Protocol\EgressGuard.Protocol.csproj" />
+  </ItemGroup>
+</Project>
