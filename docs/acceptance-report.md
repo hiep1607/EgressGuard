@@ -89,6 +89,8 @@ The UI connected without hanging and displayed the service-online state. Its sta
 
 ## Remaining manual acceptance
 
+The post-reboot system DPI probe reported 120 DPI (125% scale), matching the previously accepted level. This is the original scale that must be restored after the 100% and 150% visual checks. The continuation checkpoint is now `AwaitingManualDpi100`; no registry or display-setting mutation was performed automatically.
+
 - Reboot acceptance: `Verified`. The real post-merge artifact auto-started and completed the post-boot service/UI/database/Simulator checklist.
 - DPI 100% and 150%: `Not verified`. Set each real display scale, sign out/restart applications if Windows requests it, and repeat the six-tab, tray, long-path, IPv6, empty-state and resize checks.
 - Tray icon/context menu: `Not verified` for direct user interaction.

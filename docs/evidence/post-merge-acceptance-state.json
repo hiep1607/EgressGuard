@@ -1,6 +1,6 @@
 {
   "SchemaVersion": 1,
-  "Stage": "RebootVerified",
+  "Stage": "AwaitingManualDpi100",
   "SourceCommit": "c7689c4ba33dcfb9809163173a7e82a655a8c8ea",
   "Branch": "acceptance/post-merge-windows",
   "PreRebootBootTimeUtc": "2026-07-16T05:04:41.6789460Z",
