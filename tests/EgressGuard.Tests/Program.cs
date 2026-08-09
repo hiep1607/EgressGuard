@@ -8,6 +8,7 @@ using EgressGuard.Protocol;
 using EgressGuard.Service;
 using EgressGuard.Windows;
 using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.Logging;
 
 namespace EgressGuard.Tests;
 
@@ -32,6 +33,10 @@ internal static class Program
             ("Baseline minimum samples and reset", TestBaselineAsync),
             ("SQLite migration and flow persistence", TestPersistenceAsync),
             ("SQLite lock fails without unsafe fallback", TestDatabaseLockAsync),
+            ("Service graceful cancellation completes without failure logs", TestGracefulCancellationAsync),
+            ("Automatic firewall rule rolls back on persistence failure", TestAutomaticRuleRollbackAsync),
+            ("Automatic firewall rule rolls back on cancellation", TestAutomaticRuleCancellationRollbackAsync),
+            ("Automatic firewall rollback logs original and rollback failures", TestAutomaticRuleRollbackFailureLoggingAsync),
             ("Protocol frame roundtrip", TestProtocolRoundTripAsync),
             ("Protocol rejects oversized message", TestOversizedMessageAsync),
             ("Protocol handles disconnect", TestProtocolDisconnectAsync),
@@ -417,6 +422,127 @@ internal static class Program
         }
     }
 
+    private static async Task TestGracefulCancellationAsync()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "EgressGuard-CancellationTests-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var databasePath = Path.Combine(directory, "cancellation.db");
+        var logger = new ListLogger<FlowCoordinator>();
+        UnobservedTaskExceptionEventArgs? unobserved = null;
+        EventHandler<UnobservedTaskExceptionEventArgs> handler = (_, args) => unobserved = args;
+        TaskScheduler.UnobservedTaskException += handler;
+        var coordinator = new FlowCoordinator(
+            new EmptyFlowSensor(),
+            new EgressGuardDatabase(databasePath),
+            new RiskEngine(),
+            new BaselineTracker(),
+            new FakeFirewallRuleManager(),
+            new ServiceState(),
+            new EventHub(),
+            logger);
+        try
+        {
+            await coordinator.StartAsync(CancellationToken.None).ConfigureAwait(false);
+            using var startupTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            while (!File.Exists(databasePath))
+            {
+                await Task.Delay(25, startupTimeout.Token).ConfigureAwait(false);
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            using var shutdownTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            await coordinator.StopAsync(shutdownTimeout.Token).ConfigureAwait(false);
+            stopwatch.Stop();
+
+            AssertTrue(stopwatch.Elapsed < TimeSpan.FromSeconds(5), "Graceful cancellation did not finish within the timeout.");
+            AssertTrue(
+                logger.Entries.All(entry => !entry.Message.Contains("Database initialization failed", StringComparison.Ordinal)),
+                "Graceful cancellation was logged as database initialization failure.");
+            AssertTrue(
+                logger.Entries.All(entry => !entry.Message.Contains("Flow persistence batch failed", StringComparison.Ordinal)),
+                "Graceful cancellation was logged as persistence failure.");
+            AssertEqual(null, unobserved);
+        }
+        finally
+        {
+            coordinator.Dispose();
+            TaskScheduler.UnobservedTaskException -= handler;
+            SqliteConnection.ClearAllPools();
+            await DeleteDirectoryWithRetryAsync(directory).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task TestAutomaticRuleRollbackAsync()
+    {
+        var flow = SampleFlow();
+        var rule = SampleRule(FirewallAction.Block, flow);
+        var foreignRuleId = Guid.NewGuid();
+        var firewall = new FakeFirewallRuleManager();
+        firewall.ForeignRuleIds.Add(foreignRuleId);
+        var logger = new ListLogger<AutomaticFirewallRuleApplier>();
+        var applier = new AutomaticFirewallRuleApplier(
+            firewall,
+            (_, _) => Task.FromException(new InvalidOperationException("controlled database failure")),
+            logger);
+
+        await applier.ApplyAsync(rule, CancellationToken.None).ConfigureAwait(false);
+
+        AssertTrue(!firewall.OwnedRuleIds.Contains(rule.Id), "The newly created rule remained after database failure.");
+        AssertTrue(firewall.ForeignRuleIds.Contains(foreignRuleId), "Rollback modified a foreign firewall rule.");
+        AssertEqual(rule.Id, firewall.DeletedRuleIds.Single());
+        AssertTrue(logger.Entries.Any(entry => entry.Message.Contains("persistence failed", StringComparison.Ordinal)), "The original persistence failure was not logged.");
+
+        var existingRule = rule with { Id = Guid.NewGuid() };
+        var existingFirewall = new FakeFirewallRuleManager { CreateChangesState = false };
+        existingFirewall.OwnedRuleIds.Add(existingRule.Id);
+        var existingApplier = new AutomaticFirewallRuleApplier(
+            existingFirewall,
+            (_, _) => Task.FromException(new InvalidOperationException("controlled database failure")),
+            new ListLogger<AutomaticFirewallRuleApplier>());
+        await existingApplier.ApplyAsync(existingRule, CancellationToken.None).ConfigureAwait(false);
+        AssertTrue(existingFirewall.OwnedRuleIds.Contains(existingRule.Id), "Rollback deleted an owned rule that predated this create request.");
+        AssertEqual(0, existingFirewall.DeletedRuleIds.Count);
+    }
+
+    private static async Task TestAutomaticRuleCancellationRollbackAsync()
+    {
+        var rule = SampleRule(FirewallAction.Block, SampleFlow());
+        var firewall = new FakeFirewallRuleManager();
+        var logger = new ListLogger<AutomaticFirewallRuleApplier>();
+        using var cancellation = new CancellationTokenSource();
+        var applier = new AutomaticFirewallRuleApplier(
+            firewall,
+            (_, _) =>
+            {
+                cancellation.Cancel();
+                return Task.FromCanceled(cancellation.Token);
+            },
+            logger);
+
+        await AssertThrowsAsync<OperationCanceledException>(() => applier.ApplyAsync(rule, cancellation.Token)).ConfigureAwait(false);
+
+        AssertTrue(!firewall.OwnedRuleIds.Contains(rule.Id), "The created rule remained after cancellation.");
+        AssertEqual(rule.Id, firewall.DeletedRuleIds.Single());
+        AssertEqual(0, logger.Entries.Count);
+    }
+
+    private static async Task TestAutomaticRuleRollbackFailureLoggingAsync()
+    {
+        var rule = SampleRule(FirewallAction.Block, SampleFlow());
+        var firewall = new FakeFirewallRuleManager { DeleteFails = true };
+        var logger = new ListLogger<AutomaticFirewallRuleApplier>();
+        var applier = new AutomaticFirewallRuleApplier(
+            firewall,
+            (_, _) => Task.FromException(new InvalidOperationException("controlled database failure")),
+            logger);
+
+        await applier.ApplyAsync(rule, CancellationToken.None).ConfigureAwait(false);
+
+        AssertTrue(firewall.OwnedRuleIds.Contains(rule.Id), "The rollback-failure fixture unexpectedly removed the rule.");
+        AssertTrue(logger.Entries.Any(entry => entry.Exception?.Message == "controlled database failure"), "The original failure was not logged.");
+        AssertTrue(logger.Entries.Any(entry => entry.Exception?.Message == "controlled rollback failure"), "The rollback failure was not logged.");
+    }
+
     private static async Task TestOversizedMessageAsync()
     {
         var message = MessageEnvelope.Create(MessageTypes.Error, new ErrorMessage("BIG", new string('x', ProtocolConstants.MaximumMessageBytes + 1)));
@@ -739,4 +865,78 @@ internal static class Program
     }
 
     private sealed class TestFailureException(string message) : Exception(message);
+
+    private sealed class EmptyFlowSensor : INetworkFlowSensor
+    {
+        public IReadOnlyList<NetworkFlow> Capture() => [];
+    }
+
+    private sealed class FakeFirewallRuleManager : IFirewallRuleManager
+    {
+        public HashSet<Guid> OwnedRuleIds { get; } = [];
+        public HashSet<Guid> ForeignRuleIds { get; } = [];
+        public List<Guid> DeletedRuleIds { get; } = [];
+        public bool CreateChangesState { get; init; } = true;
+        public bool DeleteFails { get; init; }
+
+        public Task<bool> CreateAsync(FirewallRule rule, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (CreateChangesState)
+            {
+                OwnedRuleIds.Add(rule.Id);
+            }
+
+            return Task.FromResult(CreateChangesState);
+        }
+
+        public Task DeleteAsync(Guid ruleId, CancellationToken cancellationToken)
+        {
+            DeletedRuleIds.Add(ruleId);
+            if (DeleteFails)
+            {
+                throw new InvalidOperationException("controlled rollback failure");
+            }
+
+            OwnedRuleIds.Remove(ruleId);
+            return Task.CompletedTask;
+        }
+
+        public Task SetEnabledAsync(Guid ruleId, bool enabled, CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task ResetOwnedRulesAsync(CancellationToken cancellationToken)
+        {
+            OwnedRuleIds.Clear();
+            return Task.CompletedTask;
+        }
+
+        public Task<bool> ExistsAsync(Guid ruleId, CancellationToken cancellationToken) => Task.FromResult(OwnedRuleIds.Contains(ruleId));
+    }
+
+    private sealed record LogEntry(LogLevel Level, string Message, Exception? Exception);
+
+    private sealed class ListLogger<T> : ILogger<T>
+    {
+        public List<LogEntry> Entries { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => NullScope.Instance;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter) => Entries.Add(new LogEntry(logLevel, formatter(state, exception), exception));
+    }
+
+    private sealed class NullScope : IDisposable
+    {
+        public static NullScope Instance { get; } = new();
+
+        public void Dispose()
+        {
+        }
+    }
 }

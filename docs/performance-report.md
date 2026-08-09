@@ -14,8 +14,8 @@ Date: 2026-08-09. Tool: one-second `Process.TotalProcessorTime` deltas normalize
 | Burst | Service | 1.009% | 1.302% | 75.9 MB | same period |
 | Minimized | UI | 0.026% | 0.130% | 182.0 MB | idle |
 | UI closed | Service | 1.293% | 1.823% | 77.8 MB | UI process absent |
-| 30-minute churn soak | Service | 2.876% | 8.000% | 56.4 MB initial; 78.9 MB final; 56.2–82.1 MB | 595 traffic/IPC cycles and 119 service restarts |
-| 30-minute churn soak | UI | 2.846% | 7.000% | 134.8 MB initial; 154.4 MB final; 134.6–189.1 MB | 199 opens, 198 scheduled closes plus final cleanup |
+| 30-minute churn soak | Service | 3.312% | 9.000% | 55.5 MB initial; 79.1 MB final; 55.5–86.4 MB | 585 traffic/IPC cycles and 117 service restarts |
+| 30-minute churn soak | UI | 2.449% | 6.000% | 135.3 MB initial; 157.9 MB final; 134.5–196.3 MB | 195 opens and 195 closes |
 
 The UI is below the 1–2% idle and 3% normal targets in all measured states. RAM increased about 5 MB after the burst and did not rise continuously during these short samples. Service CPU stayed near the earlier baseline.
 
@@ -25,6 +25,6 @@ Limitations: the pre-soak rows use short sample windows, event/s was inferred fr
 
 ## Phase 3.5 soak
 
-The 30-minute Release soak on 2026-08-09 completed 595 normal, burst and beacon traffic runs, 595 successful IPC status checks and zero failures. The harness verified an exclusive database open after shutdown and found zero EgressGuard processes and zero owned firewall rules after cleanup.
+The fresh isolated 30-minute Release soak on 2026-08-09 completed 585 normal, burst and beacon traffic runs, 585 successful IPC status checks and zero failures. The harness verified an exclusive database open after shutdown. Both strict cleanup inspections succeeded and found zero owned soak processes and zero EgressGuard-owned firewall rules.
 
 The soak CPU samples are one-second-style process CPU deltas normalized by logical processor count. They represent active traffic, UI churn and reconnect work, not idle measurements. Both service and UI were intentionally restarted, so the initial/final working sets belong to different process instances and cannot by themselves prove or disprove a same-process memory leak. No monotonic runaway was observed within the recorded bounds.

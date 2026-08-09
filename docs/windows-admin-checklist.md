@@ -21,7 +21,7 @@ Run in Administrator PowerShell. Do not disable Firewall or Application Control.
    ```
 
 5. Run `tools\test-firewall.ps1` with two self-contained Simulator paths.
-6. Run `tools\run-soak-test.ps1 -DurationMinutes 30`.
+6. Run `tools\run-soak-test.ps1 -DurationMinutes 30`. Confirm both cleanup inspection success fields are `true`; a missing or failed process/firewall query is not a zero-leftover result. Each run writes an isolated database and summary below `artifacts\soak\runs\<timestamp-guid>`.
 7. Uninstall and verify no process/service/rule remains:
 
    ```powershell
@@ -42,9 +42,9 @@ Run in Administrator PowerShell. Do not disable Firewall or Application Control.
 ## Phase 3.5 status (2026-08-09)
 
 - `Verified`: framework-dependent final publish ran through SCM as `LocalSystem` with machine-wide .NET 8.0.29.
-- `Verified`: executable SHA-256 `0B48EFFA32B593AE4402590097D317CE02ECC864FD8865DA61137DB3613FA558`; managed service DLL SHA-256 `76EB90545497985DE98682DB389E4A9C930E343587E9F6C6D776A8F2AAE1AECB`.
+- `Verified`: executable SHA-256 `2B6D057BD3F189AC6A186CA6B7D2AED759422390ADD6596195CA3D1FC64737F5`; managed service DLL SHA-256 `67503DCCB540CDCEDF7AD7F16551B5F4116A7A491A06212BFDACD78419A8671F`.
 - `Verified`: automatic start, recovery delays 5/15 seconds, UI-close independence, stop/disconnect, start/reconnect, post-restart flow collection and uninstall cleanup.
-- `Verified`: 30-minute soak, 595 cycles, 0 failures, database lock released, zero residual processes/rules.
+- `Verified`: fresh isolated 30-minute soak, 585 cycles, 0 failures, database lock released; process/firewall inspections succeeded with zero residual processes/rules.
 - `Not verified`: real reboot, DPI 100%, DPI 150% and direct tray context-menu interaction.
 - `Blocked – requires owner/administrator action`: production code signing or organizational Application Control approval. The tested executable is unsigned even though the current host allowed it.
 

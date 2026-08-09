@@ -7,7 +7,7 @@ namespace EgressGuard.Windows;
 
 public interface IFirewallRuleManager
 {
-    Task CreateAsync(FirewallRule rule, CancellationToken cancellationToken);
+    Task<bool> CreateAsync(FirewallRule rule, CancellationToken cancellationToken);
     Task DeleteAsync(Guid ruleId, CancellationToken cancellationToken);
     Task SetEnabledAsync(Guid ruleId, bool enabled, CancellationToken cancellationToken);
     Task ResetOwnedRulesAsync(CancellationToken cancellationToken);
@@ -19,7 +19,7 @@ public sealed class OwnedFirewallRuleManager : IFirewallRuleManager
     public const string RulePrefix = "EgressGuard-MVP-";
     private const string DescriptionPrefix = "Owned by EgressGuard MVP;";
 
-    public async Task CreateAsync(FirewallRule rule, CancellationToken cancellationToken)
+    public async Task<bool> CreateAsync(FirewallRule rule, CancellationToken cancellationToken)
     {
         ValidateRule(rule);
         ValidateExecutableHash(rule);
@@ -46,7 +46,8 @@ public sealed class OwnedFirewallRuleManager : IFirewallRuleManager
             Write-Output 'CREATED'
             """;
         var environment = CreateEnvironment(rule);
-        await RunPowerShellAsync(script, environment, cancellationToken).ConfigureAwait(false);
+        var output = await RunPowerShellAsync(script, environment, cancellationToken).ConfigureAwait(false);
+        return output.Contains("CREATED", StringComparison.Ordinal);
     }
 
     public async Task DeleteAsync(Guid ruleId, CancellationToken cancellationToken)

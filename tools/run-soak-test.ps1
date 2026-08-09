@@ -19,15 +19,21 @@ foreach ($path in @($DotNetPath,$serviceDll,$uiDll,$serverDll,$simulatorDll,$cli
 }
 
 $soakDirectory = Join-Path $root 'artifacts\soak'
-New-Item -ItemType Directory -Path $soakDirectory -Force | Out-Null
+$runsDirectory = Join-Path $soakDirectory 'runs'
+$startedAtUtc = [DateTimeOffset]::UtcNow
+$runId = $startedAtUtc.ToString('yyyyMMddTHHmmssfffZ') + '-' + [Guid]::NewGuid().ToString('N')
+$runDirectory = Join-Path $runsDirectory $runId
+$dataDirectory = Join-Path $runDirectory 'data'
+New-Item -ItemType Directory -Path $dataDirectory -Force | Out-Null
 $previousDataDirectory = $env:EGRESSGUARD_DATA_DIR
-$env:EGRESSGUARD_DATA_DIR = Join-Path $soakDirectory 'data'
+$env:EGRESSGUARD_DATA_DIR = $dataDirectory
 $deadline = (Get-Date).AddMinutes($DurationMinutes)
+$failures = [System.Collections.Generic.List[string]]::new()
+$ownedProcessIds = [System.Collections.Generic.HashSet[int]]::new()
 $service = $null
 $server = $null
 $ui = $null
 $cycles = 0
-$failures = [System.Collections.Generic.List[string]]::new()
 $serviceMemory = [System.Collections.Generic.List[double]]::new()
 $uiMemory = [System.Collections.Generic.List[double]]::new()
 $serviceCpu = [System.Collections.Generic.List[double]]::new()
@@ -41,11 +47,49 @@ $normalTrafficRuns = 0
 $burstTrafficRuns = 0
 $beaconTrafficRuns = 0
 
-function Start-SoakService { Start-Process -FilePath $DotNetPath -ArgumentList ('"' + $serviceDll + '"') -WindowStyle Hidden -PassThru }
-function Stop-SoakProcess($Process) {
-    if ($Process -and -not $Process.HasExited) {
+function Register-SoakProcess($Process) {
+    [void]$ownedProcessIds.Add($Process.Id)
+    return $Process
+}
+function Start-SoakService {
+    Register-SoakProcess (Start-Process -FilePath $DotNetPath -ArgumentList ('"' + $serviceDll + '"') -WindowStyle Hidden -PassThru)
+}
+function Stop-SoakProcess($Process, [string]$Role) {
+    if (-not $Process) { return }
+    if ($Process.HasExited) {
+        [void]$ownedProcessIds.Remove($Process.Id)
+        return
+    }
+    if (-not $ownedProcessIds.Contains($Process.Id)) {
+        $failures.Add("Refused to stop unowned $Role process $($Process.Id).")
+        return
+    }
+
+    try {
         [void]$Process.CloseMainWindow()
-        if (-not $Process.WaitForExit(5000)) { Stop-Process -Id $Process.Id }
+        if (-not $Process.WaitForExit(5000)) {
+            Stop-Process -Id $Process.Id -Force -ErrorAction Stop
+            if (-not $Process.WaitForExit(5000)) {
+                $failures.Add("Owned $Role process $($Process.Id) did not exit after forced stop.")
+                return
+            }
+        }
+        [void]$ownedProcessIds.Remove($Process.Id)
+    }
+    catch {
+        $stopFailure = $_.Exception.Message
+        try {
+            $Process.Refresh()
+            if ($Process.HasExited) {
+                [void]$ownedProcessIds.Remove($Process.Id)
+                return
+            }
+        }
+        catch {
+            [void]$ownedProcessIds.Remove($Process.Id)
+            return
+        }
+        $failures.Add("Failed to stop owned $Role process $($Process.Id): $stopFailure")
     }
 }
 function Measure-SoakProcess([string]$Name, $Process, $MemorySamples, $CpuSamples) {
@@ -67,13 +111,13 @@ function Measure-SoakProcess([string]$Name, $Process, $MemorySamples, $CpuSample
 
 try {
     $service = Start-SoakService
-    $server = Start-Process -FilePath $DotNetPath -ArgumentList @($serverDll,'--protocol','tcp','--port','5050','--duration-seconds',($DurationMinutes * 60 + 30)) -WindowStyle Hidden -PassThru
+    $server = Register-SoakProcess (Start-Process -FilePath $DotNetPath -ArgumentList @($serverDll,'--protocol','tcp','--port','5050','--duration-seconds',($DurationMinutes * 60 + 30)) -WindowStyle Hidden -PassThru)
     Start-Sleep -Seconds 3
     while ((Get-Date) -lt $deadline) {
         $cycles++
         try {
             if (-not $ui -or $ui.HasExited) {
-                $ui = Start-Process -FilePath $DotNetPath -ArgumentList ('"' + $uiDll + '"') -PassThru
+                $ui = Register-SoakProcess (Start-Process -FilePath $DotNetPath -ArgumentList ('"' + $uiDll + '"') -PassThru)
                 $uiOpenCount++
             }
             & $DotNetPath $simulatorDll --protocol tcp --port 5050 --mode small --bytes 1024 --hold-seconds 0 | Out-Null
@@ -91,12 +135,12 @@ try {
             Measure-SoakProcess 'Service' $service $serviceMemory $serviceCpu
             Measure-SoakProcess 'UI' $ui $uiMemory $uiCpu
             if (($cycles % 3) -eq 0) {
-                Stop-SoakProcess $ui
+                Stop-SoakProcess $ui 'UI'
                 $ui = $null
                 $uiCloseCount++
             }
             if (($cycles % 5) -eq 0) {
-                Stop-SoakProcess $service
+                Stop-SoakProcess $service 'service'
                 $service = Start-SoakService
                 $serviceRestartCount++
                 Start-Sleep -Seconds 3
@@ -107,14 +151,22 @@ try {
         }
     }
 }
+catch {
+    $failures.Add("Fatal soak failure: $($_.Exception.Message)")
+}
 finally {
-    Stop-SoakProcess $ui
-    Stop-SoakProcess $service
-    Stop-SoakProcess $server
-    $env:EGRESSGUARD_DATA_DIR = $previousDataDirectory
+    Stop-SoakProcess $ui 'UI'
+    Stop-SoakProcess $service 'service'
+    Stop-SoakProcess $server 'test server'
+    if ($null -eq $previousDataDirectory) {
+        Remove-Item Env:EGRESSGUARD_DATA_DIR -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:EGRESSGUARD_DATA_DIR = $previousDataDirectory
+    }
 }
 
-$databasePath = Join-Path $soakDirectory 'data\egressguard.db'
+$databasePath = Join-Path $dataDirectory 'egressguard.db'
 $databaseLockReleased = $false
 if (Test-Path -LiteralPath $databasePath) {
     try {
@@ -129,18 +181,39 @@ if (Test-Path -LiteralPath $databasePath) {
 else {
     $failures.Add('Soak database was not created.')
 }
-$remainingProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-    $_.Name -in @('dotnet.exe', 'EgressGuard.Service.exe', 'EgressGuard.UI.exe') -and
-    $_.CommandLine -match 'EgressGuard\.(Service|UI|TestServer|Simulator)'
-}).Count
-$remainingOwnedRules = @(Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {
-    $_.DisplayName -like 'EgressGuard-MVP-*' -and $_.Description -like 'Owned by EgressGuard MVP;*'
-}).Count
-if ($remainingProcesses -ne 0) { $failures.Add("$remainingProcesses EgressGuard soak process(es) remained after cleanup.") }
-if ($remainingOwnedRules -ne 0) { $failures.Add("$remainingOwnedRules EgressGuard-owned firewall rule(s) remained after cleanup.") }
+$processInspectionSucceeded = $false
+$remainingProcesses = $null
+try {
+    [void](Get-Command Get-CimInstance -ErrorAction Stop)
+    $remainingProcesses = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop | Where-Object {
+        $ownedProcessIds.Contains([int]$_.ProcessId)
+    }).Count
+    $processInspectionSucceeded = $true
+}
+catch {
+    $failures.Add("Process cleanup inspection failed: $($_.Exception.Message)")
+}
+
+$firewallInspectionSucceeded = $false
+$remainingOwnedRules = $null
+try {
+    [void](Get-Command Get-NetFirewallRule -ErrorAction Stop)
+    $remainingOwnedRules = @(Get-NetFirewallRule -ErrorAction Stop | Where-Object {
+        $_.DisplayName -like 'EgressGuard-MVP-*' -and $_.Description -like 'Owned by EgressGuard MVP;*'
+    }).Count
+    $firewallInspectionSucceeded = $true
+}
+catch {
+    $failures.Add("Firewall cleanup inspection failed: $($_.Exception.Message)")
+}
+
+if ($processInspectionSucceeded -and $remainingProcesses -ne 0) { $failures.Add("$remainingProcesses owned soak process(es) remained after cleanup.") }
+if ($firewallInspectionSucceeded -and $remainingOwnedRules -ne 0) { $failures.Add("$remainingOwnedRules EgressGuard-owned firewall rule(s) remained after cleanup.") }
 
 $summary = [pscustomobject]@{
-    StartedAt = $deadline.AddMinutes(-$DurationMinutes).ToString('O')
+    RunId = $runId
+    StartedAtUtc = $startedAtUtc.ToString('O')
+    CompletedAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
     DurationMinutes = $DurationMinutes
     Cycles = $cycles
     Failures = $failures.Count
@@ -165,9 +238,13 @@ $summary = [pscustomobject]@{
     UiRamMinimumMb = if ($uiMemory.Count) { [math]::Round(($uiMemory | Measure-Object -Minimum).Minimum,1) } else { $null }
     UiRamMaximumMb = if ($uiMemory.Count) { [math]::Round(($uiMemory | Measure-Object -Maximum).Maximum,1) } else { $null }
     DatabaseLockReleased = $databaseLockReleased
+    ProcessInspectionSucceeded = $processInspectionSucceeded
     RemainingProcesses = $remainingProcesses
+    FirewallInspectionSucceeded = $firewallInspectionSucceeded
     RemainingOwnedFirewallRules = $remainingOwnedRules
 }
-$summary | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $soakDirectory 'latest-summary.json') -Encoding utf8
+$summaryJson = $summary | ConvertTo-Json -Depth 4
+$summaryJson | Set-Content -LiteralPath (Join-Path $runDirectory 'summary.json') -Encoding utf8
+$summaryJson | Set-Content -LiteralPath (Join-Path $soakDirectory 'latest-summary.json') -Encoding utf8
 $summary
 if ($failures.Count -gt 0) { exit 1 }

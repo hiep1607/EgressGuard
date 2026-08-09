@@ -144,14 +144,17 @@ public sealed partial class PipeServer : BackgroundService
                     return Success(request, $"Equivalent rule already exists: {duplicate.Id:D}.");
                 }
 
-                await _firewall.CreateAsync(rule, cancellationToken).ConfigureAwait(false);
+                var created = await _firewall.CreateAsync(rule, cancellationToken).ConfigureAwait(false);
                 try
                 {
                     await _database.SaveRuleAsync(rule, cancellationToken).ConfigureAwait(false);
                 }
                 catch
                 {
-                    await _firewall.DeleteAsync(rule.Id, CancellationToken.None).ConfigureAwait(false);
+                    if (created)
+                    {
+                        await _firewall.DeleteAsync(rule.Id, CancellationToken.None).ConfigureAwait(false);
+                    }
                     throw;
                 }
                 return Success(request, "Rule created.");
