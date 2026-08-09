@@ -113,7 +113,7 @@ foreach ($pattern in $forbiddenPatterns) {
 }
 
 $evidenceRoot = [IO.Path]::GetFullPath((Join-Path $root 'docs\evidence'))
-$resolvedOutput = if ([IO.Path]::IsPathFullyQualified($OutputPath)) {
+$resolvedOutput = if ([IO.Path]::IsPathRooted($OutputPath)) {
     [IO.Path]::GetFullPath($OutputPath)
 }
 else {

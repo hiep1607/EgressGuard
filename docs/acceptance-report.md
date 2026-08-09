@@ -2,6 +2,7 @@
 
 Date: 2026-08-09. Host: Windows 11 x64. Session administrator: yes.
 Tested source baseline: `0c12bbd8fffe13426344d701c665198bf31f4e9a`, followed by the Phase 3.5 changes on `hardening/phase-3-5-acceptance`.
+Sanitized machine-readable evidence: [`docs/evidence/phase-3.5-validation.json`](evidence/phase-3.5-validation.json). It identifies the exact tested source commit and successful GitHub Actions run.
 
 Status vocabulary in this report is deliberate: `Verified` means exercised on the current Windows host, `Integration tested` means exercised without the full production boundary, `Not verified` means no real test was performed, and `Blocked` requires owner or administrator action.
 

@@ -71,7 +71,7 @@ Service installation and real firewall acceptance are separate, opt-in Administr
 
 Every firewall test must have cleanup. The Phase 3.5 framework-dependent service publish ran through SCM on the acceptance workstation, but it remains unsigned and is not a production-approved artifact. Never bypass Windows Application Control policy.
 
-The soak harness creates an isolated run/database directory for every invocation and treats a failed process or firewall cleanup inspection as a test failure. Sanitized, reviewable Phase 3.5 validation output is published under `docs/evidence/`; runtime artifacts remain ignored.
+The soak harness creates an isolated run/database directory for every invocation and treats a failed process or firewall cleanup inspection as a test failure. Sanitized, reviewable Phase 3.5 validation output is published in [`docs/evidence/phase-3.5-validation.json`](docs/evidence/phase-3.5-validation.json); runtime artifacts remain ignored.
 
 ## Current limitations
 
