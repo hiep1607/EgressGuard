@@ -29,7 +29,7 @@ Status vocabulary in this report is deliberate: `Verified` means exercised on th
 | SCM stop/start and UI reconnect | Verified | UI displayed `Service disconnected · reconnecting`, then returned to `Service online · Monitor · dropped 0` and remained responsive. |
 | Flow collection after restart | Verified | Safe local traffic produced service status `Active=146`, `Dropped=0` after reconnect. |
 | SCM uninstall and cleanup | Verified | Final inspection: zero SCM service, service/UI processes and EgressGuard-owned firewall rules. |
-| Reboot acceptance | Not verified | No reboot was authorized or performed. |
+| Reboot acceptance | Verified | Windows boot time advanced from `2026-07-16T05:04:41.6789460Z` to `2026-08-09T16:39:28.5000000Z`. Without a manual service start, SCM exposed the service as Running with its automatic/LocalSystem/recovery configuration and exact artifact hashes unchanged. UI/database reads and a controlled Simulator flow passed after boot. |
 | DPI 125% | Verified | All six tabs were selected and visually inspected; maximize/minimize remained responsive. Dashboard and Live Connections rendered many rows including IPv6, Connection Detail rendered a selected row, Rules rendered empty, and a 215-character database path wrapped without overlap. |
 | DPI 100% and 150% | Not verified | The active display was 120 DPI (125%). Display scaling was not changed because a real scale change can disrupt the user session and was not separately authorized. |
 | Tray interaction | Not verified | The real `NotifyIcon` construction/disposal path ran during UI open/close cycles, but the shell icon and context menu were not independently discoverable through UI Automation. |
@@ -79,11 +79,17 @@ Source commit `c7689c4ba33dcfb9809163173a7e82a655a8c8ea` was rebuilt on branch `
 
 A fresh framework-dependent service artifact was published to a new isolated runtime directory. `EgressGuard.Service.exe` SHA-256 is `CE8CE2AEB3C67508966B0FA5F0244232FA645D5270C74625E468842CE0DEF8E7`; `EgressGuard.Service.dll` SHA-256 is `E16A797BEB0170C93EEF2C8182435ABE8785A9954AF76FC752EBAFD62A86679E`. Both files are `NotSigned`; read-only inspection found no eligible code-signing certificate with a private key, so production signing remains blocked pending owner/administrator action.
 
-Before the manual reboot, SCM reported the service `Running`, automatic start, `LocalSystem`, the expected artifact path, recovery restarts after 5 and 15 seconds, and failure actions enabled for non-crash failures. The UI connected and displayed `Service online · Monitor · dropped 0`; a graceful UI close left the service running and no UI process. No firewall rule was created for reboot preparation. The sanitized continuation state is recorded in [`docs/evidence/post-merge-acceptance-state.json`](evidence/post-merge-acceptance-state.json) with stage `AwaitingManualReboot`. Reboot acceptance remains `NotVerified` until the recorded boot time advances and the post-boot checklist passes.
+Before the manual reboot, SCM reported the service `Running`, automatic start, `LocalSystem`, the expected artifact path, recovery restarts after 5 and 15 seconds, and failure actions enabled for non-crash failures. The UI connected and displayed `Service online · Monitor · dropped 0`; a graceful UI close left the service running and no UI process. No firewall rule was created for reboot preparation. At that checkpoint, the sanitized continuation state in [`docs/evidence/post-merge-acceptance-state.json`](evidence/post-merge-acceptance-state.json) was `AwaitingManualReboot`, and reboot acceptance correctly remained `NotVerified` until the recorded boot time advanced and the post-boot checklist passed.
+
+## Post-merge reboot acceptance
+
+The recorded Windows boot time advanced to `2026-08-09T16:39:28.5000000Z`. Before any service-control mutation in the post-boot session, `EgressGuard.Service` already existed and was `Running`; start mode remained automatic, account remained `LocalSystem`, failure recovery remained 5/15 seconds, and non-crash failure actions remained enabled. The installed EXE/DLL hashes still matched the pre-reboot checkpoint. No EgressGuard-related Code Integrity event and no SCM 7000/7009 event appeared after boot.
+
+The UI connected without hanging and displayed the service-online state. Its startup successfully read flows, rules and alerts through service IPC, exercising the live database after boot. A bounded Simulator TCP connection to the loopback-only test server appeared through service IPC; both fixtures exited with code 0. Closing the UI left the service running, with zero UI process and zero EgressGuard-owned firewall rule. Reboot acceptance is therefore `Verified`; DPI and direct tray interaction remain separate manual checkpoints.
 
 ## Remaining manual acceptance
 
-- Reboot acceptance: `Not verified`. Follow `docs/windows-admin-checklist.md`; do not reboot automatically.
+- Reboot acceptance: `Verified`. The real post-merge artifact auto-started and completed the post-boot service/UI/database/Simulator checklist.
 - DPI 100% and 150%: `Not verified`. Set each real display scale, sign out/restart applications if Windows requests it, and repeat the six-tab, tray, long-path, IPv6, empty-state and resize checks.
 - Tray icon/context menu: `Not verified` for direct user interaction.
 - Production signing/organizational approval: `Blocked – requires owner/administrator action`.
