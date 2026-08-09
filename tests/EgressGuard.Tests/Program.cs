@@ -591,7 +591,28 @@ internal static class Program
             }
 
             SqliteConnection.ClearAllPools();
-            Directory.Delete(dataDirectory, recursive: true);
+            await DeleteDirectoryWithRetryAsync(dataDirectory).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task DeleteDirectoryWithRetryAsync(string path)
+    {
+        for (var attempt = 0; attempt < 10; attempt++)
+        {
+            try
+            {
+                Directory.Delete(path, recursive: true);
+                return;
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                if (attempt == 9)
+                {
+                    throw;
+                }
+
+                await Task.Delay(250).ConfigureAwait(false);
+            }
         }
     }
 
