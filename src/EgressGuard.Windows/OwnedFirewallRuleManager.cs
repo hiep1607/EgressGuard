@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text.Json;
 using EgressGuard.Core;
@@ -119,7 +120,13 @@ public sealed class OwnedFirewallRuleManager : IFirewallRuleManager
             $ErrorActionPreference='Stop'; $rules=@(Get-NetFirewallRule -ErrorAction Stop | Where-Object {$_.DisplayName -eq $env:EG_RULE_NAME})
             if($rules.Count -eq 0) { throw 'Rule does not exist.' }
             if(@($rules | Where-Object {$_.Description -notlike 'Owned by EgressGuard MVP;*'}).Count -gt 0) { throw 'Rule ownership mismatch.' }
-            $rules | Set-NetFirewallRule -Enabled $env:EG_ENABLED -ErrorAction Stop
+            foreach($rule in $rules) {
+              $identity=$rule.Description.Substring('Owned by EgressGuard MVP;'.Length) | ConvertFrom-Json -ErrorAction Stop
+              if($null -eq $identity.enabled) { throw 'Rule ownership description does not contain enabled state.' }
+              $identity.enabled=[bool]::Parse($env:EG_ENABLED)
+              $description='Owned by EgressGuard MVP;' + ($identity | ConvertTo-Json -Compress -Depth 4)
+              $rule | Set-NetFirewallRule -Enabled $env:EG_ENABLED -Description $description -ErrorAction Stop
+            }
             """;
         await RunSerializedMutationAsync(script, environment, cancellationToken).ConfigureAwait(false);
     }
@@ -283,13 +290,16 @@ public sealed class OwnedFirewallRuleManager : IFirewallRuleManager
 
     private static Dictionary<string, string> CreateEnvironment(FirewallRule rule)
     {
+        var identity = ExactFirewallRuleIdentity.FromRule(rule);
         var environment = RuleIdEnvironment(rule.Id);
-        environment["EG_RULE_DESCRIPTION"] = DescriptionPrefix + JsonSerializer.Serialize(new { id = rule.Id, hash = rule.ExecutableSha256, action = rule.Action, path = Path.GetFullPath(rule.ExecutablePath) });
-        environment["EG_ACTION"] = rule.Action.ToString();
-        environment["EG_PROGRAM"] = Path.GetFullPath(rule.ExecutablePath);
-        environment["EG_REMOTE_ADDRESS"] = rule.RemoteAddress ?? string.Empty;
-        environment["EG_REMOTE_PORT"] = rule.RemotePort?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
-        environment["EG_PROTOCOL"] = rule.Protocol?.ToString() ?? string.Empty;
+        environment["EG_RULE_DESCRIPTION"] = identity.Description;
+        environment["EG_ACTION"] = identity.Action;
+        environment["EG_PROGRAM"] = identity.Program;
+        environment["EG_REMOTE_ADDRESS"] = identity.RemoteAddress;
+        environment["EG_REMOTE_PORT"] = identity.RemotePort;
+        environment["EG_PROTOCOL"] = identity.Protocol;
+        environment["EG_ENABLED"] = identity.Enabled;
+        environment["EG_PROFILE"] = identity.Profile;
         return environment;
     }
 
@@ -304,49 +314,78 @@ public sealed class OwnedFirewallRuleManager : IFirewallRuleManager
         }
     }
 
-    private const string CreateScript = """
+    private const string ExactRuleSemanticsScript = """
+        function ConvertTo-EgressGuardAnyList {
+          param($Value)
+          $items=@($Value) | ForEach-Object { @("$_" -split ',') } | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+          if($items.Count -eq 0 -or ($items.Count -eq 1 -and ($items[0] -eq 'Any' -or $items[0] -eq '*'))) { return 'Any' }
+          return (($items | Sort-Object -Unique) -join ',')
+        }
+        function ConvertTo-EgressGuardProtocol {
+          param($Value)
+          $text="$Value".Trim()
+          if(-not $text -or $text -eq 'Any' -or $text -eq '*' -or $text -eq '256') { return 'ANY' }
+          if($text -eq 'Tcp' -or $text -eq '6') { return 'TCP' }
+          if($text -eq 'Udp' -or $text -eq '17') { return 'UDP' }
+          return $text.ToUpperInvariant()
+        }
+        function Test-EgressGuardExactRule {
+          param($Rules)
+          $items=@($Rules)
+          if($items.Count -ne 1) { return $false }
+          $rule=$items[0]
+          if(-not [string]::Equals("$($rule.Description)",$env:EG_RULE_DESCRIPTION,[StringComparison]::OrdinalIgnoreCase)) { return $false }
+          if(-not [string]::Equals("$($rule.Direction)",'Outbound',[StringComparison]::OrdinalIgnoreCase)) { return $false }
+          if(-not [string]::Equals("$($rule.Action)",$env:EG_ACTION,[StringComparison]::OrdinalIgnoreCase)) { return $false }
+          if(-not [string]::Equals("$($rule.Enabled)",$env:EG_ENABLED,[StringComparison]::OrdinalIgnoreCase)) { return $false }
+          if(-not [string]::Equals("$($rule.Profile)",$env:EG_PROFILE,[StringComparison]::OrdinalIgnoreCase)) { return $false }
+          $application=@($rule | Get-NetFirewallApplicationFilter -ErrorAction Stop)
+          $address=@($rule | Get-NetFirewallAddressFilter -ErrorAction Stop)
+          $port=@($rule | Get-NetFirewallPortFilter -ErrorAction Stop)
+          if($application.Count -ne 1 -or $address.Count -ne 1 -or $port.Count -ne 1) { return $false }
+          if(-not [string]::Equals("$($application[0].Program)",$env:EG_PROGRAM,[StringComparison]::OrdinalIgnoreCase)) { return $false }
+          if(-not [string]::Equals((ConvertTo-EgressGuardAnyList $address[0].RemoteAddress),(ConvertTo-EgressGuardAnyList $env:EG_REMOTE_ADDRESS),[StringComparison]::OrdinalIgnoreCase)) { return $false }
+          if(-not [string]::Equals((ConvertTo-EgressGuardAnyList $port[0].RemotePort),(ConvertTo-EgressGuardAnyList $env:EG_REMOTE_PORT),[StringComparison]::OrdinalIgnoreCase)) { return $false }
+          if(-not [string]::Equals((ConvertTo-EgressGuardProtocol $port[0].Protocol),(ConvertTo-EgressGuardProtocol $env:EG_PROTOCOL),[StringComparison]::OrdinalIgnoreCase)) { return $false }
+          return $true
+        }
+        """;
+
+    private static readonly string CreateScript = ExactRuleSemanticsScript + """
         # EGRESSGUARD_CREATE_MUTATION
         $ErrorActionPreference='Stop'
         $name=$env:EG_RULE_NAME; $description=$env:EG_RULE_DESCRIPTION
         $existing=@(Get-NetFirewallRule -ErrorAction Stop | Where-Object {$_.DisplayName -eq $name})
         if($existing.Count -gt 0) {
-          if(@($existing | Where-Object {$_.Description -ne $description}).Count -gt 0) { throw 'Rule ownership mismatch.' }
-          if($existing.Count -ne 1) { throw 'Duplicate firewall rules exist for this EgressGuard rule ID.' }
-          $application=$existing | Get-NetFirewallApplicationFilter
-          if(-not [string]::Equals($application.Program,$env:EG_PROGRAM,[StringComparison]::OrdinalIgnoreCase) -or $existing.Direction -ne 'Outbound' -or $existing.Action -ne $env:EG_ACTION) { throw 'Existing rule semantics do not match the requested rule.' }
+          if(-not (Test-EgressGuardExactRule $existing)) { throw 'Existing rule ownership or semantics do not match the requested rule.' }
           Write-Output 'UNCHANGED'; exit 0
         }
-        $parameters=@{DisplayName=$name;Description=$description;Direction='Outbound';Action=$env:EG_ACTION;Program=$env:EG_PROGRAM;Profile='Any';Enabled='True'}
-        if($env:EG_REMOTE_ADDRESS) {$parameters.RemoteAddress=$env:EG_REMOTE_ADDRESS}
-        if($env:EG_REMOTE_PORT) {$parameters.RemotePort=$env:EG_REMOTE_PORT}
-        if($env:EG_PROTOCOL) {$parameters.Protocol=$env:EG_PROTOCOL}
+        $parameters=@{DisplayName=$name;Description=$description;Direction='Outbound';Action=$env:EG_ACTION;Program=$env:EG_PROGRAM;Profile=$env:EG_PROFILE;Enabled=$env:EG_ENABLED}
+        if($env:EG_REMOTE_ADDRESS -ne 'Any') {$parameters.RemoteAddress=$env:EG_REMOTE_ADDRESS}
+        if($env:EG_REMOTE_PORT -ne 'Any') {$parameters.RemotePort=$env:EG_REMOTE_PORT}
+        if($env:EG_PROTOCOL -ne 'ANY') {$parameters.Protocol=$env:EG_PROTOCOL}
         New-NetFirewallRule @parameters | Out-Null
         # EGRESSGUARD_AFTER_CREATE
         $created=@(Get-NetFirewallRule -ErrorAction Stop | Where-Object {$_.DisplayName -eq $name})
-        $createdApplication=$created | Get-NetFirewallApplicationFilter
-        if($created.Count -ne 1 -or $created.Description -ne $description -or -not [string]::Equals($createdApplication.Program,$env:EG_PROGRAM,[StringComparison]::OrdinalIgnoreCase) -or $created.Direction -ne 'Outbound' -or $created.Action -ne $env:EG_ACTION) { $created | Where-Object {$_.Description -eq $description} | Remove-NetFirewallRule -ErrorAction SilentlyContinue; throw 'Post-create validation failed; rolled back.' }
+        if(-not (Test-EgressGuardExactRule $created)) { $created | Where-Object {[string]::Equals("$($_.Description)",$description,[StringComparison]::OrdinalIgnoreCase)} | Remove-NetFirewallRule -ErrorAction SilentlyContinue; throw 'Post-create validation failed; rolled back.' }
         Write-Output 'CREATED'
         """;
 
-    private const string QueryExactRuleScript = """
+    private static readonly string QueryExactRuleScript = ExactRuleSemanticsScript + """
         # EGRESSGUARD_EXACT_RULE_QUERY
         $ErrorActionPreference='Stop'
         $rules=@(Get-NetFirewallRule -ErrorAction Stop | Where-Object {$_.DisplayName -eq $env:EG_RULE_NAME})
         if($rules.Count -eq 0) { Write-Output 'ABSENT'; exit 0 }
-        if($rules.Count -ne 1 -or $rules[0].Description -ne $env:EG_RULE_DESCRIPTION) { Write-Output 'MISMATCH'; exit 0 }
-        $application=$rules[0] | Get-NetFirewallApplicationFilter
-        if(-not [string]::Equals($application.Program,$env:EG_PROGRAM,[StringComparison]::OrdinalIgnoreCase) -or $rules[0].Direction -ne 'Outbound' -or $rules[0].Action -ne $env:EG_ACTION) { Write-Output 'MISMATCH'; exit 0 }
+        if(-not (Test-EgressGuardExactRule $rules)) { Write-Output 'MISMATCH'; exit 0 }
         Write-Output 'MATCH'
         """;
 
-    private const string DeleteExactRuleScript = """
+    private static readonly string DeleteExactRuleScript = ExactRuleSemanticsScript + """
         # EGRESSGUARD_EXACT_RULE_DELETE
         $ErrorActionPreference='Stop'
         $rules=@(Get-NetFirewallRule -ErrorAction Stop | Where-Object {$_.DisplayName -eq $env:EG_RULE_NAME})
         if($rules.Count -eq 0) { Write-Output 'UNCHANGED'; exit 0 }
-        if($rules.Count -ne 1 -or $rules[0].Description -ne $env:EG_RULE_DESCRIPTION) { throw 'Refusing to reconcile a rule with mismatched ownership.' }
-        $application=$rules[0] | Get-NetFirewallApplicationFilter
-        if(-not [string]::Equals($application.Program,$env:EG_PROGRAM,[StringComparison]::OrdinalIgnoreCase) -or $rules[0].Direction -ne 'Outbound' -or $rules[0].Action -ne $env:EG_ACTION) { throw 'Refusing to reconcile a rule with mismatched semantics.' }
+        if(-not (Test-EgressGuardExactRule $rules)) { throw 'Refusing to reconcile a rule with mismatched ownership or semantics.' }
         $rules[0] | Remove-NetFirewallRule -ErrorAction Stop
         Write-Output 'DELETED'
         """;
@@ -356,5 +395,51 @@ public sealed class OwnedFirewallRuleManager : IFirewallRuleManager
         Absent,
         Match,
         Mismatch
+    }
+
+    internal sealed record ExactFirewallRuleIdentity(
+        Guid Id,
+        string ExecutableSha256,
+        string Program,
+        string Action,
+        string RemoteAddress,
+        string RemotePort,
+        string Protocol,
+        string Enabled,
+        string Profile)
+    {
+        public string Description => DescriptionPrefix + JsonSerializer.Serialize(new
+        {
+            id = Id,
+            hash = ExecutableSha256,
+            path = Program,
+            action = Action,
+            remoteAddress = RemoteAddress,
+            remotePort = RemotePort,
+            protocol = Protocol,
+            enabled = bool.Parse(Enabled)
+        });
+
+        public static ExactFirewallRuleIdentity FromRule(FirewallRule rule) => new(
+            rule.Id,
+            rule.ExecutableSha256!,
+            Path.GetFullPath(rule.ExecutablePath),
+            rule.Action.ToString(),
+            NormalizeAny(rule.RemoteAddress),
+            rule.RemotePort?.ToString(CultureInfo.InvariantCulture) ?? "Any",
+            rule.Protocol?.ToString().ToUpperInvariant() ?? "ANY",
+            rule.Enabled ? "True" : "False",
+            "Any");
+
+        private static string NormalizeAny(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value) || value.Equals("Any", StringComparison.OrdinalIgnoreCase) || value == "*")
+            {
+                return "Any";
+            }
+
+            return string.Join(",", value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Order(StringComparer.OrdinalIgnoreCase));
+        }
     }
 }

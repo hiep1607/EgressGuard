@@ -35,6 +35,8 @@ internal static class Program
             ("PowerShell cancellation terminates only its owned process tree", TestPowerShellCancellationCleanupAsync),
             ("PowerShell timeout terminates its owned process tree", TestPowerShellTimeoutCleanupAsync),
             ("Indeterminate firewall creation reconciles the exact rule", TestFirewallCreateReconciliationAsync),
+            ("Complete firewall semantics recognize an exact rule", TestCompleteFirewallSemanticsMatchAsync),
+            ("Complete firewall semantics reject field mismatches", TestCompleteFirewallSemanticsMismatchAsync),
             ("Concurrent equivalent firewall requests serialize creation", TestConcurrentFirewallCreationAsync),
             ("Controlled TCP connection maps to current process", TestControlledTcpMappingAsync),
             ("Controlled IPv6 TCP maps to current process", TestControlledIPv6MappingAsync),
@@ -374,6 +376,65 @@ internal static class Program
         AssertEqual(1, savedRules.Count);
         AssertEqual(1, results.Count(result => result.Status == FirewallMutationStatus.Created));
         AssertEqual(1, results.Count(result => result.ExistingRuleId is not null));
+    }
+
+    private static async Task TestCompleteFirewallSemanticsMatchAsync()
+    {
+        var executablePath = Environment.ProcessPath ?? throw new TestFailureException("Test executable path is unavailable.");
+        var rule = TestRuleForExecutable(executablePath);
+        var runner = new MockFirewallSemanticsRunner(new Dictionary<string, string>
+        {
+            ["EG_ACTUAL_PROGRAM"] = executablePath.ToUpperInvariant(),
+            ["EG_ACTUAL_REMOTE_ADDRESS"] = rule.RemoteAddress!.ToUpperInvariant(),
+            ["EG_ACTUAL_PROTOCOL"] = "6",
+            ["EG_ACTUAL_ENABLED"] = "true",
+            ["EG_ACTUAL_PROFILE"] = "ANY"
+        });
+        var manager = new OwnedFirewallRuleManager(runner, () => true);
+
+        AssertEqual(FirewallMutationStatus.Unchanged, await manager.CreateAsync(rule, CancellationToken.None).ConfigureAwait(false));
+        AssertEqual(1, runner.QueryCount);
+        AssertEqual(0, runner.CreateCount);
+        AssertEqual(0, runner.DeleteCount);
+        var description = runner.LastEnvironment?["EG_RULE_DESCRIPTION"] ?? string.Empty;
+        foreach (var property in new[] { "id", "hash", "path", "action", "remoteAddress", "remotePort", "protocol", "enabled" })
+        {
+            AssertTrue(description.Contains($"\"{property}\"", StringComparison.Ordinal), $"Ownership description omitted {property}.");
+        }
+    }
+
+    private static async Task TestCompleteFirewallSemanticsMismatchAsync()
+    {
+        var executablePath = Environment.ProcessPath ?? throw new TestFailureException("Test executable path is unavailable.");
+        var rule = TestRuleForExecutable(executablePath);
+        var cases = new (string Field, string Value)[]
+        {
+            ("EG_ACTUAL_REMOTE_ADDRESS", "198.51.100.2"),
+            ("EG_ACTUAL_REMOTE_PORT", "10"),
+            ("EG_ACTUAL_PROTOCOL", "17"),
+            ("EG_ACTUAL_ENABLED", "False")
+        };
+
+        foreach (var testCase in cases)
+        {
+            var runner = new MockFirewallSemanticsRunner(new Dictionary<string, string> { [testCase.Field] = testCase.Value });
+            var manager = new OwnedFirewallRuleManager(runner, () => true);
+            var saveCount = 0;
+            var coordinator = new FirewallRuleCreateCoordinator(
+                manager,
+                (_, _) =>
+                {
+                    saveCount++;
+                    return Task.CompletedTask;
+                },
+                new ListLogger<FirewallRuleCreateCoordinator>());
+
+            await AssertThrowsAsync<InvalidOperationException>(() =>
+                coordinator.ApplyAsync(rule, CancellationToken.None, failOpen: false)).ConfigureAwait(false);
+            AssertEqual(0, saveCount);
+            AssertEqual(0, runner.CreateCount);
+            AssertEqual(0, runner.DeleteCount);
+        }
     }
 
     private static async Task TestControlledTcpMappingAsync()
@@ -1305,6 +1366,63 @@ internal static class Program
         }
 
         private static PowerShellProcessResult Result(string output) => new(output, string.Empty, 0);
+    }
+
+    private sealed class MockFirewallSemanticsRunner(IReadOnlyDictionary<string, string> overrides) : IPowerShellProcessRunner
+    {
+        private readonly PowerShellProcessRunner _inner = new();
+
+        public int QueryCount { get; private set; }
+        public int CreateCount { get; private set; }
+        public int DeleteCount { get; private set; }
+        public IReadOnlyDictionary<string, string>? LastEnvironment { get; private set; }
+
+        public Task<PowerShellProcessResult> RunAsync(
+            string script,
+            IReadOnlyDictionary<string, string> environment,
+            CancellationToken cancellationToken)
+        {
+            if (script.Contains("EGRESSGUARD_EXACT_RULE_QUERY", StringComparison.Ordinal)) QueryCount++;
+            if (script.Contains("EGRESSGUARD_CREATE_MUTATION", StringComparison.Ordinal)) CreateCount++;
+            if (script.Contains("EGRESSGUARD_EXACT_RULE_DELETE", StringComparison.Ordinal)) DeleteCount++;
+
+            var fixture = new Dictionary<string, string>(environment, StringComparer.OrdinalIgnoreCase)
+            {
+                ["EG_ACTUAL_DESCRIPTION"] = environment["EG_RULE_DESCRIPTION"],
+                ["EG_ACTUAL_PROGRAM"] = environment["EG_PROGRAM"],
+                ["EG_ACTUAL_REMOTE_ADDRESS"] = environment["EG_REMOTE_ADDRESS"],
+                ["EG_ACTUAL_REMOTE_PORT"] = environment["EG_REMOTE_PORT"],
+                ["EG_ACTUAL_PROTOCOL"] = environment["EG_PROTOCOL"],
+                ["EG_ACTUAL_ENABLED"] = environment["EG_ENABLED"],
+                ["EG_ACTUAL_PROFILE"] = environment["EG_PROFILE"]
+            };
+            foreach (var item in overrides)
+            {
+                fixture[item.Key] = item.Value;
+            }
+
+            LastEnvironment = fixture;
+            return _inner.RunAsync(MockFunctions + script, fixture, cancellationToken);
+        }
+
+        private const string MockFunctions = """
+            function Get-NetFirewallRule {
+              [CmdletBinding()] param()
+              [pscustomobject]@{DisplayName=$env:EG_RULE_NAME;Description=$env:EG_ACTUAL_DESCRIPTION;Direction='Outbound';Action=$env:EG_ACTION;Enabled=$env:EG_ACTUAL_ENABLED;Profile=$env:EG_ACTUAL_PROFILE}
+            }
+            function Get-NetFirewallApplicationFilter {
+              [CmdletBinding()] param([Parameter(ValueFromPipeline)]$Rule)
+              process { [pscustomobject]@{Program=$env:EG_ACTUAL_PROGRAM} }
+            }
+            function Get-NetFirewallAddressFilter {
+              [CmdletBinding()] param([Parameter(ValueFromPipeline)]$Rule)
+              process { [pscustomobject]@{RemoteAddress=$env:EG_ACTUAL_REMOTE_ADDRESS} }
+            }
+            function Get-NetFirewallPortFilter {
+              [CmdletBinding()] param([Parameter(ValueFromPipeline)]$Rule)
+              process { [pscustomobject]@{RemotePort=$env:EG_ACTUAL_REMOTE_PORT;Protocol=$env:EG_ACTUAL_PROTOCOL} }
+            }
+            """;
     }
 
     private sealed class DelayAfterCreateRunner(IPowerShellProcessRunner inner) : IPowerShellProcessRunner
