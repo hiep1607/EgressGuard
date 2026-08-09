@@ -12,7 +12,7 @@ public sealed class EgressGuardPipeClient : IAsyncDisposable
     public async Task ConnectAsync(TimeSpan timeout, CancellationToken cancellationToken)
     {
         await DisconnectAsync().ConfigureAwait(false);
-        _pipe = new NamedPipeClientStream(".", ProtocolConstants.PipeName, PipeDirection.InOut, PipeOptions.Asynchronous, System.Security.Principal.TokenImpersonationLevel.Identification);
+        _pipe = new NamedPipeClientStream(".", ProtocolConstants.PipeName, PipeDirection.InOut, PipeOptions.Asynchronous, System.Security.Principal.TokenImpersonationLevel.Impersonation);
         using var timeoutCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeoutCancellation.CancelAfter(timeout);
         await _pipe.ConnectAsync(timeoutCancellation.Token).ConfigureAwait(false);

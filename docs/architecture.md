@@ -1,4 +1,4 @@
-# Kiến trúc EgressGuard
+# Architecture
 
 ## Dependency direction
 
@@ -10,45 +10,43 @@ Persistence → Core
 Windows → Core
 ```
 
-UI không tham chiếu Windows hoặc Persistence và không sửa firewall trực tiếp. Core assembly chứa model và logic thuần. Các Stage 0 Windows source còn nằm vật lý trong thư mục Core để giảm rewrite, nhưng bị `Compile Remove` khỏi Core và được link/compile bởi Windows.
+UI never opens SQLite or changes Windows Firewall directly. Mutations cross the Named Pipe and the service verifies the impersonated client is an administrator.
 
-## Runtime flow
+## Runtime data and event path
 
 ```text
-IP Helper + Process snapshot
+IP Helper + process snapshot
   → WindowsFlowSensor
-  → FlowCoordinator
-  → RiskEngine
-  → PolicyEngine
-  → bounded persistence queue
-  → SQLite
-  → Named Pipe snapshot
-  → throttled WPF UI
+  → FlowCoordinator / RiskEngine / PolicyEngine
+  ├─→ bounded persistence queue (2,048) → SQLite
+  └─→ ServiceState transitions
+       → EventHub sequence + per-client bounded channel (512)
+       → Named Pipe subscription
+       → UI SequencedEventBuffer (4,096)
+       → 250 ms dispatcher batch
+       → incremental ObservableCollection update
 ```
 
-Queue giới hạn 2.048 item, một producer/một consumer. `TryWrite` thất bại sẽ tăng `DroppedEvents`. Sensor exception được cô lập theo iteration. Database failure không kích hoạt block-all; service fail-open.
+Snapshots are used only for initial connection, reconnect, manual refresh, queue overflow or a sequence gap. A slow subscriber cannot block the sensor: its channel is drained, a `ResyncRequired` marker is queued, and further events are skipped until reconnect. Disconnected subscriptions are removed from `EventHub`.
 
-## Event identity
+Event kinds are `FlowAdded`, `FlowUpdated`, `FlowRemoved`, `AlertRaised`, `ServiceStatusChanged`, and `ResyncRequired`. DataGrid row/column virtualization and recycling are enabled.
 
-- Process: `(PID, ProcessStartTime)`.
-- TCP flow: process identity + protocol/IP version + local/remote endpoints.
-- UDP: process identity + protocol/IP version + local endpoint; Windows API không có remote peer.
-- Executable cache: full path + file size + last-write time.
+## Identity and persistence
 
-## Persistence
+- Process identity: `(PID, ProcessStartTime)`.
+- TCP flow: process identity, protocol/IP version, local and remote endpoints.
+- UDP flow: process identity, protocol/IP version and local endpoint; Windows owner tables do not expose a remote peer.
+- Executable cache: normalized path, file size and last-write time; the cached record includes SHA-256.
+- SQLite schema version 2 adds `signature_status`. WAL, foreign keys, parameterized SQL, transactions, busy timeout and retention remain enabled.
 
-SQLite migration v1 tạo `executables`, `processes`, `network_flows`, `alerts`, `rules`, `baselines`, `settings`, `schema_versions`. SQL dùng parameter; related writes dùng transaction. WAL, foreign keys, busy timeout và index được cấu hình. Retention mặc định 30 ngày chạy khi service khởi động.
+## Authenticode
 
-## IPC
+`AuthenticodeVerifier` calls `WinVerifyTrust` with no UI and cache-only URL retrieval. It verifies embedded signatures and falls back to Windows Catalog lookup for catalog-signed system binaries. Status is one of `Unsigned`, `Valid`, `Invalid`, `Untrusted`, `Expired`, `Revoked`, `Unknown`, or `VerificationUnavailable`.
 
-Named Pipe `EgressGuard.Service.v1`, byte framing `length + JSON`, protocol version 1, maximum 1 MiB. Message type được allowlist trong switch; không có arbitrary type metadata. UI dùng timeout, cancellation và reconnect. Mutating commands xác minh Windows client identity là Administrator bằng pipe impersonation.
+Publisher subject is display metadata only. Risk treats only `Unsigned` as unsigned; `Unknown` and `VerificationUnavailable` are not auto-block signals. Network revocation lookup is not performed on the UI or sensor path.
 
-`SubscribeEvents` hiện được protocol nhận biết nhưng UI dùng snapshot polling/throttling để dễ reconnect. True push subscription là phần hardening còn lại.
+## Firewall ownership and safety
 
-## Firewall ownership
+Owned rule names are `EgressGuard-MVP-{guid}` and descriptions start with `Owned by EgressGuard MVP;`. Create validates administrator context, absolute path, protected-system policy, current SHA-256, ownership, direction, action and application path. Post-create validation removes the new rule on failure. A database failure after firewall creation triggers rule deletion.
 
-Rule name `EgressGuard-MVP-{guid}` và description `Owned by EgressGuard MVP;...`. Manager từ chối ownership mismatch, tạo idempotent, post-validates và rollback nếu validation thất bại. System32 executable không được automatic block. User block ưu tiên user allow khi conflict; quyết định này được test và tài liệu hóa.
-
-## Risk/baseline
-
-Risk score deterministic, clamp 0–100, reason có stable code/points/evidence. Threshold mặc định nằm trong `RiskThresholds`. Baseline version 1 theo executable SHA-256 + destination/protocol/port, không học blocked/critical flow và yêu cầu sample tối thiểu.
+Equivalent enabled rules are deduplicated at the service boundary. Delete/reset match both the prefix and ownership marker. System32 executables are not automatically blocked. Windows Firewall ultimately enforces program path, so replacement-after-creation remains a platform limitation; policy matching still requires the stored hash.

@@ -34,7 +34,8 @@ internal static class Program
             or InvalidOperationException
             or System.ComponentModel.Win32Exception)
         {
-            Console.Error.WriteLine($"Error: {exception.Message}");
+            var detail = string.IsNullOrWhiteSpace(exception.Message) ? exception.ToString() : exception.Message;
+            Console.Error.WriteLine($"Error: {detail}");
             return 1;
         }
     }

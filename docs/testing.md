@@ -1,47 +1,33 @@
-# Kiểm thử
+# Testing
 
-## Lệnh
+## Commands
 
 ```powershell
 dotnet build EgressGuard.sln -c Release
 dotnet run --project tests\EgressGuard.Tests\EgressGuard.Tests.csproj -c Release --no-build
 dotnet format EgressGuard.sln --verify-no-changes --no-restore
+.\tools\run-performance-test.ps1 -UiProcessId <pid> -ServiceProcessId <pid> -DurationSeconds 30
+.\tools\run-soak-test.ps1 -DurationMinutes 10
 ```
 
-## Automated tests đã chạy
+The custom runner is retained: it has deterministic Windows integration setup and returns a CI-compatible exit code. Migrating frameworks would not currently add enough isolation to justify the rewrite.
 
-19/19 pass trên Windows build `10.0.26200`:
+## Automated coverage
 
-- PID + start-time identity và process churn.
-- Port/endpoints, SHA/signature cache, simulator-only Stage 0 guard.
-- Controlled TCP IPv4, TCP IPv6, UDP owner PID và WindowsFlowSensor mapping.
-- Risk Low/Medium/High/Critical, clamp và determinism.
-- User block/allow conflict và system safety priority.
-- Baseline minimum samples, blocked-flow exclusion và reset.
-- SQLite migration idempotence, flow/alert/baseline persistence, retention/clear và lock behavior.
-- Protocol roundtrip, 1 MiB rejection, disconnect.
-- Worker Service Named Pipe disconnect/reconnect; service vẫn sống giữa clients.
+The suite covers process identity/churn, TCP IPv4/IPv6, UDP owner PID, flow sensing, executable cache invalidation, Authenticode status/HRESULT mapping, embedded and catalog signatures, tampered and missing files, firewall path/hash guards, risk/policy/baseline, SQLite schema/persistence/locking, framing/oversize/disconnect, event ordering/gap/overflow/slow client, flow add/update/remove, and a real service Named Pipe reconnect/event subscription.
 
-## Integration đã chạy
+Access-denied Authenticode is not automated because a reliable fixture requires ACL mutation and can produce machine-specific behavior. The verifier maps access/I/O failures to `VerificationUnavailable`.
 
-- Service console → IPC status/snapshot.
-- UI process launch; sau khi UI dừng, service vẫn status `Running=True`.
-- Service CPU khoảng 1.5%, working set khoảng 69 MB trong sample 6 giây.
-- UI CPU khoảng 8.46%, working set khoảng 168 MB trong hidden-process sample; CPU chưa đạt mục tiêu 3% và phép đo chưa thay thế profiler/visual QA.
+## Windows integration evidence
 
-## Chưa chạy do thiếu Administrator token
+- Public IPv4 connect-only probe to `1.1.1.1:443`: success before block, socket access denied while blocked, success after undo.
+- Same-name binary at a different path remained connected.
+- Duplicate request left exactly one owned rule.
+- Chrome retained established public TCP connections while the Simulator rule was active.
+- External rule deletion followed by two resets was idempotent; zero owned rules remained.
+- IPv6 was not verifiable because the workstation had no IPv6 route.
+- UI Automation selected and rendered Dashboard, Live Connections, Connection Detail, Alerts, Rules and Settings. A 641-row burst snapshot rendered responsively; selected-row and ComboBox contrast defects found during QA were fixed.
+- True subscription was exercised over the real service pipe and preserved sequence order.
+- The bounded soak ran 2 minutes/40 cycles with normal, burst, beacon, UI open/close and IPC checks: 0 failures; service RAM 56.2–78.0 MB.
 
-- Create/delete/enable/disable/reset Windows Firewall rule thật.
-- Rule rollback/drift trên firewall thật.
-- SCM install/recovery/uninstall.
-- Chrome/Edge unaffected test.
-
-Chạy `tools\test-firewall.ps1`, `tools\install-service.ps1` và `tools\uninstall-service.ps1` trong Administrator PowerShell. Script firewall luôn reset owned rules trong `finally`.
-
-## Manual UI checklist
-
-1. Mở Service và UI; kiểm tra Dashboard/Live/Detail/Alerts/Rules/Settings.
-2. Chạy Simulator burst/beacon; kiểm tra batch update và search/filter/sort.
-3. Đóng/mở UI; lịch sử/rules/baseline còn trong SQLite.
-4. Chuyển Monitor/Learning/Protect bằng client Administrator.
-5. Xác nhận alert dùng diễn đạt thận trọng và reason evidence đúng.
+See the acceptance and performance reports for limitations and exact measurements.

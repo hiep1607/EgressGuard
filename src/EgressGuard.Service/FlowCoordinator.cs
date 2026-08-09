@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Threading.Channels;
 using EgressGuard.Core;
 using EgressGuard.Persistence;
+using EgressGuard.Protocol;
 using EgressGuard.Windows;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -17,6 +18,7 @@ public sealed partial class FlowCoordinator : BackgroundService
     private readonly BaselineTracker _baseline;
     private readonly IFirewallRuleManager _firewall;
     private readonly ServiceState _state;
+    private readonly EventHub _eventHub;
     private readonly ILogger<FlowCoordinator> _logger;
     private readonly Channel<NetworkFlow> _persistenceQueue;
     private readonly ConcurrentDictionary<string, byte> _seenExecutables = new(StringComparer.OrdinalIgnoreCase);
@@ -29,6 +31,7 @@ public sealed partial class FlowCoordinator : BackgroundService
         BaselineTracker baseline,
         IFirewallRuleManager firewall,
         ServiceState state,
+        EventHub eventHub,
         ILogger<FlowCoordinator> logger)
     {
         _sensor = sensor;
@@ -37,6 +40,7 @@ public sealed partial class FlowCoordinator : BackgroundService
         _baseline = baseline;
         _firewall = firewall;
         _state = state;
+        _eventHub = eventHub;
         _logger = logger;
         _persistenceQueue = Channel.CreateBounded<NetworkFlow>(new BoundedChannelOptions(2048)
         {
@@ -48,6 +52,9 @@ public sealed partial class FlowCoordinator : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        // Let the host start PipeServer before the first potentially expensive
+        // process/hash/signature inventory runs.
+        await Task.Yield();
         try
         {
             await _database.InitializeAsync(stoppingToken).ConfigureAwait(false);
@@ -128,7 +135,23 @@ public sealed partial class FlowCoordinator : BackgroundService
             }
         }
 
-        _state.ReplaceSnapshot(assessed);
+        var changes = _state.ReplaceSnapshot(assessed);
+        foreach (var change in changes)
+        {
+            _eventHub.PublishFlow(change.Kind, change.Flow, change.FlowId);
+            if (change.Flow?.Risk?.Level is RiskLevel.High or RiskLevel.Critical)
+            {
+                _eventHub.PublishAlert(CreateAlert(change.Flow));
+            }
+        }
+
+        _eventHub.PublishStatus(new ServiceStatusMessage(
+            _state.Mode,
+            true,
+            _state.ActiveFlowCount,
+            _state.DroppedEvents,
+            _database.DatabasePath,
+            DateTimeOffset.UtcNow));
     }
 
     private NetworkFlow Assess(NetworkFlow flow, IReadOnlyList<FirewallRule> rules)
@@ -140,11 +163,12 @@ public sealed partial class FlowCoordinator : BackgroundService
             : $"{executableKey}|{flow.Destination.Address}|{flow.Destination.Port}|{flow.Protocol}";
         var firstExecutable = executableKey is not null && _seenExecutables.TryAdd(executableKey, 0);
         var firstDestination = destinationKey is not null && _seenDestinations.TryAdd(destinationKey, 0);
-        var blockedDestination = rules.Any(rule => rule.Enabled && rule.Action == FirewallAction.Block
-            && (string.Equals(rule.RemoteAddress, flow.Destination?.Address.ToString(), StringComparison.OrdinalIgnoreCase)
-                || string.Equals(rule.RemoteAddress, flow.Destination?.Domain, StringComparison.OrdinalIgnoreCase)));
+        var blockedDestination = rules.Any(rule =>
+            rule.Enabled
+            && rule.Action == FirewallAction.Block
+            && PolicyEngine.RuleMatches(rule, flow));
         var signals = new RiskSignals(
-            IsUnsigned: flow.Executable?.IsSigned == false,
+            IsUnsigned: flow.Executable?.SignatureStatus == SignatureVerificationStatus.Unsigned,
             IsInTemp: flow.Executable?.IsInTemp == true,
             IsInUnusualAppData: flow.Executable?.IsInAppData == true,
             IsFirstSeenExecutable: firstExecutable,
@@ -248,6 +272,16 @@ public sealed partial class FlowCoordinator : BackgroundService
         var bytes = SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(flowId));
         return new Guid(bytes.AsSpan(0, 16));
     }
+
+    private static SecurityAlert CreateAlert(NetworkFlow flow) => new(
+        DeterministicRuleId("alert|" + flow.Id),
+        flow.Id,
+        flow.FirstSeen,
+        flow.ProcessName,
+        flow.Destination is null ? "Remote endpoint unavailable" : $"{flow.Destination.Address}:{flow.Destination.Port}",
+        flow.Risk!,
+        null,
+        false);
 
     [LoggerMessage(Level = LogLevel.Error, Message = "Database initialization failed. Protection remains fail-open; no automatic firewall changes will occur.")]
     private static partial void LogDatabaseInitializationFailed(ILogger logger, Exception exception);

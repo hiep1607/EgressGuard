@@ -1,28 +1,7 @@
-# Báo cáo Giai đoạn 1
+# Phase 1 report
 
-## Hoàn thành
+Implemented and tested: process/connection model, TCP/UDP IPv4/IPv6 sensor, executable identity cache, SQLite v2 persistence, WPF Dashboard/Live/Detail/Alerts/Rules/Settings, filtering/sorting, virtualization, tray integration and true event-driven updates.
 
-- Event model, executable metadata cache, TCP/UDP IPv4/IPv6 sensor.
-- SQLite migration/schema/index/transaction/parameter/retention.
-- WPF Dashboard, Live Connections, Connection Detail, Alerts, Rules, Settings.
-- Search process/IP/domain, protocol/IP/risk filters và DataGrid sorting.
-- UI polling 2 giây, rules/alerts polling thưa hơn; không hash/signature trên UI thread.
+Hardening replaced realtime snapshot polling with sequenced incremental events. Snapshot remains a reconnect/resync/manual fallback. Authenticode now distinguishes trust states using WinVerifyTrust and Windows Catalog signatures.
 
-## Module chính
-
-`Core`, `Windows`, `Persistence`, `UI`, `Protocol`.
-
-## Test
-
-Build 0 warning/error; model/mapping/cache/persistence/IPv4/IPv6/TCP/UDP pass trong bộ 19 test.
-
-## Chưa kiểm thử đầy đủ
-
-- Visual QA tương tác dài hạn.
-- UI hidden-process CPU đo 8.46%, chưa đạt mục tiêu dưới 3%.
-- Domain luôn null nếu không có process-correlated DNS evidence.
-- Authenticode chỉ kiểm tra embedded certificate/publisher subject, chưa verify trust/revocation.
-
-## Điều kiện chuyển phase
-
-Kiến trúc và data path đủ để phát triển Service; performance/visual hardening vẫn còn.
+Visual QA found and fixed collection-view crash, tab/selection/ComboBox contrast, default sizing, and a false-positive rule comparison. Dark theme is supported; a light theme is not advertised. Current-scale and small/maximized window QA were performed; forced 100/125/150 percent OS scaling was not changed during this session.

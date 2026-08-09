@@ -1,136 +1,87 @@
 # EgressGuard
 
-EgressGuard là ứng dụng Windows local-first quan sát outbound connection theo process, lưu lịch sử cục bộ, đánh giá rủi ro bằng rule có thể giải thích và quản lý Windows Firewall rule thuộc riêng EgressGuard.
+EgressGuard is a Windows, local-first outbound connection monitor. It maps TCP/UDP endpoints to process identity, stores local history in SQLite, assesses explainable risk, and manages only firewall rules carrying the EgressGuard ownership marker.
 
-Repository hiện triển khai phạm vi Giai đoạn 0–3. Không có ETW file monitoring, packet payload capture, HTTPS decryption, driver, AI/ML, cloud, malware thật, quarantine hay process killing.
+The repository implements Phases 0–3. It does **not** include ETW file correlation, packet payload capture, TLS interception, a driver, cloud telemetry, process killing, or malware execution.
 
-## Thành phần
+## Components
 
 ```text
 src/
-├─ EgressGuard.Core/         domain model, baseline, risk và policy
-├─ EgressGuard.Windows/      IP Helper/process/firewall adapters
-├─ EgressGuard.Persistence/  SQLite migrations và repositories
-├─ EgressGuard.Protocol/     versioned Named Pipe messages/framing
-├─ EgressGuard.Service/      Worker Service, sensor loop, queue, IPC
-├─ EgressGuard.UI/           WPF dashboard/live/detail/alerts/rules/settings
-└─ EgressGuard.Cli/          Stage 0 watcher và service diagnostics
+├─ EgressGuard.Core/         domain model, baseline, risk and policy
+├─ EgressGuard.Windows/      IP Helper, process, Authenticode and firewall adapters
+├─ EgressGuard.Persistence/  SQLite schema and repositories
+├─ EgressGuard.Protocol/     framed Named Pipe request and event clients
+├─ EgressGuard.Service/      sensor, bounded queues, event fan-out and IPC
+├─ EgressGuard.UI/           WPF dashboard, live/detail/alerts/rules/settings and tray
+└─ EgressGuard.Cli/          diagnostics and service commands
 ```
 
-`Core` assembly không compile Windows-specific Stage 0 adapters; các source compatibility file còn ở thư mục cũ được link và compile bởi `EgressGuard.Windows` để tránh viết lại phần đã kiểm thử.
+## Build and test
 
-## Dependency
-
-- `Microsoft.Data.Sqlite 8.0.29`: raw parameterized SQL, không dùng Entity Framework.
-- `Microsoft.Extensions.Hosting 8.0.1` và `Microsoft.Extensions.Hosting.WindowsServices 8.0.1`: Worker Service và Windows SCM lifetime.
-- Không có MVVM framework hoặc dependency UI bên thứ ba.
-
-## Build và test
-
-Yêu cầu Windows 11 x64 và .NET 8 SDK.
+Windows 11 x64 and the .NET 8 SDK are required.
 
 ```powershell
-dotnet build EgressGuard.sln --configuration Release
-dotnet run --project tests\EgressGuard.Tests\EgressGuard.Tests.csproj --configuration Release --no-build
+dotnet build EgressGuard.sln -c Release
+dotnet run --project tests\EgressGuard.Tests\EgressGuard.Tests.csproj -c Release --no-build
 dotnet format EgressGuard.sln --verify-no-changes --no-restore
 ```
 
-## Chạy development mode
-
-Terminal 1:
+## Development run
 
 ```powershell
 $env:EGRESSGUARD_DATA_DIR = Join-Path $env:LOCALAPPDATA 'EgressGuard-Dev'
 .\src\EgressGuard.Service\bin\Release\net8.0-windows\EgressGuard.Service.exe
-```
-
-Terminal 2:
-
-```powershell
 .\src\EgressGuard.UI\bin\Release\net8.0-windows\EgressGuard.UI.exe
 ```
 
-Chẩn đoán không cần UI:
+Closing the UI releases its request pipe, event pipe, timer and cancellation source. It does not stop the service. The tray provides Open Dashboard, current protection/service state, and Exit UI.
 
-```powershell
-.\src\EgressGuard.Cli\bin\Release\net8.0-windows\EgressGuard.Cli.exe service status
-.\src\EgressGuard.Cli\bin\Release\net8.0-windows\EgressGuard.Cli.exe service flows
-```
-
-Đóng UI không dừng service. Mode mặc định là `Learning`; mode đã chọn được lưu trong SQLite.
-
-## Test Server và Simulator
+## Safe synthetic traffic
 
 ```powershell
 .\tools\EgressGuard.TestServer\bin\Release\net8.0-windows\EgressGuard.TestServer.exe --protocol both --port 5050
-.\tools\EgressGuard.Simulator\bin\Release\net8.0-windows\EgressGuard.Simulator.exe --protocol tcp --port 5050 --mode small --bytes 5120 --hold-seconds 15
+.\tools\EgressGuard.Simulator\bin\Release\net8.0-windows\EgressGuard.Simulator.exe --protocol tcp --port 5050 --mode small --bytes 5120 --hold-seconds 5
 ```
 
-Burst và beacon/nhiều connection:
+For a harmless public enforcement probe with no payload:
 
 ```powershell
-.\tools\EgressGuard.Simulator\bin\Release\net8.0-windows\EgressGuard.Simulator.exe --protocol tcp --port 5050 --mode burst --bytes 10485760 --hold-seconds 0
-.\tools\EgressGuard.Simulator\bin\Release\net8.0-windows\EgressGuard.Simulator.exe --protocol tcp --port 5050 --mode small --bytes 512 --hold-seconds 0 --connections 20 --connection-interval-ms 1000
+.\EgressGuard.Simulator.exe --host 1.1.1.1 --port 443 --connect-only --hold-seconds 0
 ```
 
-Tất cả payload được sinh trong RAM và chỉ gửi tới localhost. UDP remote hiển thị `*:*` vì `GetExtendedUdpTable` chỉ cung cấp local bound endpoint/PID.
-
-## Publish, cài và gỡ service
+## Windows Service
 
 Administrator PowerShell:
 
 ```powershell
 dotnet publish .\src\EgressGuard.Service\EgressGuard.Service.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true
 .\tools\install-service.ps1 -PublishedDirectory .\src\EgressGuard.Service\bin\Release\net8.0-windows\win-x64\publish
-Get-Service EgressGuard.Service
-```
-
-Gỡ service và owned rules:
-
-```powershell
+sc.exe qfailure EgressGuard.Service
 .\tools\uninstall-service.ps1
 ```
 
-Script cài đặt cấu hình automatic start và recovery restart. Script gỡ chỉ xóa service exact-name và firewall rule có đúng prefix + ownership marker.
+Framework-dependent deployment requires a machine-wide .NET 8 runtime visible to LocalSystem. The installer now rolls back the SCM entry if configuration or start fails. This workstation had no registered runtime; a self-contained acceptance build initially ran, while a later rebuilt unsigned service was blocked by the workstation's Application Control policy. See [acceptance-report.md](docs/acceptance-report.md).
 
-## Firewall commands
+## Firewall acceptance
 
-Service phải chạy elevated; client gửi lệnh phải có Administrator identity.
-
-```powershell
-$cli = '.\src\EgressGuard.Cli\bin\Release\net8.0-windows\EgressGuard.Cli.exe'
-$simulator = (Resolve-Path '.\tools\EgressGuard.Simulator\bin\Release\net8.0-windows\EgressGuard.Simulator.exe').Path
-& $cli service block --path $simulator
-& $cli service allow --path $simulator
-& $cli service reset-rules
-```
-
-Nghiệm thu có rollback:
+The service and calling client must both have the required administrator context. The script uses a public TCP connect-only probe, always resets owned rules in `finally`, and never changes a firewall profile.
 
 ```powershell
-.\tools\test-firewall.ps1
+.\tools\test-firewall.ps1 `
+  -SimulatorPath 'D:\path with spaces\EgressGuard.Simulator.exe' `
+  -AlternateSimulatorPath 'D:\other path\EgressGuard.Simulator.exe'
 ```
 
-Kiểm tra thủ công Chrome/Edge vẫn có Internet trong khi Simulator bị block.
+Rules are path-bound by Windows Firewall. EgressGuard verifies SHA-256 immediately before creation and policy matching includes path plus hash, but Windows Firewall cannot keep enforcing the hash after the file is replaced. Refresh identity and recreate the rule after executable changes.
 
-Reset khẩn cấp chỉ các MVP rule thuộc EgressGuard:
+## Reports
 
-```powershell
-Get-NetFirewallRule -ErrorAction SilentlyContinue |
-  Where-Object {$_.DisplayName -like 'EgressGuard-MVP-*' -and $_.Description -like 'Owned by EgressGuard MVP;*'} |
-  Remove-NetFirewallRule
-```
+- [Architecture](docs/architecture.md)
+- [Testing](docs/testing.md)
+- [Privacy](docs/privacy.md)
+- [Acceptance](docs/acceptance-report.md)
+- [Performance](docs/performance-report.md)
+- [Administrator checklist](docs/windows-admin-checklist.md)
 
-## Tài liệu
-
-- [Kiến trúc](docs/architecture.md)
-- [Threat model](docs/threat-model.md)
-- [Quyền riêng tư](docs/privacy.md)
-- [Kiểm thử](docs/testing.md)
-- [Báo cáo Giai đoạn 1](docs/phase-1-report.md)
-- [Báo cáo Giai đoạn 2](docs/phase-2-report.md)
-- [Báo cáo Giai đoạn 3](docs/phase-3-report.md)
-
-## Trạng thái hiện tại
-
-Build sạch và 19/19 automated tests pass trên Windows hiện tại. TCP IPv4/IPv6, UDP PID mapping, SQLite, risk/policy/baseline và service IPC reconnect đã được chạy thật. Firewall mutation, SCM install/uninstall và ảnh hưởng loopback vẫn cần terminal Administrator. UI launch/service independence đã kiểm tra; visual QA tương tác và CPU target chưa đạt đầy đủ. Không chuyển sang Giai đoạn 4 trước khi hoàn tất các mục này.
+Phase 4/ETW is intentionally not implemented. The final SCM restart and soak gates remain open, so the project is not yet declared ready for Phase 4.

@@ -7,5 +7,6 @@
     <ProjectReference Include="..\..\src\EgressGuard.Windows\EgressGuard.Windows.csproj" />
     <ProjectReference Include="..\..\src\EgressGuard.Persistence\EgressGuard.Persistence.csproj" />
     <ProjectReference Include="..\..\src\EgressGuard.Protocol\EgressGuard.Protocol.csproj" />
+    <ProjectReference Include="..\..\src\EgressGuard.Service\EgressGuard.Service.csproj" />
   </ItemGroup>
 </Project>

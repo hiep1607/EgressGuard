@@ -15,6 +15,76 @@
             <Setter Property="BorderBrush" Value="#3B5268" />
         </Style>
         <Style TargetType="TextBox"><Setter Property="Padding" Value="8,6" /><Setter Property="Margin" Value="4" /></Style>
-        <Style TargetType="ComboBox"><Setter Property="Padding" Value="8,5" /><Setter Property="Margin" Value="4" /></Style>
+        <Style TargetType="ComboBox"><Setter Property="Padding" Value="8,5" /><Setter Property="Margin" Value="4" /><Setter Property="Foreground" Value="#101820" /><Setter Property="Background" Value="#F3F6F8" /></Style>
+        <Style TargetType="DataGrid">
+            <Setter Property="EnableRowVirtualization" Value="True" />
+            <Setter Property="EnableColumnVirtualization" Value="True" />
+            <Setter Property="VirtualizingPanel.IsVirtualizing" Value="True" />
+            <Setter Property="VirtualizingPanel.VirtualizationMode" Value="Recycling" />
+            <Setter Property="ScrollViewer.CanContentScroll" Value="True" />
+            <Setter Property="BorderBrush" Value="#324557" />
+            <Setter Property="GridLinesVisibility" Value="Horizontal" />
+            <Setter Property="HorizontalGridLinesBrush" Value="#2B3B4A" />
+        </Style>
+        <Style TargetType="DataGridColumnHeader">
+            <Setter Property="Background" Value="#202C38" />
+            <Setter Property="Foreground" Value="#B9C8D6" />
+            <Setter Property="BorderBrush" Value="#324557" />
+            <Setter Property="Padding" Value="8,7" />
+        </Style>
+        <Style TargetType="DataGridCell">
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Padding" Value="6,3" />
+            <Setter Property="Foreground" Value="#E8EEF5" />
+            <Style.Triggers>
+                <Trigger Property="IsSelected" Value="True">
+                    <Setter Property="Background" Value="#2B806B" />
+                    <Setter Property="Foreground" Value="White" />
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+        <Style TargetType="DataGridRow">
+            <Setter Property="Foreground" Value="#E8EEF5" />
+            <Style.Triggers>
+                <Trigger Property="IsSelected" Value="True">
+                    <Setter Property="Background" Value="#2B806B" />
+                    <Setter Property="Foreground" Value="White" />
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+        <Style TargetType="TabControl">
+            <Setter Property="BorderBrush" Value="#324557" />
+        </Style>
+        <Style TargetType="TabItem">
+            <Setter Property="Foreground" Value="#AFC0CF" />
+            <Setter Property="Background" Value="#18212B" />
+            <Setter Property="BorderBrush" Value="#324557" />
+            <Setter Property="Padding" Value="12,7" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TabItem">
+                        <Border x:Name="TabBorder" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter ContentSource="Header" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="TabBorder" Property="Background" Value="#45D1A3" />
+                                <Setter Property="Foreground" Value="#0E141B" />
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="TabBorder" Property="Background" Value="#263646" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <Trigger Property="IsSelected" Value="True">
+                    <Setter Property="Foreground" Value="#0E141B" />
+                    <Setter Property="Background" Value="#45D1A3" />
+                    <Setter Property="FontWeight" Value="SemiBold" />
+                </Trigger>
+            </Style.Triggers>
+        </Style>
     </Application.Resources>
 </Application>

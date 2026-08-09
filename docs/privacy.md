@@ -1,25 +1,11 @@
-# Quyền riêng tư
+# Privacy
 
-EgressGuard local-first. Database mặc định nằm trong LocalAppData khi chạy interactive và ProgramData khi chạy Windows Service.
+EgressGuard is local-first. Interactive data defaults to LocalAppData and Windows Service data defaults to `C:\ProgramData\EgressGuard`.
 
-## Dữ liệu lưu
+Stored data includes process name, PID/start time, parent PID, executable path/SHA-256/size/time, Authenticode status, publisher display metadata, endpoint metadata, state/timestamps, risk reasons, baselines, settings and owned-rule records.
 
-- Process name, PID + start time, parent PID.
-- Executable path, SHA-256, embedded signing certificate subject nếu có, size/last-write time.
-- TCP/UDP endpoint metadata, state và timestamps.
-- Risk reasons, baseline counters, settings và EgressGuard-owned rules.
+EgressGuard does not collect packet payload, TLS content, documents, browser profiles, cookies, passwords, command lines, credentials, cloud telemetry or threat-intelligence queries. The public firewall acceptance probe uses TCP connect-only mode and sends no payload.
 
-## Không thu thập
+Publisher subject is not treated as proof of trust. Signature verification uses Windows trust APIs; cache-only trust evaluation avoids sensor/UI network revocation traffic. Offline or inaccessible verification becomes `VerificationUnavailable`, not `Unsigned`, and does not by itself trigger blocking.
 
-- Packet payload, HTTPS content, file content.
-- Documents, browser profile, cookies, password database.
-- Command line, credential hoặc secret.
-- Cloud telemetry hoặc threat-intelligence lookup.
-
-## Kiểm soát
-
-- Retention flow mặc định 30 ngày.
-- Settings có Clear History và Reset Baseline.
-- Uninstall script reset owned firewall rules; database không tự xóa để tránh mất dữ liệu ngoài ý muốn. Người dùng có thể xóa thư mục dữ liệu sau khi xác nhận.
-
-Publisher hiện lấy từ subject của embedded signing certificate. Đây là metadata, không phải xác minh certificate trust/revocation đầy đủ.
+Flow retention defaults to 30 days. Clear History and Reset Baseline are explicit confirmed UI actions. Uninstall removes only owned firewall rules and leaves the database to avoid unexpected data loss.

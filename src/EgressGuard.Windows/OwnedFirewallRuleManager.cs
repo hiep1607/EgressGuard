@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Security.Cryptography;
 using System.Text.Json;
 using EgressGuard.Core;
 
@@ -21,6 +22,7 @@ public sealed class OwnedFirewallRuleManager : IFirewallRuleManager
     public async Task CreateAsync(FirewallRule rule, CancellationToken cancellationToken)
     {
         ValidateRule(rule);
+        ValidateExecutableHash(rule);
         EnsureAdministrator();
         var script = """
             $ErrorActionPreference='Stop'
@@ -28,6 +30,9 @@ public sealed class OwnedFirewallRuleManager : IFirewallRuleManager
             $existing=@(Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue)
             if($existing.Count -gt 0) {
               if(@($existing | Where-Object {$_.Description -ne $description}).Count -gt 0) { throw 'Rule ownership mismatch.' }
+              if($existing.Count -ne 1) { throw 'Duplicate firewall rules exist for this EgressGuard rule ID.' }
+              $application=$existing | Get-NetFirewallApplicationFilter
+              if(-not [string]::Equals($application.Program,$env:EG_PROGRAM,[StringComparison]::OrdinalIgnoreCase) -or $existing.Direction -ne 'Outbound' -or $existing.Action -ne $env:EG_ACTION) { throw 'Existing rule semantics do not match the requested rule.' }
               Write-Output 'UNCHANGED'; exit 0
             }
             $parameters=@{DisplayName=$name;Description=$description;Direction='Outbound';Action=$env:EG_ACTION;Program=$env:EG_PROGRAM;Profile='Any';Enabled='True'}
@@ -36,7 +41,8 @@ public sealed class OwnedFirewallRuleManager : IFirewallRuleManager
             if($env:EG_PROTOCOL) {$parameters.Protocol=$env:EG_PROTOCOL}
             New-NetFirewallRule @parameters | Out-Null
             $created=Get-NetFirewallRule -DisplayName $name -ErrorAction Stop
-            if($created.Description -ne $description) { Remove-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue; throw 'Post-create validation failed; rolled back.' }
+            $createdApplication=$created | Get-NetFirewallApplicationFilter
+            if(@($created).Count -ne 1 -or $created.Description -ne $description -or -not [string]::Equals($createdApplication.Program,$env:EG_PROGRAM,[StringComparison]::OrdinalIgnoreCase) -or $created.Direction -ne 'Outbound' -or $created.Action -ne $env:EG_ACTION) { Remove-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue; throw 'Post-create validation failed; rolled back.' }
             Write-Output 'CREATED'
             """;
         var environment = CreateEnvironment(rule);
@@ -104,6 +110,27 @@ public sealed class OwnedFirewallRuleManager : IFirewallRuleManager
         }
     }
 
+    public static void ValidateExecutableHash(FirewallRule rule)
+    {
+        ArgumentNullException.ThrowIfNull(rule);
+        if (!File.Exists(rule.ExecutablePath))
+        {
+            throw new FileNotFoundException("Firewall rule executable does not exist.", rule.ExecutablePath);
+        }
+
+        if (string.IsNullOrWhiteSpace(rule.ExecutableSha256) || rule.ExecutableSha256.Length != 64)
+        {
+            throw new ArgumentException("Firewall rule requires a SHA-256 executable identity.", nameof(rule));
+        }
+
+        using var stream = new FileStream(rule.ExecutablePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        var actualHash = Convert.ToHexString(SHA256.HashData(stream));
+        if (!actualHash.Equals(rule.ExecutableSha256, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("Executable changed after the rule was proposed; refresh its identity before enforcing.");
+        }
+    }
+
     public static bool IsProtectedSystemExecutable(string path)
     {
         var windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
@@ -113,7 +140,7 @@ public sealed class OwnedFirewallRuleManager : IFirewallRuleManager
     private static Dictionary<string, string> CreateEnvironment(FirewallRule rule)
     {
         var environment = RuleIdEnvironment(rule.Id);
-        environment["EG_RULE_DESCRIPTION"] = DescriptionPrefix + JsonSerializer.Serialize(new { id = rule.Id, hash = rule.ExecutableSha256 });
+        environment["EG_RULE_DESCRIPTION"] = DescriptionPrefix + JsonSerializer.Serialize(new { id = rule.Id, hash = rule.ExecutableSha256, action = rule.Action, path = Path.GetFullPath(rule.ExecutablePath) });
         environment["EG_ACTION"] = rule.Action.ToString();
         environment["EG_PROGRAM"] = Path.GetFullPath(rule.ExecutablePath);
         environment["EG_REMOTE_ADDRESS"] = rule.RemoteAddress ?? string.Empty;

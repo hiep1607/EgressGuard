@@ -28,4 +28,5 @@ runtime/
 .dotnet/
 TestResults/
 coverage/
+artifacts/
 *.trx

@@ -72,7 +72,7 @@ public sealed class WindowsFlowSensor : INetworkFlowSensor
         return new ExecutableInfo(
             path,
             process.ExecutableMetadata.Sha256,
-            process.ExecutableMetadata.HasDigitalSignature,
+            process.ExecutableMetadata.SignatureStatus,
             process.ExecutableMetadata.Publisher,
             process.ExecutableMetadata.FileSize,
             process.ExecutableMetadata.LastWriteTime,

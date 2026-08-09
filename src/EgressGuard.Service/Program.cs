@@ -22,6 +22,7 @@ builder.Services.AddSingleton<IFirewallRuleManager, OwnedFirewallRuleManager>();
 builder.Services.AddSingleton<RiskEngine>();
 builder.Services.AddSingleton<BaselineTracker>();
 builder.Services.AddSingleton<ServiceState>();
+builder.Services.AddSingleton<EventHub>();
 builder.Services.AddHostedService<FlowCoordinator>();
 builder.Services.AddHostedService<PipeServer>();
 if (int.TryParse(Environment.GetEnvironmentVariable("EGRESSGUARD_TEST_DURATION_SECONDS"), out var testDurationSeconds)

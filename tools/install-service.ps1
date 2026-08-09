@@ -22,7 +22,16 @@ if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
 
 sc.exe create $serviceName binPath= ('"' + $executable + '"') start= auto DisplayName= 'EgressGuard Service' | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "sc.exe create failed with exit code $LASTEXITCODE" }
-sc.exe failure $serviceName reset= 86400 actions= restart/5000/restart/15000/none/0 | Out-Null
-sc.exe failureflag $serviceName 1 | Out-Null
-Start-Service -Name $serviceName
-Write-Host "Installed and started $serviceName"
+try {
+    sc.exe failure $serviceName reset= 86400 actions= restart/5000/restart/15000/none/0 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "sc.exe failure failed with exit code $LASTEXITCODE" }
+    sc.exe failureflag $serviceName 1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "sc.exe failureflag failed with exit code $LASTEXITCODE" }
+    Start-Service -Name $serviceName
+    (Get-Service -Name $serviceName).WaitForStatus('Running', [TimeSpan]::FromSeconds(20))
+    Write-Host "Installed and started $serviceName"
+}
+catch {
+    sc.exe delete $serviceName | Out-Null
+    throw
+}

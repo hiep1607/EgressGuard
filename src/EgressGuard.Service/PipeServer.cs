@@ -14,13 +14,15 @@ public sealed partial class PipeServer : BackgroundService
     private readonly ServiceState _state;
     private readonly EgressGuardDatabase _database;
     private readonly IFirewallRuleManager _firewall;
+    private readonly EventHub _eventHub;
     private readonly ILogger<PipeServer> _logger;
 
-    public PipeServer(ServiceState state, EgressGuardDatabase database, IFirewallRuleManager firewall, ILogger<PipeServer> logger)
+    public PipeServer(ServiceState state, EgressGuardDatabase database, IFirewallRuleManager firewall, EventHub eventHub, ILogger<PipeServer> logger)
     {
         _state = state;
         _database = database;
         _firewall = firewall;
+        _eventHub = eventHub;
         _logger = logger;
     }
 
@@ -67,18 +69,27 @@ public sealed partial class PipeServer : BackgroundService
                         break;
                     }
 
+                    if (request.Type == MessageTypes.SubscribeEvents)
+                    {
+                        await StreamEventsAsync(pipe, request, stoppingToken).ConfigureAwait(false);
+                        return;
+                    }
+
                     var response = await DispatchAsync(pipe, request, stoppingToken).ConfigureAwait(false);
                     await MessageFraming.WriteAsync(pipe, response, stoppingToken).ConfigureAwait(false);
                 }
                 catch (Exception exception) when (exception is IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException)
                 {
-                    LogRequestRejected(_logger, exception.Message);
+                    var detail = string.IsNullOrWhiteSpace(exception.Message)
+                        ? exception.GetType().FullName ?? exception.GetType().Name
+                        : exception.Message;
+                    LogRequestRejected(_logger, detail);
                     if (!pipe.IsConnected)
                     {
                         break;
                     }
 
-                    var error = MessageEnvelope.Create(MessageTypes.Error, new ErrorMessage("REQUEST_REJECTED", exception.Message));
+                    var error = MessageEnvelope.Create(MessageTypes.Error, new ErrorMessage("REQUEST_REJECTED", detail));
                     await MessageFraming.WriteAsync(pipe, error, stoppingToken).ConfigureAwait(false);
                 }
                 catch (Exception exception)
@@ -113,17 +124,36 @@ public sealed partial class PipeServer : BackgroundService
                     new ServiceStatusMessage(_state.Mode, true, _state.ActiveFlowCount, _state.DroppedEvents, _database.DatabasePath, DateTimeOffset.UtcNow),
                     request.CorrelationId);
             case MessageTypes.GetActiveFlows:
-                return MessageEnvelope.Create(MessageTypes.GetActiveFlows, new ActiveFlowsMessage(_state.Snapshot()), request.CorrelationId);
+                return MessageEnvelope.Create(MessageTypes.GetActiveFlows, new ActiveFlowsMessage(_state.Snapshot(), _eventHub.CurrentSequence), request.CorrelationId);
             case MessageTypes.GetRules:
                 return MessageEnvelope.Create(MessageTypes.GetRules, new RulesMessage(await _database.GetRulesAsync(cancellationToken).ConfigureAwait(false)), request.CorrelationId);
             case MessageTypes.GetAlerts:
                 return MessageEnvelope.Create(MessageTypes.GetAlerts, new AlertsMessage(await _database.GetRecentAlertsAsync(200, cancellationToken).ConfigureAwait(false)), request.CorrelationId);
-            case MessageTypes.SubscribeEvents:
-                return Success(request, "Subscription acknowledged; Stage 3 UI uses throttled snapshots for reconnect safety.");
             case MessageTypes.CreateRule:
                 var rule = request.ReadPayload<CreateRuleMessage>().Rule;
+                var duplicate = (await _database.GetRulesAsync(cancellationToken).ConfigureAwait(false)).FirstOrDefault(existing =>
+                    existing.Enabled
+                    && existing.Action == rule.Action
+                    && string.Equals(existing.ExecutablePath, rule.ExecutablePath, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(existing.ExecutableSha256, rule.ExecutableSha256, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(existing.RemoteAddress, rule.RemoteAddress, StringComparison.OrdinalIgnoreCase)
+                    && existing.RemotePort == rule.RemotePort
+                    && existing.Protocol == rule.Protocol);
+                if (duplicate is not null)
+                {
+                    return Success(request, $"Equivalent rule already exists: {duplicate.Id:D}.");
+                }
+
                 await _firewall.CreateAsync(rule, cancellationToken).ConfigureAwait(false);
-                await _database.SaveRuleAsync(rule, cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await _database.SaveRuleAsync(rule, cancellationToken).ConfigureAwait(false);
+                }
+                catch
+                {
+                    await _firewall.DeleteAsync(rule.Id, CancellationToken.None).ConfigureAwait(false);
+                    throw;
+                }
                 return Success(request, "Rule created.");
             case MessageTypes.DeleteRule:
                 var ruleId = request.ReadPayload<DeleteRuleMessage>().RuleId;
@@ -165,7 +195,7 @@ public sealed partial class PipeServer : BackgroundService
         var authorized = false;
         pipe.RunAsClient(() =>
         {
-            using var identity = WindowsIdentity.GetCurrent(TokenAccessLevels.Query);
+            using var identity = WindowsIdentity.GetCurrent();
             authorized = new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
         });
         return authorized;
@@ -173,6 +203,29 @@ public sealed partial class PipeServer : BackgroundService
 
     private static MessageEnvelope Success(MessageEnvelope request, string message) =>
         MessageEnvelope.Create(MessageTypes.Success, new SuccessMessage(message), request.CorrelationId);
+
+    private async Task StreamEventsAsync(
+        NamedPipeServerStream pipe,
+        MessageEnvelope request,
+        CancellationToken cancellationToken)
+    {
+        var subscriptionRequest = request.ReadPayload<SubscribeEventsMessage>();
+        await using var subscription = _eventHub.Subscribe(subscriptionRequest.LastSequence);
+        await MessageFraming.WriteAsync(pipe, Success(request, "Event subscription active."), cancellationToken).ConfigureAwait(false);
+        await foreach (var streamEvent in subscription.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+        {
+            var messageType = streamEvent.Kind switch
+            {
+                StreamEventKind.AlertRaised => MessageTypes.AlertRaised,
+                StreamEventKind.ServiceStatusChanged => MessageTypes.ServiceStatusChanged,
+                _ => MessageTypes.FlowObserved
+            };
+            await MessageFraming.WriteAsync(
+                pipe,
+                MessageEnvelope.Create(messageType, streamEvent),
+                cancellationToken).ConfigureAwait(false);
+        }
+    }
 
     [LoggerMessage(Level = LogLevel.Error, Message = "Named pipe accept failed; retrying.")]
     private static partial void LogAcceptFailed(ILogger logger, Exception exception);

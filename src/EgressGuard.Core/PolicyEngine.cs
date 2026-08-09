@@ -12,7 +12,7 @@ public sealed class PolicyEngine
     {
         ArgumentNullException.ThrowIfNull(flow);
         ArgumentNullException.ThrowIfNull(rules);
-        var enabled = rules.Where(rule => rule.Enabled && Matches(rule, flow)).ToArray();
+        var enabled = rules.Where(rule => rule.Enabled && RuleMatches(rule, flow)).ToArray();
 
         var userBlock = enabled.FirstOrDefault(rule => rule.Source == RuleSource.User && rule.Action == FirewallAction.Block);
         if (userBlock is not null)
@@ -42,7 +42,7 @@ public sealed class PolicyEngine
             null);
     }
 
-    private static bool Matches(FirewallRule rule, NetworkFlow flow)
+    public static bool RuleMatches(FirewallRule rule, NetworkFlow flow)
     {
         if (!string.Equals(rule.ExecutablePath, flow.Executable?.Path, StringComparison.OrdinalIgnoreCase))
         {

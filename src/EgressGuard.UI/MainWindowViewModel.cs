@@ -1,7 +1,6 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.IO;
-using System.Net;
 using System.Runtime.CompilerServices;
 using System.Windows.Data;
 using System.Windows.Input;
@@ -14,7 +13,14 @@ namespace EgressGuard.UI;
 public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposable
 {
     private readonly EgressGuardPipeClient _client = new();
-    private readonly DispatcherTimer _timer;
+    private readonly EgressGuardEventClient _eventClient = new();
+    private readonly SequencedEventBuffer _eventBuffer = new(4096);
+    private readonly CancellationTokenSource _lifetimeCancellation = new();
+    private readonly DispatcherTimer _batchTimer;
+    private Task? _subscriptionTask;
+    private long _lastSequence;
+    private int _resyncRequested;
+    private int _batchBusy;
     private string _serviceStatus = "Service disconnected";
     private string _lastOperation = "Starting…";
     private string _searchText = string.Empty;
@@ -25,8 +31,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     private FirewallRule? _selectedRule;
     private SecurityAlert? _selectedAlert;
     private ProtectionMode _protectionMode = ProtectionMode.Learning;
-    private int _refreshIntervalMilliseconds = 2000;
-    private int _refreshCounter;
+    private int _refreshIntervalMilliseconds = 250;
     private int _retentionDays = 30;
     private string _databasePath = "Unavailable until connected";
 
@@ -34,16 +39,16 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     {
         FlowView = CollectionViewSource.GetDefaultView(Flows);
         FlowView.Filter = FilterFlow;
-        _timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(_refreshIntervalMilliseconds) };
-        _timer.Tick += async (_, _) => await RefreshAsync().ConfigureAwait(true);
+        _batchTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(_refreshIntervalMilliseconds) };
+        _batchTimer.Tick += OnBatchTimerTick;
         RefreshCommand = new AsyncCommand(RefreshAsync);
         AllowCommand = new AsyncCommand(() => CreateRuleAsync(FirewallAction.Allow));
         AllowOnceCommand = new AsyncCommand(() => SetOperationAsync("Allow once uses the current default-allow connection and does not create a persistent rule."));
         BlockCommand = new AsyncCommand(() => CreateRuleAsync(FirewallAction.Block));
         UndoRuleCommand = new AsyncCommand(UndoRuleAsync);
-        ResetRulesCommand = new AsyncCommand(() => SendMutationAsync(MessageTypes.ResetOwnedRules, new { }));
+        ResetRulesCommand = new AsyncCommand(() => ConfirmAndSendAsync("Reset every EgressGuard-owned firewall rule?", MessageTypes.ResetOwnedRules, new { }));
         ApplyModeCommand = new AsyncCommand(() => SendMutationAsync(MessageTypes.SetProtectionMode, new SetProtectionModeMessage(ProtectionMode)));
-        ClearHistoryCommand = new AsyncCommand(() => SendMutationAsync(MessageTypes.ClearHistory, new { }));
+        ClearHistoryCommand = new AsyncCommand(() => ConfirmAndSendAsync("Delete local flow and alert history?", MessageTypes.ClearHistory, new { }));
         ResetBaselineCommand = new AsyncCommand(() => SendMutationAsync(MessageTypes.ResetBaseline, new ResetBaselineMessage(SelectedFlow?.Flow.Executable?.Sha256)));
     }
 
@@ -67,14 +72,14 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     public ICommand ResetBaselineCommand { get; }
     public int ActiveCount => Flows.Count;
     public int ProcessCount => Flows.Select(item => item.Flow.ProcessIdentity).Distinct().Count();
-    public int AlertCount => Flows.Count(item => item.Flow.Risk?.Level is RiskLevel.High or RiskLevel.Critical);
+    public int AlertCount => Alerts.Count;
 
     public string ServiceStatus { get => _serviceStatus; private set => Set(ref _serviceStatus, value); }
     public string LastOperation { get => _lastOperation; private set => Set(ref _lastOperation, value); }
     public string DatabasePath { get => _databasePath; private set => Set(ref _databasePath, value); }
     public bool NotificationsEnabled { get; set; } = true;
     public int RetentionDays { get => _retentionDays; set => Set(ref _retentionDays, Math.Clamp(value, 1, 3650)); }
-    public int RefreshIntervalMilliseconds { get => _refreshIntervalMilliseconds; set { if (Set(ref _refreshIntervalMilliseconds, Math.Clamp(value, 250, 60_000))) _timer.Interval = TimeSpan.FromMilliseconds(_refreshIntervalMilliseconds); } }
+    public int RefreshIntervalMilliseconds { get => _refreshIntervalMilliseconds; set { if (Set(ref _refreshIntervalMilliseconds, Math.Clamp(value, 100, 1000))) _batchTimer.Interval = TimeSpan.FromMilliseconds(_refreshIntervalMilliseconds); } }
     public ProtectionMode ProtectionMode { get => _protectionMode; set => Set(ref _protectionMode, value); }
     public FlowRow? SelectedFlow { get => _selectedFlow; set => Set(ref _selectedFlow, value); }
     public FirewallRule? SelectedRule { get => _selectedRule; set => Set(ref _selectedRule, value); }
@@ -98,9 +103,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
 
     public async Task StartAsync()
     {
-        await EnsureConnectedAsync().ConfigureAwait(true);
         await RefreshAsync().ConfigureAwait(true);
-        _timer.Start();
+        _batchTimer.Start();
+        _subscriptionTask = RunSubscriptionLoopAsync(_lifetimeCancellation.Token);
     }
 
     private async Task RefreshAsync()
@@ -110,17 +115,17 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
             await EnsureConnectedAsync().ConfigureAwait(true);
             var flowResponse = await _client.SendAsync(MessageEnvelope.Create(MessageTypes.GetActiveFlows, new { }), TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(true);
             var statusResponse = await _client.SendAsync(MessageEnvelope.Create(MessageTypes.GetStatus, new { }), TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(true);
-            var active = flowResponse.ReadPayload<ActiveFlowsMessage>().Flows;
+            var activeSnapshot = flowResponse.ReadPayload<ActiveFlowsMessage>();
+            var active = activeSnapshot.Flows;
             var status = statusResponse.ReadPayload<ServiceStatusMessage>();
             Replace(Flows, active.Select(flow => new FlowRow(flow)));
-            _refreshCounter++;
-            if (_refreshCounter == 1 || _refreshCounter % 3 == 0)
-            {
-                var rulesResponse = await _client.SendAsync(MessageEnvelope.Create(MessageTypes.GetRules, new { }), TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(true);
-                var alertsResponse = await _client.SendAsync(MessageEnvelope.Create(MessageTypes.GetAlerts, new { }), TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(true);
-                Replace(Rules, rulesResponse.ReadPayload<RulesMessage>().Rules);
-                Replace(Alerts, alertsResponse.ReadPayload<AlertsMessage>().Alerts);
-            }
+            var rulesResponse = await _client.SendAsync(MessageEnvelope.Create(MessageTypes.GetRules, new { }), TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(true);
+            var alertsResponse = await _client.SendAsync(MessageEnvelope.Create(MessageTypes.GetAlerts, new { }), TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(true);
+            Replace(Rules, rulesResponse.ReadPayload<RulesMessage>().Rules);
+            Replace(Alerts, alertsResponse.ReadPayload<AlertsMessage>().Alerts);
+            _eventBuffer.Reset();
+            Interlocked.Exchange(ref _lastSequence, activeSnapshot.Sequence);
+            Interlocked.Exchange(ref _resyncRequested, 0);
             ProtectionMode = status.Mode;
             DatabasePath = status.DatabasePath;
             ServiceStatus = $"Service online · {status.Mode} · dropped {status.DroppedEvents}";
@@ -132,6 +137,133 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
             LastOperation = exception.Message;
             await _client.DisconnectAsync().ConfigureAwait(true);
         }
+    }
+
+    private async Task RunSubscriptionLoopAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                await _eventClient.SubscribeAsync(
+                    Interlocked.Read(ref _lastSequence),
+                    streamEvent =>
+                    {
+                        if (!_eventBuffer.Enqueue(streamEvent))
+                        {
+                            Interlocked.Exchange(ref _resyncRequested, 1);
+                        }
+
+                        return ValueTask.CompletedTask;
+                    },
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception exception) when (exception is IOException or InvalidDataException or OperationCanceledException or ObjectDisposedException)
+            {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    break;
+                }
+
+                Interlocked.Exchange(ref _resyncRequested, 1);
+                await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private async Task ApplyEventBatchAsync()
+    {
+        if (Interlocked.Exchange(ref _resyncRequested, 0) != 0)
+        {
+            await _eventClient.DisconnectAsync().ConfigureAwait(true);
+            await RefreshAsync().ConfigureAwait(true);
+            return;
+        }
+
+        var batch = _eventBuffer.Drain(Interlocked.Read(ref _lastSequence), 500);
+        if (batch.RequiresResync)
+        {
+            Interlocked.Exchange(ref _resyncRequested, 1);
+            return;
+        }
+
+        if (batch.Events.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var streamEvent in batch.Events)
+        {
+            ApplyEvent(streamEvent);
+        }
+
+        Interlocked.Exchange(ref _lastSequence, batch.LastSequence);
+        NotifyCounts(refreshView: false);
+    }
+
+    private async void OnBatchTimerTick(object? sender, EventArgs eventArgs)
+    {
+        if (Interlocked.Exchange(ref _batchBusy, 1) != 0)
+        {
+            return;
+        }
+
+        try
+        {
+            await ApplyEventBatchAsync().ConfigureAwait(true);
+        }
+        catch (Exception exception)
+        {
+            ServiceStatus = "Service event stream failed · reconnecting";
+            LastOperation = exception.Message;
+            Interlocked.Exchange(ref _resyncRequested, 1);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _batchBusy, 0);
+        }
+    }
+
+    private void ApplyEvent(StreamEventMessage streamEvent)
+    {
+        switch (streamEvent.Kind)
+        {
+            case StreamEventKind.FlowAdded when streamEvent.Flow is not null:
+                if (Flows.All(row => row.Flow.Id != streamEvent.Flow.Id))
+                {
+                    Flows.Add(new FlowRow(streamEvent.Flow));
+                }
+                break;
+            case StreamEventKind.FlowUpdated when streamEvent.Flow is not null:
+                var updateIndex = IndexOfFlow(streamEvent.Flow.Id);
+                if (updateIndex >= 0) Flows[updateIndex] = new FlowRow(streamEvent.Flow);
+                else Flows.Add(new FlowRow(streamEvent.Flow));
+                break;
+            case StreamEventKind.FlowRemoved when streamEvent.FlowId is not null:
+                var removeIndex = IndexOfFlow(streamEvent.FlowId);
+                if (removeIndex >= 0) Flows.RemoveAt(removeIndex);
+                break;
+            case StreamEventKind.AlertRaised when streamEvent.Alert is not null:
+                if (Alerts.All(alert => alert.Id != streamEvent.Alert.Id)) Alerts.Insert(0, streamEvent.Alert);
+                break;
+            case StreamEventKind.ServiceStatusChanged when streamEvent.Status is not null:
+                ProtectionMode = streamEvent.Status.Mode;
+                DatabasePath = streamEvent.Status.DatabasePath;
+                ServiceStatus = $"Service online · {streamEvent.Status.Mode} · dropped {streamEvent.Status.DroppedEvents}";
+                break;
+            case StreamEventKind.ResyncRequired:
+                Interlocked.Exchange(ref _resyncRequested, 1);
+                break;
+        }
+    }
+
+    private int IndexOfFlow(string flowId)
+    {
+        for (var index = 0; index < Flows.Count; index++)
+        {
+            if (string.Equals(Flows[index].Flow.Id, flowId, StringComparison.Ordinal)) return index;
+        }
+        return -1;
     }
 
     private async Task EnsureConnectedAsync()
@@ -175,6 +307,12 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         }
     }
 
+    private Task ConfirmAndSendAsync<T>(string question, string type, T payload) =>
+        System.Windows.MessageBox.Show(question, "EgressGuard", System.Windows.MessageBoxButton.YesNo, System.Windows.MessageBoxImage.Warning)
+            == System.Windows.MessageBoxResult.Yes
+            ? SendMutationAsync(type, payload)
+            : Task.CompletedTask;
+
     private bool FilterFlow(object item)
     {
         if (item is not FlowRow row) return false;
@@ -194,12 +332,12 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         foreach (var value in values) target.Add(value);
     }
 
-    private void NotifyCounts()
+    private void NotifyCounts(bool refreshView = true)
     {
         OnPropertyChanged(nameof(ActiveCount));
         OnPropertyChanged(nameof(ProcessCount));
         OnPropertyChanged(nameof(AlertCount));
-        FlowView.Refresh();
+        if (refreshView) FlowView.Refresh();
     }
 
     private Task SetOperationAsync(string message) { LastOperation = message; return Task.CompletedTask; }
@@ -208,8 +346,16 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
 
     public async ValueTask DisposeAsync()
     {
-        _timer.Stop();
+        _batchTimer.Stop();
+        _lifetimeCancellation.Cancel();
+        await _eventClient.DisposeAsync().ConfigureAwait(false);
         await _client.DisposeAsync().ConfigureAwait(false);
+        if (_subscriptionTask is not null)
+        {
+            try { await _subscriptionTask.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+        }
+        _lifetimeCancellation.Dispose();
     }
 }
 
@@ -230,7 +376,7 @@ public sealed class FlowRow
     public string Identity => $"Identity: PID {Flow.ProcessIdentity?.ProcessId}, start {Flow.ProcessIdentity?.StartTime:O}";
     public string ExecutablePath => $"Executable: {Flow.Executable?.Path ?? "Unavailable"}";
     public string Hash => $"SHA-256: {Flow.Executable?.Sha256 ?? "Unavailable"}";
-    public string Signature => $"Signature/publisher: {(Flow.Executable?.IsSigned is null ? "Not verified" : Flow.Executable.IsSigned.Value ? "Signed" : "Unsigned")} / {Publisher}";
+    public string Signature => $"Authenticode/publisher: {Flow.Executable?.SignatureStatus.ToString() ?? "Unknown"} / {Publisher}";
     public string Parent => $"Parent PID: {Flow.ParentProcessId?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "Unavailable"}";
     public string Destination => $"Destination: {Remote}; domain evidence: {Flow.Destination?.DomainEvidence ?? "Unavailable"}";
     public string Reasons => "Risk reasons: " + string.Join(" | ", Flow.Risk?.Reasons.Select(reason => $"{reason.Code} ({reason.Points:+#;-#;0}): {reason.Message}") ?? []);

@@ -48,7 +48,7 @@ public sealed record MessageEnvelope(
 
 public sealed record HandshakeMessage(string ClientName, int MinimumVersion, int MaximumVersion);
 public sealed record ServiceStatusMessage(ProtectionMode Mode, bool IsRunning, int ActiveFlowCount, long DroppedEvents, string DatabasePath, DateTimeOffset Timestamp);
-public sealed record ActiveFlowsMessage(IReadOnlyList<NetworkFlow> Flows);
+public sealed record ActiveFlowsMessage(IReadOnlyList<NetworkFlow> Flows, long Sequence = 0);
 public sealed record RulesMessage(IReadOnlyList<FirewallRule> Rules);
 public sealed record AlertsMessage(IReadOnlyList<SecurityAlert> Alerts);
 public sealed record FlowObservedMessage(NetworkFlow Flow);
@@ -59,6 +59,26 @@ public sealed record SetProtectionModeMessage(ProtectionMode Mode);
 public sealed record ResetBaselineMessage(string? ExecutableSha256);
 public sealed record SuccessMessage(string Message);
 public sealed record ErrorMessage(string Code, string Message);
+public sealed record SubscribeEventsMessage(long LastSequence);
+
+public enum StreamEventKind
+{
+    FlowAdded,
+    FlowUpdated,
+    FlowRemoved,
+    AlertRaised,
+    ServiceStatusChanged,
+    ResyncRequired
+}
+
+public sealed record StreamEventMessage(
+    long Sequence,
+    StreamEventKind Kind,
+    NetworkFlow? Flow,
+    string? FlowId,
+    SecurityAlert? Alert,
+    ServiceStatusMessage? Status,
+    bool RequiresResync);
 
 public static class JsonDefaults
 {

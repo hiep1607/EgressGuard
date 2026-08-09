@@ -20,7 +20,7 @@ internal static class Program
 
             Console.WriteLine("EgressGuard Simulator: TEST TRAFFIC ONLY.");
             Console.WriteLine("Payload bytes are generated in memory. No user files or credentials are read.");
-            Console.WriteLine($"Target: 127.0.0.1:{options.Port} via {options.Protocol}; mode={options.Mode}.");
+            Console.WriteLine($"Target: {options.Address}:{options.Port} via {options.Protocol}; mode={options.Mode}; connect-only={options.ConnectOnly}.");
 
             if (options.Protocol == SimulatorProtocol.Tcp)
             {
@@ -65,9 +65,15 @@ internal static class Program
 
     private static async Task RunTcpAsync(SimulatorOptions options, CancellationToken cancellationToken)
     {
-        using var client = new TcpClient(AddressFamily.InterNetwork);
-        await client.ConnectAsync(IPAddress.Loopback, options.Port, cancellationToken).ConfigureAwait(false);
+        using var client = new TcpClient(options.Address.AddressFamily);
+        await client.ConnectAsync(options.Address, options.Port, cancellationToken).ConfigureAwait(false);
         Console.WriteLine($"Connected from {client.Client.LocalEndPoint} to {client.Client.RemoteEndPoint}.");
+        if (options.ConnectOnly)
+        {
+            await HoldForObservationAsync(options.HoldSeconds, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
         await using var stream = client.GetStream();
         await SendTestBytesAsync(
             options,
@@ -80,8 +86,8 @@ internal static class Program
     private static async Task RunUdpAsync(SimulatorOptions options, CancellationToken cancellationToken)
     {
         using var client = new UdpClient(AddressFamily.InterNetwork);
-        client.Connect(IPAddress.Loopback, options.Port);
-        Console.WriteLine($"UDP local endpoint will be assigned on first send; target is 127.0.0.1:{options.Port}.");
+        client.Connect(options.Address, options.Port);
+        Console.WriteLine($"UDP local endpoint will be assigned on first send; target is {options.Address}:{options.Port}.");
         await SendTestBytesAsync(
             options,
             async (buffer, token) =>
@@ -142,6 +148,7 @@ internal static class Program
     }
 
     private sealed record SimulatorOptions(
+        IPAddress Address,
         int Port,
         SimulatorProtocol Protocol,
         SendMode Mode,
@@ -149,11 +156,13 @@ internal static class Program
         int DelayMilliseconds,
         int HoldSeconds,
         int Connections,
-        int ConnectionIntervalMilliseconds)
+        int ConnectionIntervalMilliseconds,
+        bool ConnectOnly)
     {
         internal static SimulatorOptions Parse(string[] args)
         {
             var port = 5050;
+            var address = IPAddress.Loopback;
             var protocol = SimulatorProtocol.Tcp;
             var mode = SendMode.Small;
             var totalBytes = 5 * 1024;
@@ -161,11 +170,19 @@ internal static class Program
             var holdSeconds = 15;
             var connections = 1;
             var connectionIntervalMilliseconds = 1000;
+            var connectOnly = false;
 
             for (var index = 0; index < args.Length; index++)
             {
                 switch (args[index])
                 {
+                    case "--host" when index + 1 < args.Length:
+                        if (!IPAddress.TryParse(args[++index], out address))
+                        {
+                            throw new ArgumentException("--host must be an explicit IPv4 or IPv6 address.");
+                        }
+
+                        break;
                     case "--port" when index + 1 < args.Length:
                         port = ParseRange(args[++index], "--port", 1, 65535);
                         break;
@@ -198,12 +215,20 @@ internal static class Program
                     case "--connection-interval-ms" when index + 1 < args.Length:
                         connectionIntervalMilliseconds = ParseRange(args[++index], "--connection-interval-ms", 10, 60_000);
                         break;
+                    case "--connect-only":
+                        connectOnly = true;
+                        break;
                     default:
                         throw new ArgumentException($"Unknown or incomplete argument: {args[index]}");
                 }
             }
 
-            return new SimulatorOptions(port, protocol, mode, totalBytes, delayMilliseconds, holdSeconds, connections, connectionIntervalMilliseconds);
+            if (connectOnly && protocol != SimulatorProtocol.Tcp)
+            {
+                throw new ArgumentException("--connect-only is supported only for TCP.");
+            }
+
+            return new SimulatorOptions(address, port, protocol, mode, totalBytes, delayMilliseconds, holdSeconds, connections, connectionIntervalMilliseconds, connectOnly);
         }
 
         private static int ParseRange(string value, string option, int minimum, int maximum)

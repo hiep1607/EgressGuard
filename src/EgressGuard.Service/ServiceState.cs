@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using EgressGuard.Core;
+using EgressGuard.Protocol;
 
 namespace EgressGuard.Service;
 
@@ -20,7 +21,7 @@ public sealed class ServiceState
 
     public IReadOnlyList<NetworkFlow> Snapshot() => _flows.Values.OrderByDescending(flow => flow.LastSeen).ToArray();
 
-    public void ReplaceSnapshot(IEnumerable<NetworkFlow> flows)
+    public IReadOnlyList<FlowStateChange> ReplaceSnapshot(IEnumerable<NetworkFlow> flows)
     {
         ArgumentNullException.ThrowIfNull(flows);
         var current = new Dictionary<string, NetworkFlow>(StringComparer.Ordinal);
@@ -30,16 +31,37 @@ public sealed class ServiceState
             // The newest observation represents the same logical flow identity.
             current[flow.Id] = flow;
         }
+        var changes = new List<FlowStateChange>();
         foreach (var item in current)
         {
+            if (!_flows.TryGetValue(item.Key, out var previous))
+            {
+                changes.Add(new FlowStateChange(StreamEventKind.FlowAdded, item.Value, item.Key));
+            }
+            else if (HasMeaningfulUpdate(previous, item.Value))
+            {
+                changes.Add(new FlowStateChange(StreamEventKind.FlowUpdated, item.Value, item.Key));
+            }
+
             _flows[item.Key] = item.Value;
         }
 
         foreach (var stale in _flows.Keys.Except(current.Keys, StringComparer.Ordinal).ToArray())
         {
             _flows.TryRemove(stale, out _);
+            changes.Add(new FlowStateChange(StreamEventKind.FlowRemoved, null, stale));
         }
+
+        return changes;
     }
 
     public void RecordDroppedEvent() => Interlocked.Increment(ref _droppedEvents);
+
+    private static bool HasMeaningfulUpdate(NetworkFlow previous, NetworkFlow current) =>
+        current.LastSeen - previous.LastSeen >= TimeSpan.FromSeconds(2)
+        || !string.Equals(previous.State, current.State, StringComparison.Ordinal)
+        || previous.IsBlocked != current.IsBlocked
+        || previous.Risk?.Score != current.Risk?.Score;
 }
+
+public sealed record FlowStateChange(StreamEventKind Kind, NetworkFlow? Flow, string FlowId);

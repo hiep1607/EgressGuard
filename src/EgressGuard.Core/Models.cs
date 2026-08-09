@@ -13,7 +13,7 @@ public sealed record ProcessSnapshot(
 
 public sealed record ExecutableMetadata(
     string Sha256,
-    bool? HasDigitalSignature,
+    SignatureVerificationStatus SignatureStatus,
     string? Publisher,
     long FileSize,
     DateTimeOffset LastWriteTime);
@@ -48,12 +48,26 @@ public sealed record ObservedConnection(
 public sealed record ExecutableInfo(
     string Path,
     string Sha256,
-    bool? IsSigned,
+    SignatureVerificationStatus SignatureStatus,
     string? Publisher,
     long FileSize,
     DateTimeOffset LastWriteTime,
     bool IsInTemp,
     bool IsInAppData);
+
+public enum SignatureVerificationStatus
+{
+#pragma warning disable CA1720 // Protocol/storage value is deliberately named "Unsigned".
+    Unsigned,
+#pragma warning restore CA1720
+    Valid,
+    Invalid,
+    Untrusted,
+    Expired,
+    Revoked,
+    Unknown,
+    VerificationUnavailable
+}
 
 public sealed record DestinationInfo(
     IPAddress Address,

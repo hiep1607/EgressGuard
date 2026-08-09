@@ -1,25 +1,7 @@
-# Báo cáo Giai đoạn 2
+# Phase 2 report
 
-## Hoàn thành
+Implemented and tested: Worker Service lifetime, graceful cancellation, bounded persistence and event queues, versioned Named Pipe request/subscription paths, administrator impersonation for mutations, protection-mode persistence, owned firewall operations, semantic duplicate detection, SHA-256 pre-enforcement validation and rollback.
 
-- Worker Service Windows lifetime, graceful cancellation và timed test lifetime.
-- Bounded queue 2.048, batching, dropped-event metric, sensor/database fail-open isolation.
-- Versioned Named Pipe with max size, timeout, reconnect và admin identity check cho mutation.
-- Owned firewall manager: ID/prefix/description, duplicate prevention, enable/disable, delete/reset, validation/rollback.
-- Monitor/Learning/Protect và persisted protection mode.
-- Install/uninstall/firewall acceptance scripts.
+Verified on Windows: public IPv4 Simulator-only block, alternate-path isolation, duplicate prevention, Chrome unaffected evidence, external deletion, repeated reset, zero orphaned rule, initial SCM install/start, recovery configuration, UI-to-service connection, UI close independence, flow collection while UI was closed, and uninstall cleanup.
 
-## Test
-
-Service disconnect/reconnect pass; UI dừng nhưng service còn chạy; build sạch. Firewall code path/security guards build/test, nhưng mutation thật chưa chạy vì session non-admin.
-
-## Chưa kiểm thử đầy đủ
-
-- SCM install/recovery/uninstall.
-- Firewall block/undo/reset/drift và Chrome unaffected.
-- `SubscribeEvents` là acknowledged contract; UI hiện dùng throttled snapshots, chưa có push fan-out.
-- Tray icon chưa triển khai.
-
-## Điều kiện chuyển phase
-
-Risk/baseline có thể phát triển trên service pipeline. Không coi enforcement hoàn tất trước Administrator acceptance.
+Not verified on the final rebuilt service: SCM stop/start/reconnect. Framework-dependent start failed because .NET 8 was not registered for LocalSystem. A later unsigned self-contained rebuild was blocked by Windows Application Control. The installer rolled back cleanly. No policy bypass was attempted.

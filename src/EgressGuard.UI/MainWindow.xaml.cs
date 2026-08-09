@@ -8,8 +8,13 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         var viewModel = new MainWindowViewModel();
+        var trayIcon = new TrayIconController(this, viewModel);
         DataContext = viewModel;
         Loaded += async (_, _) => await viewModel.StartAsync().ConfigureAwait(true);
-        Closed += async (_, _) => await viewModel.DisposeAsync().ConfigureAwait(true);
+        Closed += async (_, _) =>
+        {
+            trayIcon.Dispose();
+            await viewModel.DisposeAsync().ConfigureAwait(true);
+        };
     }
 }

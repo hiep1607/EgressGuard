@@ -11,7 +11,7 @@ public sealed record PersistedBaseline(string ExecutableSha256, string Destinati
 
 public sealed class EgressGuardDatabase
 {
-    public const int CurrentSchemaVersion = 1;
+    public const int CurrentSchemaVersion = 2;
     private readonly string _connectionString;
 
     public EgressGuardDatabase(string databasePath)
@@ -44,6 +44,13 @@ public sealed class EgressGuardDatabase
         if (version < 1)
         {
             await ApplyVersion1Async(connection, cancellationToken).ConfigureAwait(false);
+            version = 1;
+        }
+
+        if (version < 2)
+        {
+            await ApplyVersion2Async(connection, cancellationToken).ConfigureAwait(false);
+            version = 2;
         }
 
         if (version > CurrentSchemaVersion)
@@ -77,7 +84,7 @@ public sealed class EgressGuardDatabase
         await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
         var command = connection.CreateCommand();
         command.CommandText = """
-            SELECT f.id,f.pid,f.process_start_ticks,f.process_name,e.path,e.sha256,e.is_signed,e.publisher,e.file_size,e.last_write_time,e.is_temp,e.is_appdata,
+            SELECT f.id,f.pid,f.process_start_ticks,f.process_name,e.path,e.sha256,e.signature_status,e.publisher,e.file_size,e.last_write_time,e.is_temp,e.is_appdata,
                    f.parent_pid,f.protocol,f.ip_version,f.local_address,f.local_port,f.remote_address,f.remote_port,f.domain,f.domain_evidence,
                    f.first_seen,f.last_seen,f.state,f.bytes_sent,f.bytes_received,f.is_blocked,f.risk_score,f.risk_level,f.risk_decision,f.risk_reasons
             FROM network_flows f LEFT JOIN executables e ON e.id=f.executable_id
@@ -344,6 +351,17 @@ public sealed class EgressGuardDatabase
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
 
+    private static async Task ApplyVersion2Async(SqliteConnection connection, CancellationToken cancellationToken)
+    {
+        await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        await ExecuteAsync(
+            connection,
+            transaction,
+            "ALTER TABLE executables ADD COLUMN signature_status TEXT NOT NULL DEFAULT 'Unknown'; INSERT INTO schema_versions(version,applied_at) VALUES(2,strftime('%Y-%m-%dT%H:%M:%fZ','now'));",
+            cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     private static async Task<long?> UpsertExecutableAsync(SqliteConnection connection, SqliteTransaction transaction, ExecutableInfo? executable, CancellationToken cancellationToken)
     {
         if (executable is null)
@@ -354,14 +372,15 @@ public sealed class EgressGuardDatabase
         var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
-            INSERT INTO executables(path,sha256,is_signed,publisher,file_size,last_write_time,is_temp,is_appdata,first_seen)
-            VALUES($path,$hash,$signed,$publisher,$size,$write,$temp,$appdata,$seen)
-            ON CONFLICT(sha256) DO UPDATE SET path=excluded.path,is_signed=excluded.is_signed,publisher=excluded.publisher,file_size=excluded.file_size,last_write_time=excluded.last_write_time,is_temp=excluded.is_temp,is_appdata=excluded.is_appdata
+            INSERT INTO executables(path,sha256,is_signed,signature_status,publisher,file_size,last_write_time,is_temp,is_appdata,first_seen)
+            VALUES($path,$hash,$signed,$signatureStatus,$publisher,$size,$write,$temp,$appdata,$seen)
+            ON CONFLICT(sha256) DO UPDATE SET path=excluded.path,is_signed=excluded.is_signed,signature_status=excluded.signature_status,publisher=excluded.publisher,file_size=excluded.file_size,last_write_time=excluded.last_write_time,is_temp=excluded.is_temp,is_appdata=excluded.is_appdata
             RETURNING id;
             """;
         Add(command, "$path", executable.Path);
         Add(command, "$hash", executable.Sha256);
-        Add(command, "$signed", executable.IsSigned is null ? null : executable.IsSigned.Value ? 1 : 0);
+        Add(command, "$signed", executable.SignatureStatus == SignatureVerificationStatus.Unsigned ? 0 : 1);
+        Add(command, "$signatureStatus", executable.SignatureStatus.ToString());
         Add(command, "$publisher", executable.Publisher);
         Add(command, "$size", executable.FileSize);
         Add(command, "$write", executable.LastWriteTime.ToString("O", CultureInfo.InvariantCulture));
@@ -438,7 +457,7 @@ public sealed class EgressGuardDatabase
             : new ProcessIdentity(reader.GetInt32(1), new DateTimeOffset(reader.GetInt64(2), TimeSpan.Zero));
         var executable = reader.IsDBNull(4)
             ? null
-            : new ExecutableInfo(reader.GetString(4), reader.GetString(5), reader.IsDBNull(6) ? null : reader.GetInt32(6) != 0, NullableString(reader, 7), reader.GetInt64(8), DateTimeOffset.Parse(reader.GetString(9), CultureInfo.InvariantCulture), reader.GetInt32(10) != 0, reader.GetInt32(11) != 0);
+            : new ExecutableInfo(reader.GetString(4), reader.GetString(5), Enum.Parse<SignatureVerificationStatus>(reader.GetString(6)), NullableString(reader, 7), reader.GetInt64(8), DateTimeOffset.Parse(reader.GetString(9), CultureInfo.InvariantCulture), reader.GetInt32(10) != 0, reader.GetInt32(11) != 0);
         var destination = reader.IsDBNull(17)
             ? null
             : new DestinationInfo(System.Net.IPAddress.Parse(reader.GetString(17)), reader.GetInt32(18), NullableString(reader, 19), reader.GetString(20));

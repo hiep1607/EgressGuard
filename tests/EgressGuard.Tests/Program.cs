@@ -5,6 +5,7 @@ using System.Security.Cryptography;
 using EgressGuard.Core;
 using EgressGuard.Persistence;
 using EgressGuard.Protocol;
+using EgressGuard.Service;
 using EgressGuard.Windows;
 using Microsoft.Data.Sqlite;
 
@@ -20,6 +21,7 @@ internal static class Program
             ("Native port conversion", TestPortConversionAsync),
             ("Endpoint formatting", TestEndpointFormattingAsync),
             ("Executable metadata hashes and caches", TestExecutableMetadataAsync),
+            ("Authenticode maps trust results and validates Windows binary", TestAuthenticodeAsync),
             ("Firewall path validation is simulator-only", TestFirewallPathValidationAsync),
             ("Controlled TCP connection maps to current process", TestControlledTcpMappingAsync),
             ("Controlled IPv6 TCP maps to current process", TestControlledIPv6MappingAsync),
@@ -33,7 +35,10 @@ internal static class Program
             ("Protocol frame roundtrip", TestProtocolRoundTripAsync),
             ("Protocol rejects oversized message", TestOversizedMessageAsync),
             ("Protocol handles disconnect", TestProtocolDisconnectAsync),
-            ("Service pipe disconnect and reconnect", TestServicePipeReconnectAsync),
+            ("Event buffer preserves order and detects gaps and overflow", TestEventBufferAsync),
+            ("Slow event subscriber cannot block publisher", TestSlowSubscriberAsync),
+            ("Flow state emits add update and remove transitions", TestFlowStateTransitionsAsync),
+            ("Service pipe reconnect and event subscription", TestServicePipeReconnectAsync),
             ("Process churn does not crash collector", TestProcessChurnAsync)
         };
 
@@ -87,18 +92,67 @@ internal static class Program
         var testPath = Path.Combine(testDirectory, "sample.exe");
         try
         {
-            var bytes = "EgressGuard synthetic executable bytes"u8.ToArray();
-            File.WriteAllBytes(testPath, bytes);
+            var sourcePath = Environment.ProcessPath ?? throw new TestFailureException("Current executable path is unavailable.");
+            File.Copy(sourcePath, testPath);
+            var bytes = File.ReadAllBytes(testPath);
             var provider = new ExecutableMetadataProvider();
             var first = provider.GetMetadata(testPath) ?? throw new TestFailureException("Metadata was null.");
             var second = provider.GetMetadata(testPath) ?? throw new TestFailureException("Cached metadata was null.");
             AssertEqual(Convert.ToHexString(SHA256.HashData(bytes)), first.Sha256);
             AssertTrue(ReferenceEquals(first, second), "Expected the unchanged file metadata to come from cache.");
-            AssertEqual(false, first.HasDigitalSignature);
+            AssertEqual(SignatureVerificationStatus.Unsigned, first.SignatureStatus);
+            File.WriteAllBytes(testPath, [.. bytes, 0x45, 0x47]);
+            File.SetLastWriteTimeUtc(testPath, DateTime.UtcNow.AddSeconds(2));
+            var changed = provider.GetMetadata(testPath) ?? throw new TestFailureException("Changed metadata was null.");
+            AssertTrue(!ReferenceEquals(first, changed), "Changed file incorrectly reused cached metadata.");
+            AssertNotEqual(first.Sha256, changed.Sha256);
         }
         finally
         {
             Directory.Delete(testDirectory, recursive: true);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private static Task TestAuthenticodeAsync()
+    {
+        AssertEqual(SignatureVerificationStatus.Valid, AuthenticodeVerifier.MapStatus(0));
+        AssertEqual(SignatureVerificationStatus.Unsigned, AuthenticodeVerifier.MapStatus(unchecked((int)0x800B0100)));
+        AssertEqual(SignatureVerificationStatus.Invalid, AuthenticodeVerifier.MapStatus(unchecked((int)0x80096010)));
+        AssertEqual(SignatureVerificationStatus.Expired, AuthenticodeVerifier.MapStatus(unchecked((int)0x800B0101)));
+        AssertEqual(SignatureVerificationStatus.Revoked, AuthenticodeVerifier.MapStatus(unchecked((int)0x800B010C)));
+        AssertEqual(SignatureVerificationStatus.Untrusted, AuthenticodeVerifier.MapStatus(unchecked((int)0x800B0111)));
+        AssertEqual(SignatureVerificationStatus.VerificationUnavailable, AuthenticodeVerifier.MapStatus(unchecked((int)0x80092013)));
+        AssertEqual(SignatureVerificationStatus.Unknown, AuthenticodeVerifier.MapStatus(unchecked((int)0x81234567)));
+        AssertEqual(SignatureVerificationStatus.VerificationUnavailable, AuthenticodeVerifier.Verify(Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".exe")));
+
+        var catalogSignedPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "System32", "cmd.exe");
+        AssertEqual(SignatureVerificationStatus.Valid, AuthenticodeVerifier.Verify(catalogSignedPath));
+        var signedPath = new[]
+        {
+            Environment.GetEnvironmentVariable("DOTNET_HOST_PATH"),
+            Path.Combine(Environment.GetEnvironmentVariable("DOTNET_ROOT") ?? string.Empty, "dotnet.exe"),
+            Path.Combine(Path.GetTempPath(), "EgressGuard-dotnet8", "dotnet.exe")
+        }.FirstOrDefault(path => !string.IsNullOrWhiteSpace(path) && File.Exists(path))
+            ?? throw new TestFailureException("No embedded-signed test executable was found.");
+        AssertEqual(SignatureVerificationStatus.Valid, AuthenticodeVerifier.Verify(signedPath));
+
+        var directory = Path.Combine(Path.GetTempPath(), "EgressGuard-SignatureTests-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var tamperedPath = Path.Combine(directory, "signed-tampered.exe");
+            File.Copy(signedPath, tamperedPath);
+            var bytes = File.ReadAllBytes(tamperedPath);
+            var offset = Math.Min(4096, bytes.Length / 2);
+            bytes[offset] ^= 0x01;
+            File.WriteAllBytes(tamperedPath, bytes);
+            AssertEqual(SignatureVerificationStatus.Invalid, AuthenticodeVerifier.Verify(tamperedPath));
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
         }
 
         return Task.CompletedTask;
@@ -117,6 +171,10 @@ internal static class Program
             AssertEqual(Path.GetFullPath(simulatorPath), WindowsFirewallManager.ValidateSimulatorPath(simulatorPath));
             AssertThrows<ArgumentException>(() => WindowsFirewallManager.ValidateSimulatorPath(otherPath));
             AssertThrows<FileNotFoundException>(() => WindowsFirewallManager.ValidateSimulatorPath(Path.Combine(testDirectory, "missing.exe")));
+            var hash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(simulatorPath)));
+            var rule = new FirewallRule(Guid.NewGuid(), "hash validation", FirewallAction.Block, RuleSource.User, simulatorPath, hash, null, null, null, true, DateTimeOffset.UtcNow, null);
+            OwnedFirewallRuleManager.ValidateExecutableHash(rule);
+            AssertThrows<InvalidOperationException>(() => OwnedFirewallRuleManager.ValidateExecutableHash(rule with { ExecutableSha256 = new string('A', 64) }));
         }
         finally
         {
@@ -258,6 +316,7 @@ internal static class Program
         var result = PolicyEngine.Evaluate(flow, ProtectionMode.Protect, [allow, block], isSystemProtected: false);
         AssertEqual(PolicyDecision.Block, result.Decision);
         AssertEqual(block.Id, result.MatchedRule?.Id);
+        AssertTrue(!PolicyEngine.RuleMatches(block, flow with { Executable = flow.Executable! with { Path = "C:\\Tests\\Different.exe" } }), "A path-bound rule matched another executable.");
         var safe = PolicyEngine.Evaluate(flow, ProtectionMode.Protect, [], isSystemProtected: true);
         AssertEqual(PolicyDecision.Allow, safe.Decision);
         return Task.CompletedTask;
@@ -371,6 +430,73 @@ internal static class Program
         AssertEqual(null, await MessageFraming.ReadAsync(stream, CancellationToken.None).ConfigureAwait(false));
     }
 
+    private static Task TestEventBufferAsync()
+    {
+        var buffer = new SequencedEventBuffer(3);
+        AssertTrue(buffer.Enqueue(StreamEvent(10)), "First event was rejected.");
+        AssertTrue(buffer.Enqueue(StreamEvent(11)), "Second event was rejected.");
+        var firstBatch = buffer.Drain(9, 1);
+        AssertEqual(1, firstBatch.Events.Count);
+        AssertEqual(10L, firstBatch.LastSequence);
+        AssertTrue(!firstBatch.RequiresResync, "Ordered batch unexpectedly requested resync.");
+        var secondBatch = buffer.Drain(firstBatch.LastSequence, 10);
+        AssertEqual(11L, secondBatch.LastSequence);
+
+        buffer.Enqueue(StreamEvent(13));
+        AssertTrue(buffer.Drain(11).RequiresResync, "Sequence gap was not detected.");
+
+        buffer.Enqueue(StreamEvent(20));
+        buffer.Enqueue(StreamEvent(21));
+        buffer.Enqueue(StreamEvent(22));
+        AssertTrue(!buffer.Enqueue(StreamEvent(23)), "Overflowing event was unexpectedly accepted.");
+        var overflow = buffer.Drain(19);
+        AssertTrue(overflow.RequiresResync && overflow.Overflowed, "Overflow did not force resync.");
+        return Task.CompletedTask;
+    }
+
+    private static StreamEventMessage StreamEvent(long sequence) =>
+        new(sequence, StreamEventKind.FlowUpdated, SampleFlow() with { Id = $"flow-{sequence}" }, $"flow-{sequence}", null, null, false);
+
+    private static async Task TestSlowSubscriberAsync()
+    {
+        var hub = new EventHub();
+        await using var subscription = hub.Subscribe(0);
+        var stopwatch = Stopwatch.StartNew();
+        for (var index = 0; index < 600; index++)
+        {
+            hub.PublishFlow(StreamEventKind.FlowUpdated, SampleFlow(), "slow-flow");
+        }
+
+        stopwatch.Stop();
+        AssertTrue(stopwatch.Elapsed < TimeSpan.FromSeconds(2), "A slow subscriber blocked event publishing.");
+        AssertEqual(600L, hub.CurrentSequence);
+        if (!subscription.Reader.TryRead(out var overflow))
+        {
+            throw new TestFailureException("Slow subscriber received no resync marker.");
+        }
+        AssertTrue(overflow.RequiresResync && overflow.Kind == StreamEventKind.ResyncRequired, "Slow subscriber did not receive a resync marker.");
+
+        var mismatchHub = new EventHub();
+        mismatchHub.PublishFlow(StreamEventKind.FlowAdded, SampleFlow(), "initial");
+        await using var mismatch = mismatchHub.Subscribe(99);
+        AssertTrue(mismatch.Reader.TryRead(out var resync) && resync.RequiresResync, "A reconnect sequence mismatch did not request resync.");
+    }
+
+    private static Task TestFlowStateTransitionsAsync()
+    {
+        var state = new ServiceState();
+        var first = SampleFlow();
+        var added = state.ReplaceSnapshot([first]);
+        AssertEqual(StreamEventKind.FlowAdded, added.Single().Kind);
+        AssertEqual(0, state.ReplaceSnapshot([first]).Count);
+        var updated = state.ReplaceSnapshot([first with { LastSeen = first.LastSeen.AddSeconds(3) }]);
+        AssertEqual(StreamEventKind.FlowUpdated, updated.Single().Kind);
+        var removed = state.ReplaceSnapshot([]);
+        AssertEqual(StreamEventKind.FlowRemoved, removed.Single().Kind);
+        AssertEqual(first.Id, removed.Single().FlowId);
+        return Task.CompletedTask;
+    }
+
     private static async Task TestServicePipeReconnectAsync()
     {
         var servicePath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "src", "EgressGuard.Service", "bin", "Release", "net8.0-windows", "EgressGuard.Service.exe"));
@@ -400,13 +526,51 @@ internal static class Program
                 AssertTrue(response.ReadPayload<ServiceStatusMessage>().IsRunning, "Service did not report running state.");
             }
 
+            long snapshotSequence;
             stage = "second connect";
             await using (var second = new EgressGuardPipeClient())
             {
                 await ConnectWithRetryAsync(second).ConfigureAwait(false);
                 stage = "second flows request";
                 var response = await second.SendAsync(MessageEnvelope.Create(MessageTypes.GetActiveFlows, new { }), TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(false);
-                _ = response.ReadPayload<ActiveFlowsMessage>();
+                snapshotSequence = response.ReadPayload<ActiveFlowsMessage>().Sequence;
+            }
+
+            stage = "event subscription";
+            using (var eventTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(8)))
+            await using (var eventClient = new EgressGuardEventClient())
+            {
+                var observed = new TaskCompletionSource<StreamEventMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var subscribeTask = eventClient.SubscribeAsync(snapshotSequence, streamEvent =>
+                {
+                    if (streamEvent.Flow?.ProcessIdentity?.ProcessId == Environment.ProcessId)
+                    {
+                        observed.TrySetResult(streamEvent);
+                    }
+
+                    return ValueTask.CompletedTask;
+                }, eventTimeout.Token);
+                await Task.Delay(500, eventTimeout.Token).ConfigureAwait(false);
+                var listener = new TcpListener(IPAddress.Loopback, 0);
+                listener.Start();
+                try
+                {
+                    using var controlledClient = new TcpClient(AddressFamily.InterNetwork);
+                    var acceptTask = listener.AcceptTcpClientAsync(eventTimeout.Token);
+                    await controlledClient.ConnectAsync((IPEndPoint)listener.LocalEndpoint, eventTimeout.Token).ConfigureAwait(false);
+                    using var accepted = await acceptTask.ConfigureAwait(false);
+                    var streamEvent = await observed.Task.WaitAsync(eventTimeout.Token).ConfigureAwait(false);
+                    AssertTrue(streamEvent.Kind is StreamEventKind.FlowAdded or StreamEventKind.FlowUpdated, "Controlled flow produced the wrong event kind.");
+                    AssertTrue(streamEvent.Sequence > snapshotSequence, "Stream event sequence did not advance beyond the snapshot.");
+                }
+                finally
+                {
+                    listener.Stop();
+                    eventTimeout.Cancel();
+                    await eventClient.DisconnectAsync().ConfigureAwait(false);
+                    try { await subscribeTask.ConfigureAwait(false); }
+                    catch (Exception exception) when (exception is OperationCanceledException or IOException or ObjectDisposedException) { }
+                }
             }
 
             stage = "service lifetime check";
@@ -480,7 +644,7 @@ internal static class Program
     private static NetworkFlow SampleFlow(RiskAssessment? risk = null)
     {
         var start = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
-        var executable = new ExecutableInfo("C:\\Tests\\EgressGuard.Simulator.exe", new string('A', 64), false, null, 100, start, false, false);
+        var executable = new ExecutableInfo("C:\\Tests\\EgressGuard.Simulator.exe", new string('A', 64), SignatureVerificationStatus.Unsigned, null, 100, start, false, false);
         return new NetworkFlow("test-flow", new ProcessIdentity(42, start), "EgressGuard.Simulator", executable, 1, TransportProtocol.Tcp, IpVersion.IPv4, new NetworkEndpoint(IPAddress.Loopback, 50000), new DestinationInfo(IPAddress.Loopback, 5050, "localhost", "controlled test"), start, start.AddSeconds(1), "ESTABLISHED", null, null, false, risk);
     }
 

@@ -40,25 +40,26 @@ public sealed class ExecutableMetadataProvider : IExecutableMetadataProvider
             FileAccess.Read,
             FileShare.ReadWrite | FileShare.Delete);
         var hash = Convert.ToHexString(SHA256.HashData(stream));
-        var signature = InspectEmbeddedSignature(key.Path);
+        var signatureStatus = AuthenticodeVerifier.Verify(key.Path);
+        var publisher = ReadPublisherMetadata(key.Path);
         return new ExecutableMetadata(
             hash,
-            signature.IsPresent,
-            signature.Publisher,
+            signatureStatus,
+            publisher,
             key.FileSize,
             new DateTimeOffset(key.LastWriteTimeUtc, TimeSpan.Zero));
     }
 
-    private static (bool IsPresent, string? Publisher) InspectEmbeddedSignature(string path)
+    private static string? ReadPublisherMetadata(string path)
     {
         try
         {
             using var certificate = X509Certificate.CreateFromSignedFile(path);
-            return (true, certificate.Subject);
+            return certificate.Subject;
         }
-        catch (CryptographicException)
+        catch (Exception exception) when (exception is CryptographicException or InvalidOperationException)
         {
-            return (false, null);
+            return null;
         }
     }
 
