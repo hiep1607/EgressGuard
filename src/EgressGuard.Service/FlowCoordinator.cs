@@ -70,6 +70,10 @@ public sealed partial class FlowCoordinator : BackgroundService
 
             await _database.ApplyRetentionAsync(30, stoppingToken).ConfigureAwait(false);
         }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            return;
+        }
         catch (Exception exception)
         {
             LogDatabaseInitializationFailed(_logger, exception);
@@ -190,6 +194,10 @@ public sealed partial class FlowCoordinator : BackgroundService
         {
             return await _database.GetRulesAsync(cancellationToken).ConfigureAwait(false);
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
         catch (Exception exception)
         {
             LogRuleReadFailed(_logger, exception);
@@ -222,6 +230,10 @@ public sealed partial class FlowCoordinator : BackgroundService
             await _firewall.CreateAsync(rule, cancellationToken).ConfigureAwait(false);
             await _database.SaveRuleAsync(rule, cancellationToken).ConfigureAwait(false);
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
         catch (Exception exception)
         {
             LogAutomaticRuleFailed(_logger, exception);
@@ -251,6 +263,10 @@ public sealed partial class FlowCoordinator : BackgroundService
                         {
                             await _database.SaveBaselineObservationsAsync(batch, cancellationToken).ConfigureAwait(false);
                         }
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        throw;
                     }
                     catch (Exception exception)
                     {

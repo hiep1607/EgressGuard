@@ -38,3 +38,31 @@ Run in Administrator PowerShell. Do not disable Firewall or Application Control.
 - Close UI and confirm service continues collecting.
 - Stop/start service and confirm UI shows disconnect then reconnects without hanging.
 - Re-run an owned-rule create/undo and verify zero orphaned rules.
+
+## Phase 3.5 status (2026-08-09)
+
+- `Verified`: framework-dependent final publish ran through SCM as `LocalSystem` with machine-wide .NET 8.0.29.
+- `Verified`: executable SHA-256 `0B48EFFA32B593AE4402590097D317CE02ECC864FD8865DA61137DB3613FA558`; managed service DLL SHA-256 `76EB90545497985DE98682DB389E4A9C930E343587E9F6C6D776A8F2AAE1AECB`.
+- `Verified`: automatic start, recovery delays 5/15 seconds, UI-close independence, stop/disconnect, start/reconnect, post-restart flow collection and uninstall cleanup.
+- `Verified`: 30-minute soak, 595 cycles, 0 failures, database lock released, zero residual processes/rules.
+- `Not verified`: real reboot, DPI 100%, DPI 150% and direct tray context-menu interaction.
+- `Blocked – requires owner/administrator action`: production code signing or organizational Application Control approval. The tested executable is unsigned even though the current host allowed it.
+
+After an approved signature or binary approval is available, verify the signature and re-run the exact artifact:
+
+```powershell
+Get-AuthenticodeSignature <final-publish>\EgressGuard.Service.exe
+Get-FileHash -Algorithm SHA256 <final-publish>\EgressGuard.Service.exe
+.\tools\install-service.ps1 -PublishedDirectory <final-publish>
+sc.exe qfailure EgressGuard.Service
+```
+
+Do not mark reboot or the remaining DPI levels as passed until they are exercised on the real host. After the owner authorizes a reboot, execute the reboot checklist above and finish with:
+
+```powershell
+.\tools\uninstall-service.ps1
+Get-Service EgressGuard.Service -ErrorAction SilentlyContinue
+Get-Process EgressGuard.Service,EgressGuard.UI -ErrorAction SilentlyContinue
+Get-NetFirewallRule -ErrorAction SilentlyContinue |
+    Where-Object {$_.DisplayName -like 'EgressGuard-MVP-*' -and $_.Description -like 'Owned by EgressGuard MVP;*'}
+```

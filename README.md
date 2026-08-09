@@ -69,11 +69,11 @@ Service installation and real firewall acceptance are separate, opt-in Administr
 - [Windows administrator checklist](docs/windows-admin-checklist.md)
 - [Testing guide](docs/testing.md)
 
-Every firewall test must have cleanup. Windows Application Control currently blocks the final unsigned SCM binary on the acceptance workstation; do not bypass that policy.
+Every firewall test must have cleanup. The Phase 3.5 framework-dependent service publish ran through SCM on the acceptance workstation, but it remains unsigned and is not a production-approved artifact. Never bypass Windows Application Control policy.
 
 ## Current limitations
 
-- Phases 1–3 are hardened but final SCM restart/reconnect and forced multi-DPI acceptance remain open.
+- Phases 1–3 have verified final SCM restart/reconnect and a 30-minute soak. Real reboot acceptance, DPI 100%/150% QA, direct tray interaction and production signing/approval remain open; do not begin Phase 4/ETW yet.
 - Windows Firewall enforcement is path-based; EgressGuard verifies SHA-256 before rule creation and in policy matching, but executable replacement requires identity refresh and rule recreation.
 - UDP owner tables do not expose a remote peer.
 - No release, installer, signing pipeline, or production support commitment exists yet.
