@@ -1,0 +1,63 @@
+{
+  "SchemaVersion": 1,
+  "EvidenceType": "Phase 3.5.1 targeted cancellation safety validation",
+  "GeneratedAtUtc": "2026-08-09T15:46:03.5110694+00:00",
+  "Source": {
+    "TestedCommit": "dcbb07e370d082c0bb52f23fa4d229ad6c0c44a9",
+    "Branch": "hardening/phase-3-5-acceptance"
+  },
+  "Validation": {
+    "BuildWarnings": 0,
+    "BuildErrors": 0,
+    "TestsPassed": 32,
+    "TestsFailed": 0,
+    "FormatExitCode": 0,
+    "DependencyAudit": "No known vulnerable packages"
+  },
+  "RealFirewallCancellationIntegration": {
+    "Status": "Verified",
+    "CancelledAfterOwnedRuleCreation": true,
+    "ExactRuleReconciledAndRemoved": true,
+    "UnrelatedPowerShellPreserved": true
+  },
+  "Smoke": {
+    "RunId": "20260809T153826754Z-44c3679c3f324a6c9a5b528ecf4f05d9",
+    "DurationMinutes": 2,
+    "Cycles": 40,
+    "Failures": 0,
+    "IpcStatusChecks": 40,
+    "ServiceRestarts": 8,
+    "UiOpenCount": 14,
+    "UiCloseCount": 13,
+    "DatabaseLockReleased": true,
+    "ProcessInspectionSucceeded": true,
+    "RemainingProcesses": 0,
+    "FirewallInspectionSucceeded": true,
+    "RemainingOwnedFirewallRules": 0
+  },
+  "PostValidationCleanup": {
+    "RemainingScmServices": 0,
+    "RemainingEgressGuardProcesses": 0,
+    "RemainingTestOwnedPowerShellProcesses": 0,
+    "RemainingOwnedFirewallRules": 0
+  },
+  "LongSoak": {
+    "Status": "Not rerun for Phase 3.5.1",
+    "Reason": "The soak harness and lifecycle/reconnect implementation did not change; targeted tests, real firewall integration, and a fresh 2-minute smoke covered the scoped risk.",
+    "PreviousEvidence": "phase-3.5-validation.json",
+    "PreviousTestedCommit": "c7273caac1106d54d5b327bfde20b13c7c2187f3"
+  },
+  "GitHubActionsUrl": "https://github.com/hiep1607/EgressGuard/actions/runs/31321849056",
+  "Remaining": {
+    "NotVerified": [
+      "Reboot",
+      "DPI 100%",
+      "DPI 150%",
+      "Direct tray context-menu interaction"
+    ],
+    "Blocked": [
+      "Production signing or organizational Application Control approval",
+      "Phase 4/ETW until remaining Phase 3.5 acceptance is complete"
+    ]
+  }
+}

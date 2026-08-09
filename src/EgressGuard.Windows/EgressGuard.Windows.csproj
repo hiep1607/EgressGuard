@@ -1,5 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
+    <InternalsVisibleTo Include="EgressGuard.Tests" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\EgressGuard.Core\EgressGuard.Core.csproj" />
   </ItemGroup>
   <ItemGroup>

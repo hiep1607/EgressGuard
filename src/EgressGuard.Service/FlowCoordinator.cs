@@ -20,6 +20,7 @@ public sealed partial class FlowCoordinator : BackgroundService
     private readonly ServiceState _state;
     private readonly EventHub _eventHub;
     private readonly ILogger<FlowCoordinator> _logger;
+    private readonly FirewallRuleCreateCoordinator _firewallRuleCreateCoordinator;
     private readonly Channel<NetworkFlow> _persistenceQueue;
     private readonly ConcurrentDictionary<string, byte> _seenExecutables = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _seenDestinations = new(StringComparer.OrdinalIgnoreCase);
@@ -42,6 +43,11 @@ public sealed partial class FlowCoordinator : BackgroundService
         _state = state;
         _eventHub = eventHub;
         _logger = logger;
+        _firewallRuleCreateCoordinator = new FirewallRuleCreateCoordinator(
+            _firewall,
+            _database.SaveRuleAsync,
+            logger,
+            _database.GetRulesAsync);
         _persistenceQueue = Channel.CreateBounded<NetworkFlow>(new BoundedChannelOptions(2048)
         {
             FullMode = BoundedChannelFullMode.Wait,
@@ -69,6 +75,10 @@ public sealed partial class FlowCoordinator : BackgroundService
             }
 
             await _database.ApplyRetentionAsync(30, stoppingToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            return;
         }
         catch (Exception exception)
         {
@@ -190,6 +200,10 @@ public sealed partial class FlowCoordinator : BackgroundService
         {
             return await _database.GetRulesAsync(cancellationToken).ConfigureAwait(false);
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
         catch (Exception exception)
         {
             LogRuleReadFailed(_logger, exception);
@@ -217,15 +231,7 @@ public sealed partial class FlowCoordinator : BackgroundService
             Enabled: true,
             DateTimeOffset.UtcNow,
             LastMatchedAt: null);
-        try
-        {
-            await _firewall.CreateAsync(rule, cancellationToken).ConfigureAwait(false);
-            await _database.SaveRuleAsync(rule, cancellationToken).ConfigureAwait(false);
-        }
-        catch (Exception exception)
-        {
-            LogAutomaticRuleFailed(_logger, exception);
-        }
+        await _firewallRuleCreateCoordinator.ApplyAsync(rule, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task PersistAsync(CancellationToken cancellationToken)
@@ -251,6 +257,10 @@ public sealed partial class FlowCoordinator : BackgroundService
                         {
                             await _database.SaveBaselineObservationsAsync(batch, cancellationToken).ConfigureAwait(false);
                         }
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        throw;
                     }
                     catch (Exception exception)
                     {
@@ -291,9 +301,6 @@ public sealed partial class FlowCoordinator : BackgroundService
 
     [LoggerMessage(Level = LogLevel.Error, Message = "Rule database read failed; this iteration is fail-open.")]
     private static partial void LogRuleReadFailed(ILogger logger, Exception exception);
-
-    [LoggerMessage(Level = LogLevel.Warning, Message = "Automatic rule was not applied; monitoring continues fail-open.")]
-    private static partial void LogAutomaticRuleFailed(ILogger logger, Exception exception);
 
     [LoggerMessage(Level = LogLevel.Error, Message = "Flow persistence batch failed; sensor remains active.")]
     private static partial void LogPersistenceFailed(ILogger logger, Exception exception);

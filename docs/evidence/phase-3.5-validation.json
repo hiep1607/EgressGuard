@@ -1,0 +1,64 @@
+﻿{
+    "SchemaVersion":  1,
+    "GeneratedAtUtc":  "2026-08-09T14:57:15.0739245+00:00",
+    "Source":  {
+                   "TestedCommit":  "c7273caac1106d54d5b327bfde20b13c7c2187f3",
+                   "Branch":  "hardening/phase-3-5-acceptance"
+               },
+    "DotNet":  {
+                   "SdkVersion":  "8.0.423",
+                   "RuntimeVersion":  "8.0.29"
+               },
+    "Validation":  {
+                       "BuildWarnings":  0,
+                       "BuildErrors":  0,
+                       "TestsPassed":  27,
+                       "TestsFailed":  0,
+                       "FormatExitCode":  0
+                   },
+    "Soak":  {
+                 "StartedAtUtc":  "2026-08-09T14:18:39.1000778+00:00",
+                 "DurationMinutes":  30,
+                 "Cycles":  585,
+                 "Failures":  0,
+                 "ServiceCpuAveragePercent":  3.312,
+                 "ServiceCpuPeakPercent":  9.0,
+                 "UiCpuAveragePercent":  2.449,
+                 "UiCpuPeakPercent":  6.0,
+                 "ServiceRamInitialMb":  55.5,
+                 "ServiceRamFinalMb":  79.1,
+                 "ServiceRamMinimumMb":  55.5,
+                 "ServiceRamMaximumMb":  86.4,
+                 "UiRamInitialMb":  135.3,
+                 "UiRamFinalMb":  157.9,
+                 "UiRamMinimumMb":  134.5,
+                 "UiRamMaximumMb":  196.3,
+                 "ServiceRestarts":  117,
+                 "UiOpenCount":  195,
+                 "UiCloseCount":  195,
+                 "IpcStatusChecks":  585,
+                 "DatabaseLockReleased":  true,
+                 "ProcessInspectionSucceeded":  true,
+                 "RemainingProcesses":  0,
+                 "FirewallInspectionSucceeded":  true,
+                 "RemainingOwnedFirewallRules":  0
+             },
+    "Scm":  {
+                "Status":  "Verified",
+                "ServiceExeSha256":  "2B6D057BD3F189AC6A186CA6B7D2AED759422390ADD6596195CA3D1FC64737F5",
+                "ServiceDllSha256":  "67503DCCB540CDCEDF7AD7F16551B5F4116A7A491A06212BFDACD78419A8671F"
+            },
+    "GitHubActionsUrl":  "https://github.com/hiep1607/EgressGuard/actions/runs/31319664186",
+    "Remaining":  {
+                      "NotVerified":  [
+                                          "Reboot",
+                                          "DPI 100%",
+                                          "DPI 150%",
+                                          "Direct tray context-menu interaction"
+                                      ],
+                      "Blocked":  [
+                                      "Production signing or organizational Application Control approval",
+                                      "Phase 4/ETW until remaining Phase 3.5 acceptance is complete"
+                                  ]
+                  }
+}

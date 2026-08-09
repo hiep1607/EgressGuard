@@ -8,13 +8,21 @@ using EgressGuard.Protocol;
 using EgressGuard.Service;
 using EgressGuard.Windows;
 using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.Logging;
 
 namespace EgressGuard.Tests;
 
 internal static class Program
 {
-    public static async Task<int> Main()
+    public static async Task<int> Main(string[] args)
     {
+        if (args.Length == 1 && args[0] == "--firewall-cancellation-integration")
+        {
+            await TestRealFirewallCancellationIntegrationAsync().ConfigureAwait(false);
+            Console.WriteLine("PASS  Real firewall cancellation reconciliation");
+            return 0;
+        }
+
         var tests = new (string Name, Func<Task> Run)[]
         {
             ("Process identity includes start time", TestProcessIdentityAsync),
@@ -23,6 +31,13 @@ internal static class Program
             ("Executable metadata hashes and caches", TestExecutableMetadataAsync),
             ("Authenticode maps trust results and validates Windows binary", TestAuthenticodeAsync),
             ("Firewall path validation is simulator-only", TestFirewallPathValidationAsync),
+            ("PowerShell pre-cancellation does not start a process", TestPowerShellPreCancellationAsync),
+            ("PowerShell cancellation terminates only its owned process tree", TestPowerShellCancellationCleanupAsync),
+            ("PowerShell timeout terminates its owned process tree", TestPowerShellTimeoutCleanupAsync),
+            ("Indeterminate firewall creation reconciles the exact rule", TestFirewallCreateReconciliationAsync),
+            ("Complete firewall semantics recognize an exact rule", TestCompleteFirewallSemanticsMatchAsync),
+            ("Complete firewall semantics reject field mismatches", TestCompleteFirewallSemanticsMismatchAsync),
+            ("Concurrent equivalent firewall requests serialize creation", TestConcurrentFirewallCreationAsync),
             ("Controlled TCP connection maps to current process", TestControlledTcpMappingAsync),
             ("Controlled IPv6 TCP maps to current process", TestControlledIPv6MappingAsync),
             ("Controlled UDP endpoint maps to current process", TestControlledUdpMappingAsync),
@@ -32,6 +47,10 @@ internal static class Program
             ("Baseline minimum samples and reset", TestBaselineAsync),
             ("SQLite migration and flow persistence", TestPersistenceAsync),
             ("SQLite lock fails without unsafe fallback", TestDatabaseLockAsync),
+            ("Service graceful cancellation completes without failure logs", TestGracefulCancellationAsync),
+            ("Automatic firewall rule rolls back on persistence failure", TestAutomaticRuleRollbackAsync),
+            ("Automatic firewall rule rolls back on cancellation", TestAutomaticRuleCancellationRollbackAsync),
+            ("Automatic firewall rollback logs original and rollback failures", TestAutomaticRuleRollbackFailureLoggingAsync),
             ("Protocol frame roundtrip", TestProtocolRoundTripAsync),
             ("Protocol rejects oversized message", TestOversizedMessageAsync),
             ("Protocol handles disconnect", TestProtocolDisconnectAsync),
@@ -182,6 +201,240 @@ internal static class Program
         }
 
         return Task.CompletedTask;
+    }
+
+    private static async Task TestPowerShellPreCancellationAsync()
+    {
+        var starts = 0;
+        var runner = new PowerShellProcessRunner(
+            startProcess: startInfo =>
+            {
+                Interlocked.Increment(ref starts);
+                return Process.Start(startInfo);
+            });
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await AssertThrowsAsync<OperationCanceledException>(() =>
+            runner.RunAsync("Write-Output 'unexpected'", new Dictionary<string, string>(), cancellation.Token)).ConfigureAwait(false);
+
+        AssertEqual(0, starts);
+
+        var firewallRunner = new StatefulFirewallPowerShellRunner();
+        var manager = new OwnedFirewallRuleManager(firewallRunner, () => true);
+        var executablePath = Environment.ProcessPath ?? throw new TestFailureException("Test executable path is unavailable.");
+        await AssertThrowsAsync<OperationCanceledException>(() =>
+            manager.CreateAsync(TestRuleForExecutable(executablePath), cancellation.Token)).ConfigureAwait(false);
+        AssertEqual(0, firewallRunner.InvocationCount);
+        AssertEqual(FakeExactRuleState.Absent, firewallRunner.State);
+    }
+
+    private static async Task TestPowerShellCancellationCleanupAsync()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "EgressGuard-PowerShellCancellation-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var parentPidPath = Path.Combine(directory, "parent.pid");
+        var childPidPath = Path.Combine(directory, "child.pid");
+        using var unrelated = Process.Start(new ProcessStartInfo("powershell.exe")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            ArgumentList = { "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30" }
+        }) ?? throw new TestFailureException("Unable to start unrelated PowerShell fixture.");
+        try
+        {
+            var runner = new PowerShellProcessRunner(TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(5));
+            var environment = new Dictionary<string, string>
+            {
+                ["EG_PARENT_PID_PATH"] = parentPidPath,
+                ["EG_CHILD_PID_PATH"] = childPidPath
+            };
+            const string script = """
+                Set-Content -LiteralPath $env:EG_PARENT_PID_PATH -Value $PID
+                $child=Start-Process powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30' -PassThru
+                Set-Content -LiteralPath $env:EG_CHILD_PID_PATH -Value $child.Id
+                Wait-Process -Id $child.Id
+                """;
+            using var cancellation = new CancellationTokenSource();
+            var runTask = runner.RunAsync(script, environment, cancellation.Token);
+            await WaitForFileAsync(parentPidPath).ConfigureAwait(false);
+            await WaitForFileAsync(childPidPath).ConfigureAwait(false);
+            var parentPid = int.Parse((await File.ReadAllTextAsync(parentPidPath).ConfigureAwait(false)).Trim(), System.Globalization.CultureInfo.InvariantCulture);
+            var childPid = int.Parse((await File.ReadAllTextAsync(childPidPath).ConfigureAwait(false)).Trim(), System.Globalization.CultureInfo.InvariantCulture);
+
+            cancellation.Cancel();
+            await AssertThrowsAsync<OperationCanceledException>(() => runTask).ConfigureAwait(false);
+
+            await AssertProcessExitedAsync(parentPid).ConfigureAwait(false);
+            await AssertProcessExitedAsync(childPid).ConfigureAwait(false);
+            AssertTrue(!unrelated.HasExited, "Cancellation killed an unrelated PowerShell process.");
+        }
+        finally
+        {
+            if (!unrelated.HasExited)
+            {
+                unrelated.Kill(entireProcessTree: true);
+                await unrelated.WaitForExitAsync().ConfigureAwait(false);
+            }
+
+            await DeleteDirectoryWithRetryAsync(directory).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task TestPowerShellTimeoutCleanupAsync()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "EgressGuard-PowerShellTimeout-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var parentPidPath = Path.Combine(directory, "parent.pid");
+        var childPidPath = Path.Combine(directory, "child.pid");
+        try
+        {
+            var runner = new PowerShellProcessRunner(TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(5));
+            var environment = new Dictionary<string, string>
+            {
+                ["EG_PARENT_PID_PATH"] = parentPidPath,
+                ["EG_CHILD_PID_PATH"] = childPidPath
+            };
+            var runTask = runner.RunAsync(
+                "Set-Content -LiteralPath $env:EG_PARENT_PID_PATH -Value $PID; $child=Start-Process powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30' -PassThru; Set-Content -LiteralPath $env:EG_CHILD_PID_PATH -Value $child.Id; Wait-Process -Id $child.Id",
+                environment,
+                CancellationToken.None);
+            await WaitForFileAsync(parentPidPath).ConfigureAwait(false);
+            await WaitForFileAsync(childPidPath).ConfigureAwait(false);
+            var parentPid = int.Parse((await File.ReadAllTextAsync(parentPidPath).ConfigureAwait(false)).Trim(), System.Globalization.CultureInfo.InvariantCulture);
+            var childPid = int.Parse((await File.ReadAllTextAsync(childPidPath).ConfigureAwait(false)).Trim(), System.Globalization.CultureInfo.InvariantCulture);
+
+            await AssertThrowsAsync<TimeoutException>(() => runTask).ConfigureAwait(false);
+            await AssertProcessExitedAsync(parentPid).ConfigureAwait(false);
+            await AssertProcessExitedAsync(childPid).ConfigureAwait(false);
+        }
+        finally
+        {
+            await DeleteDirectoryWithRetryAsync(directory).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task TestFirewallCreateReconciliationAsync()
+    {
+        var executablePath = Environment.ProcessPath ?? throw new TestFailureException("Test executable path is unavailable.");
+        var rule = TestRuleForExecutable(executablePath);
+        var runner = new StatefulFirewallPowerShellRunner { CancelCreateAfterMutation = true };
+        var manager = new OwnedFirewallRuleManager(runner, () => true);
+        using var cancellation = new CancellationTokenSource();
+        runner.Cancellation = cancellation;
+
+        await AssertThrowsAsync<OperationCanceledException>(() => manager.CreateAsync(rule, cancellation.Token)).ConfigureAwait(false);
+
+        AssertEqual(FakeExactRuleState.Absent, runner.State);
+        AssertEqual(1, runner.ExactDeleteCount);
+
+        var preExistingRunner = new StatefulFirewallPowerShellRunner { State = FakeExactRuleState.Match };
+        var preExistingManager = new OwnedFirewallRuleManager(preExistingRunner, () => true);
+        AssertEqual(FirewallMutationStatus.Unchanged, await preExistingManager.CreateAsync(rule, CancellationToken.None).ConfigureAwait(false));
+        AssertEqual(0, preExistingRunner.CreateCount);
+        AssertEqual(0, preExistingRunner.ExactDeleteCount);
+
+        var foreignRunner = new StatefulFirewallPowerShellRunner { State = FakeExactRuleState.Mismatch };
+        var foreignManager = new OwnedFirewallRuleManager(foreignRunner, () => true);
+        await AssertThrowsAsync<InvalidOperationException>(() => foreignManager.CreateAsync(rule, CancellationToken.None)).ConfigureAwait(false);
+        AssertEqual(FakeExactRuleState.Mismatch, foreignRunner.State);
+        AssertEqual(0, foreignRunner.ExactDeleteCount);
+    }
+
+    private static async Task TestConcurrentFirewallCreationAsync()
+    {
+        var savedRules = new List<FirewallRule>();
+        var sync = new object();
+        var firewall = new FakeFirewallRuleManager();
+        Task<IReadOnlyList<FirewallRule>> GetRules(CancellationToken _)
+        {
+            lock (sync)
+            {
+                return Task.FromResult<IReadOnlyList<FirewallRule>>([.. savedRules]);
+            }
+        }
+
+        async Task SaveRule(FirewallRule rule, CancellationToken cancellationToken)
+        {
+            await Task.Delay(50, cancellationToken).ConfigureAwait(false);
+            lock (sync)
+            {
+                savedRules.Add(rule);
+            }
+        }
+
+        var firstRule = SampleRule(FirewallAction.Block, SampleFlow());
+        var secondRule = firstRule with { Id = Guid.NewGuid() };
+        var first = new FirewallRuleCreateCoordinator(firewall, SaveRule, new ListLogger<FirewallRuleCreateCoordinator>(), GetRules);
+        var second = new FirewallRuleCreateCoordinator(firewall, SaveRule, new ListLogger<FirewallRuleCreateCoordinator>(), GetRules);
+
+        var results = await Task.WhenAll(
+            first.ApplyAsync(firstRule, CancellationToken.None, failOpen: false),
+            second.ApplyAsync(secondRule, CancellationToken.None, failOpen: false)).ConfigureAwait(false);
+
+        AssertEqual(1, firewall.CreateCallCount);
+        AssertEqual(1, savedRules.Count);
+        AssertEqual(1, results.Count(result => result.Status == FirewallMutationStatus.Created));
+        AssertEqual(1, results.Count(result => result.ExistingRuleId is not null));
+    }
+
+    private static async Task TestCompleteFirewallSemanticsMatchAsync()
+    {
+        var executablePath = Environment.ProcessPath ?? throw new TestFailureException("Test executable path is unavailable.");
+        var rule = TestRuleForExecutable(executablePath);
+        var runner = new MockFirewallSemanticsRunner(new Dictionary<string, string>
+        {
+            ["EG_ACTUAL_PROGRAM"] = executablePath.ToUpperInvariant(),
+            ["EG_ACTUAL_REMOTE_ADDRESS"] = rule.RemoteAddress!.ToUpperInvariant(),
+            ["EG_ACTUAL_PROTOCOL"] = "6",
+            ["EG_ACTUAL_ENABLED"] = "true",
+            ["EG_ACTUAL_PROFILE"] = "ANY"
+        });
+        var manager = new OwnedFirewallRuleManager(runner, () => true);
+
+        AssertEqual(FirewallMutationStatus.Unchanged, await manager.CreateAsync(rule, CancellationToken.None).ConfigureAwait(false));
+        AssertEqual(1, runner.QueryCount);
+        AssertEqual(0, runner.CreateCount);
+        AssertEqual(0, runner.DeleteCount);
+        var description = runner.LastEnvironment?["EG_RULE_DESCRIPTION"] ?? string.Empty;
+        foreach (var property in new[] { "id", "hash", "path", "action", "remoteAddress", "remotePort", "protocol", "enabled" })
+        {
+            AssertTrue(description.Contains($"\"{property}\"", StringComparison.Ordinal), $"Ownership description omitted {property}.");
+        }
+    }
+
+    private static async Task TestCompleteFirewallSemanticsMismatchAsync()
+    {
+        var executablePath = Environment.ProcessPath ?? throw new TestFailureException("Test executable path is unavailable.");
+        var rule = TestRuleForExecutable(executablePath);
+        var cases = new (string Field, string Value)[]
+        {
+            ("EG_ACTUAL_REMOTE_ADDRESS", "198.51.100.2"),
+            ("EG_ACTUAL_REMOTE_PORT", "10"),
+            ("EG_ACTUAL_PROTOCOL", "17"),
+            ("EG_ACTUAL_ENABLED", "False")
+        };
+
+        foreach (var testCase in cases)
+        {
+            var runner = new MockFirewallSemanticsRunner(new Dictionary<string, string> { [testCase.Field] = testCase.Value });
+            var manager = new OwnedFirewallRuleManager(runner, () => true);
+            var saveCount = 0;
+            var coordinator = new FirewallRuleCreateCoordinator(
+                manager,
+                (_, _) =>
+                {
+                    saveCount++;
+                    return Task.CompletedTask;
+                },
+                new ListLogger<FirewallRuleCreateCoordinator>());
+
+            await AssertThrowsAsync<InvalidOperationException>(() =>
+                coordinator.ApplyAsync(rule, CancellationToken.None, failOpen: false)).ConfigureAwait(false);
+            AssertEqual(0, saveCount);
+            AssertEqual(0, runner.CreateCount);
+            AssertEqual(0, runner.DeleteCount);
+        }
     }
 
     private static async Task TestControlledTcpMappingAsync()
@@ -417,6 +670,127 @@ internal static class Program
         }
     }
 
+    private static async Task TestGracefulCancellationAsync()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "EgressGuard-CancellationTests-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var databasePath = Path.Combine(directory, "cancellation.db");
+        var logger = new ListLogger<FlowCoordinator>();
+        UnobservedTaskExceptionEventArgs? unobserved = null;
+        EventHandler<UnobservedTaskExceptionEventArgs> handler = (_, args) => unobserved = args;
+        TaskScheduler.UnobservedTaskException += handler;
+        var coordinator = new FlowCoordinator(
+            new EmptyFlowSensor(),
+            new EgressGuardDatabase(databasePath),
+            new RiskEngine(),
+            new BaselineTracker(),
+            new FakeFirewallRuleManager(),
+            new ServiceState(),
+            new EventHub(),
+            logger);
+        try
+        {
+            await coordinator.StartAsync(CancellationToken.None).ConfigureAwait(false);
+            using var startupTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            while (!File.Exists(databasePath))
+            {
+                await Task.Delay(25, startupTimeout.Token).ConfigureAwait(false);
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            using var shutdownTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            await coordinator.StopAsync(shutdownTimeout.Token).ConfigureAwait(false);
+            stopwatch.Stop();
+
+            AssertTrue(stopwatch.Elapsed < TimeSpan.FromSeconds(5), "Graceful cancellation did not finish within the timeout.");
+            AssertTrue(
+                logger.Entries.All(entry => !entry.Message.Contains("Database initialization failed", StringComparison.Ordinal)),
+                "Graceful cancellation was logged as database initialization failure.");
+            AssertTrue(
+                logger.Entries.All(entry => !entry.Message.Contains("Flow persistence batch failed", StringComparison.Ordinal)),
+                "Graceful cancellation was logged as persistence failure.");
+            AssertEqual(null, unobserved);
+        }
+        finally
+        {
+            coordinator.Dispose();
+            TaskScheduler.UnobservedTaskException -= handler;
+            SqliteConnection.ClearAllPools();
+            await DeleteDirectoryWithRetryAsync(directory).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task TestAutomaticRuleRollbackAsync()
+    {
+        var flow = SampleFlow();
+        var rule = SampleRule(FirewallAction.Block, flow);
+        var foreignRuleId = Guid.NewGuid();
+        var firewall = new FakeFirewallRuleManager();
+        firewall.ForeignRuleIds.Add(foreignRuleId);
+        var logger = new ListLogger<FirewallRuleCreateCoordinator>();
+        var applier = new FirewallRuleCreateCoordinator(
+            firewall,
+            (_, _) => Task.FromException(new InvalidOperationException("controlled database failure")),
+            logger);
+
+        await applier.ApplyAsync(rule, CancellationToken.None).ConfigureAwait(false);
+
+        AssertTrue(!firewall.OwnedRuleIds.Contains(rule.Id), "The newly created rule remained after database failure.");
+        AssertTrue(firewall.ForeignRuleIds.Contains(foreignRuleId), "Rollback modified a foreign firewall rule.");
+        AssertEqual(rule.Id, firewall.DeletedRuleIds.Single());
+        AssertTrue(logger.Entries.Any(entry => entry.Message.Contains("persistence failed", StringComparison.Ordinal)), "The original persistence failure was not logged.");
+
+        var existingRule = rule with { Id = Guid.NewGuid() };
+        var existingFirewall = new FakeFirewallRuleManager { CreateChangesState = false };
+        existingFirewall.OwnedRuleIds.Add(existingRule.Id);
+        var existingApplier = new FirewallRuleCreateCoordinator(
+            existingFirewall,
+            (_, _) => Task.FromException(new InvalidOperationException("controlled database failure")),
+            new ListLogger<FirewallRuleCreateCoordinator>());
+        await existingApplier.ApplyAsync(existingRule, CancellationToken.None).ConfigureAwait(false);
+        AssertTrue(existingFirewall.OwnedRuleIds.Contains(existingRule.Id), "Rollback deleted an owned rule that predated this create request.");
+        AssertEqual(0, existingFirewall.DeletedRuleIds.Count);
+    }
+
+    private static async Task TestAutomaticRuleCancellationRollbackAsync()
+    {
+        var rule = SampleRule(FirewallAction.Block, SampleFlow());
+        var firewall = new FakeFirewallRuleManager();
+        var logger = new ListLogger<FirewallRuleCreateCoordinator>();
+        using var cancellation = new CancellationTokenSource();
+        var applier = new FirewallRuleCreateCoordinator(
+            firewall,
+            (_, _) =>
+            {
+                cancellation.Cancel();
+                return Task.FromCanceled(cancellation.Token);
+            },
+            logger);
+
+        await AssertThrowsAsync<OperationCanceledException>(() => applier.ApplyAsync(rule, cancellation.Token)).ConfigureAwait(false);
+
+        AssertTrue(!firewall.OwnedRuleIds.Contains(rule.Id), "The created rule remained after cancellation.");
+        AssertEqual(rule.Id, firewall.DeletedRuleIds.Single());
+        AssertEqual(0, logger.Entries.Count);
+    }
+
+    private static async Task TestAutomaticRuleRollbackFailureLoggingAsync()
+    {
+        var rule = SampleRule(FirewallAction.Block, SampleFlow());
+        var firewall = new FakeFirewallRuleManager { DeleteFails = true };
+        var logger = new ListLogger<FirewallRuleCreateCoordinator>();
+        var applier = new FirewallRuleCreateCoordinator(
+            firewall,
+            (_, _) => Task.FromException(new InvalidOperationException("controlled database failure")),
+            logger);
+
+        await applier.ApplyAsync(rule, CancellationToken.None).ConfigureAwait(false);
+
+        AssertTrue(firewall.OwnedRuleIds.Contains(rule.Id), "The rollback-failure fixture unexpectedly removed the rule.");
+        AssertTrue(logger.Entries.Any(entry => entry.Exception?.Message == "controlled database failure"), "The original failure was not logged.");
+        AssertTrue(logger.Entries.Any(entry => entry.Exception?.Message == "controlled rollback failure"), "The rollback failure was not logged.");
+    }
+
     private static async Task TestOversizedMessageAsync()
     {
         var message = MessageEnvelope.Create(MessageTypes.Error, new ErrorMessage("BIG", new string('x', ProtocolConstants.MaximumMessageBytes + 1)));
@@ -595,6 +969,152 @@ internal static class Program
         }
     }
 
+    private static async Task TestRealFirewallCancellationIntegrationAsync()
+    {
+        if (!WindowsFirewallManager.IsAdministrator())
+        {
+            throw new TestFailureException("Real firewall cancellation integration requires an Administrator token.");
+        }
+
+        var executablePath = Environment.ProcessPath ?? throw new TestFailureException("Test executable path is unavailable.");
+        var rule = TestRuleForExecutable(executablePath);
+        var startedProcesses = new List<(int Id, DateTime StartTimeUtc)>();
+        var processSync = new object();
+        var runner = new PowerShellProcessRunner(
+            TimeSpan.FromSeconds(30),
+            TimeSpan.FromSeconds(5),
+            startInfo =>
+            {
+                var process = Process.Start(startInfo);
+                if (process is not null)
+                {
+                    lock (processSync)
+                    {
+                        startedProcesses.Add((process.Id, process.StartTime.ToUniversalTime()));
+                    }
+                }
+
+                return process;
+            });
+        var manager = new OwnedFirewallRuleManager(new DelayAfterCreateRunner(runner), () => true);
+        using var unrelated = Process.Start(new ProcessStartInfo("powershell.exe")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            ArgumentList = { "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30" }
+        }) ?? throw new TestFailureException("Unable to start unrelated PowerShell integration fixture.");
+        try
+        {
+            using var cancellation = new CancellationTokenSource();
+            var createTask = manager.CreateAsync(rule, cancellation.Token);
+            using var observationTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            while (!await manager.ExistsAsync(rule.Id, observationTimeout.Token).ConfigureAwait(false))
+            {
+                await Task.Delay(100, observationTimeout.Token).ConfigureAwait(false);
+            }
+
+            cancellation.Cancel();
+            await AssertThrowsAsync<OperationCanceledException>(() => createTask).ConfigureAwait(false);
+            AssertTrue(!await manager.ExistsAsync(rule.Id, CancellationToken.None).ConfigureAwait(false), "Cancelled real firewall create left an orphan rule.");
+            AssertTrue(!unrelated.HasExited, "Firewall reconciliation killed an unrelated PowerShell process.");
+
+            List<(int Id, DateTime StartTimeUtc)> snapshot;
+            lock (processSync)
+            {
+                snapshot = [.. startedProcesses];
+            }
+
+            foreach (var started in snapshot)
+            {
+                AssertTrue(!IsSameProcessRunning(started.Id, started.StartTimeUtc), $"Owned PowerShell process {started.Id} remained after integration cleanup.");
+            }
+        }
+        finally
+        {
+            try
+            {
+                await manager.DeleteAsync(rule.Id, CancellationToken.None).ConfigureAwait(false);
+            }
+            finally
+            {
+                if (!unrelated.HasExited)
+                {
+                    unrelated.Kill(entireProcessTree: true);
+                    await unrelated.WaitForExitAsync().ConfigureAwait(false);
+                }
+            }
+        }
+    }
+
+    private static FirewallRule TestRuleForExecutable(string executablePath)
+    {
+        using var stream = new FileStream(executablePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        var hash = Convert.ToHexString(SHA256.HashData(stream));
+        return new FirewallRule(
+            Guid.NewGuid(),
+            "Phase 3.5.1 cancellation integration",
+            FirewallAction.Block,
+            RuleSource.User,
+            executablePath,
+            hash,
+            "203.0.113.1",
+            9,
+            TransportProtocol.Tcp,
+            true,
+            DateTimeOffset.UtcNow,
+            null);
+    }
+
+    private static async Task WaitForFileAsync(string path)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (!File.Exists(path))
+        {
+            await Task.Delay(25, timeout.Token).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task AssertProcessExitedAsync(int processId)
+    {
+        for (var attempt = 0; attempt < 40; attempt++)
+        {
+            if (!IsProcessRunning(processId))
+            {
+                return;
+            }
+
+            await Task.Delay(50).ConfigureAwait(false);
+        }
+
+        throw new TestFailureException($"Process {processId} remained after cleanup.");
+    }
+
+    private static bool IsProcessRunning(int processId)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            return !process.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsSameProcessRunning(int processId, DateTime startTimeUtc)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            return !process.HasExited && process.StartTime.ToUniversalTime() == startTimeUtc;
+        }
+        catch (Exception exception) when (exception is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            return false;
+        }
+    }
+
     private static async Task DeleteDirectoryWithRetryAsync(string path)
     {
         for (var attempt = 0; attempt < 10; attempt++)
@@ -739,4 +1259,215 @@ internal static class Program
     }
 
     private sealed class TestFailureException(string message) : Exception(message);
+
+    private sealed class EmptyFlowSensor : INetworkFlowSensor
+    {
+        public IReadOnlyList<NetworkFlow> Capture() => [];
+    }
+
+    private sealed class FakeFirewallRuleManager : IFirewallRuleManager
+    {
+        public HashSet<Guid> OwnedRuleIds { get; } = [];
+        public HashSet<Guid> ForeignRuleIds { get; } = [];
+        public List<Guid> DeletedRuleIds { get; } = [];
+        public bool CreateChangesState { get; init; } = true;
+        public bool DeleteFails { get; init; }
+        public int CreateCallCount { get; private set; }
+
+        public Task<FirewallMutationStatus> CreateAsync(FirewallRule rule, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            CreateCallCount++;
+            if (CreateChangesState)
+            {
+                OwnedRuleIds.Add(rule.Id);
+            }
+
+            return Task.FromResult(CreateChangesState ? FirewallMutationStatus.Created : FirewallMutationStatus.Unchanged);
+        }
+
+        public Task DeleteAsync(Guid ruleId, CancellationToken cancellationToken)
+        {
+            DeletedRuleIds.Add(ruleId);
+            if (DeleteFails)
+            {
+                throw new InvalidOperationException("controlled rollback failure");
+            }
+
+            OwnedRuleIds.Remove(ruleId);
+            return Task.CompletedTask;
+        }
+
+        public Task SetEnabledAsync(Guid ruleId, bool enabled, CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task ResetOwnedRulesAsync(CancellationToken cancellationToken)
+        {
+            OwnedRuleIds.Clear();
+            return Task.CompletedTask;
+        }
+
+        public Task<bool> ExistsAsync(Guid ruleId, CancellationToken cancellationToken) => Task.FromResult(OwnedRuleIds.Contains(ruleId));
+    }
+
+    private enum FakeExactRuleState
+    {
+        Absent,
+        Match,
+        Mismatch
+    }
+
+    private sealed class StatefulFirewallPowerShellRunner : IPowerShellProcessRunner
+    {
+        public FakeExactRuleState State { get; set; }
+        public bool CancelCreateAfterMutation { get; init; }
+        public CancellationTokenSource? Cancellation { get; set; }
+        public int CreateCount { get; private set; }
+        public int ExactDeleteCount { get; private set; }
+        public int InvocationCount { get; private set; }
+
+        public Task<PowerShellProcessResult> RunAsync(
+            string script,
+            IReadOnlyDictionary<string, string> environment,
+            CancellationToken cancellationToken)
+        {
+            InvocationCount++;
+            cancellationToken.ThrowIfCancellationRequested();
+            if (script.Contains("EGRESSGUARD_EXACT_RULE_QUERY", StringComparison.Ordinal))
+            {
+                return Task.FromResult(Result(State switch
+                {
+                    FakeExactRuleState.Absent => "ABSENT",
+                    FakeExactRuleState.Match => "MATCH",
+                    _ => "MISMATCH"
+                }));
+            }
+
+            if (script.Contains("EGRESSGUARD_CREATE_MUTATION", StringComparison.Ordinal))
+            {
+                CreateCount++;
+                State = FakeExactRuleState.Match;
+                if (CancelCreateAfterMutation)
+                {
+                    Cancellation?.Cancel();
+                    return Task.FromCanceled<PowerShellProcessResult>(Cancellation?.Token ?? new CancellationToken(canceled: true));
+                }
+
+                return Task.FromResult(Result("CREATED"));
+            }
+
+            if (script.Contains("EGRESSGUARD_EXACT_RULE_DELETE", StringComparison.Ordinal))
+            {
+                ExactDeleteCount++;
+                State = FakeExactRuleState.Absent;
+                return Task.FromResult(Result("DELETED"));
+            }
+
+            return Task.FromResult(Result(string.Empty));
+        }
+
+        private static PowerShellProcessResult Result(string output) => new(output, string.Empty, 0);
+    }
+
+    private sealed class MockFirewallSemanticsRunner(IReadOnlyDictionary<string, string> overrides) : IPowerShellProcessRunner
+    {
+        private readonly PowerShellProcessRunner _inner = new();
+
+        public int QueryCount { get; private set; }
+        public int CreateCount { get; private set; }
+        public int DeleteCount { get; private set; }
+        public IReadOnlyDictionary<string, string>? LastEnvironment { get; private set; }
+
+        public Task<PowerShellProcessResult> RunAsync(
+            string script,
+            IReadOnlyDictionary<string, string> environment,
+            CancellationToken cancellationToken)
+        {
+            if (script.Contains("EGRESSGUARD_EXACT_RULE_QUERY", StringComparison.Ordinal)) QueryCount++;
+            if (script.Contains("EGRESSGUARD_CREATE_MUTATION", StringComparison.Ordinal)) CreateCount++;
+            if (script.Contains("EGRESSGUARD_EXACT_RULE_DELETE", StringComparison.Ordinal)) DeleteCount++;
+
+            var fixture = new Dictionary<string, string>(environment, StringComparer.OrdinalIgnoreCase)
+            {
+                ["EG_ACTUAL_DESCRIPTION"] = environment["EG_RULE_DESCRIPTION"],
+                ["EG_ACTUAL_PROGRAM"] = environment["EG_PROGRAM"],
+                ["EG_ACTUAL_REMOTE_ADDRESS"] = environment["EG_REMOTE_ADDRESS"],
+                ["EG_ACTUAL_REMOTE_PORT"] = environment["EG_REMOTE_PORT"],
+                ["EG_ACTUAL_PROTOCOL"] = environment["EG_PROTOCOL"],
+                ["EG_ACTUAL_ENABLED"] = environment["EG_ENABLED"],
+                ["EG_ACTUAL_PROFILE"] = environment["EG_PROFILE"]
+            };
+            foreach (var item in overrides)
+            {
+                fixture[item.Key] = item.Value;
+            }
+
+            LastEnvironment = fixture;
+            return _inner.RunAsync(MockFunctions + script, fixture, cancellationToken);
+        }
+
+        private const string MockFunctions = """
+            function Get-NetFirewallRule {
+              [CmdletBinding()] param()
+              [pscustomobject]@{DisplayName=$env:EG_RULE_NAME;Description=$env:EG_ACTUAL_DESCRIPTION;Direction='Outbound';Action=$env:EG_ACTION;Enabled=$env:EG_ACTUAL_ENABLED;Profile=$env:EG_ACTUAL_PROFILE}
+            }
+            function Get-NetFirewallApplicationFilter {
+              [CmdletBinding()] param([Parameter(ValueFromPipeline)]$Rule)
+              process { [pscustomobject]@{Program=$env:EG_ACTUAL_PROGRAM} }
+            }
+            function Get-NetFirewallAddressFilter {
+              [CmdletBinding()] param([Parameter(ValueFromPipeline)]$Rule)
+              process { [pscustomobject]@{RemoteAddress=$env:EG_ACTUAL_REMOTE_ADDRESS} }
+            }
+            function Get-NetFirewallPortFilter {
+              [CmdletBinding()] param([Parameter(ValueFromPipeline)]$Rule)
+              process { [pscustomobject]@{RemotePort=$env:EG_ACTUAL_REMOTE_PORT;Protocol=$env:EG_ACTUAL_PROTOCOL} }
+            }
+            """;
+    }
+
+    private sealed class DelayAfterCreateRunner(IPowerShellProcessRunner inner) : IPowerShellProcessRunner
+    {
+        public Task<PowerShellProcessResult> RunAsync(
+            string script,
+            IReadOnlyDictionary<string, string> environment,
+            CancellationToken cancellationToken)
+        {
+            if (script.Contains("EGRESSGUARD_CREATE_MUTATION", StringComparison.Ordinal))
+            {
+                script = script.Replace(
+                    "# EGRESSGUARD_AFTER_CREATE",
+                    "# EGRESSGUARD_AFTER_CREATE\nStart-Sleep -Seconds 30",
+                    StringComparison.Ordinal);
+            }
+
+            return inner.RunAsync(script, environment, cancellationToken);
+        }
+    }
+
+    private sealed record LogEntry(LogLevel Level, string Message, Exception? Exception);
+
+    private sealed class ListLogger<T> : ILogger<T>
+    {
+        public List<LogEntry> Entries { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => NullScope.Instance;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter) => Entries.Add(new LogEntry(logLevel, formatter(state, exception), exception));
+    }
+
+    private sealed class NullScope : IDisposable
+    {
+        public static NullScope Instance { get; } = new();
+
+        public void Dispose()
+        {
+        }
+    }
 }

@@ -15,13 +15,27 @@
             <Setter Property="BorderBrush" Value="#3B5268" />
         </Style>
         <Style TargetType="TextBox"><Setter Property="Padding" Value="8,6" /><Setter Property="Margin" Value="4" /></Style>
-        <Style TargetType="ComboBox"><Setter Property="Padding" Value="8,5" /><Setter Property="Margin" Value="4" /><Setter Property="Foreground" Value="#101820" /><Setter Property="Background" Value="#F3F6F8" /></Style>
+        <Style TargetType="ComboBox">
+            <Style.Resources>
+                <Style TargetType="TextBlock">
+                    <Setter Property="Foreground" Value="#101820" />
+                </Style>
+            </Style.Resources>
+            <Setter Property="Padding" Value="8,5" />
+            <Setter Property="Margin" Value="4" />
+            <Setter Property="Foreground" Value="#101820" />
+            <Setter Property="Background" Value="#F3F6F8" />
+        </Style>
         <Style TargetType="DataGrid">
             <Setter Property="EnableRowVirtualization" Value="True" />
             <Setter Property="EnableColumnVirtualization" Value="True" />
             <Setter Property="VirtualizingPanel.IsVirtualizing" Value="True" />
             <Setter Property="VirtualizingPanel.VirtualizationMode" Value="Recycling" />
             <Setter Property="ScrollViewer.CanContentScroll" Value="True" />
+            <Setter Property="Background" Value="#111A23" />
+            <Setter Property="Foreground" Value="#E8EEF5" />
+            <Setter Property="RowBackground" Value="#18212B" />
+            <Setter Property="AlternatingRowBackground" Value="#202C38" />
             <Setter Property="BorderBrush" Value="#324557" />
             <Setter Property="GridLinesVisibility" Value="Horizontal" />
             <Setter Property="HorizontalGridLinesBrush" Value="#2B3B4A" />

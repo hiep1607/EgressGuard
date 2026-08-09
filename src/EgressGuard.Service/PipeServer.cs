@@ -16,6 +16,7 @@ public sealed partial class PipeServer : BackgroundService
     private readonly IFirewallRuleManager _firewall;
     private readonly EventHub _eventHub;
     private readonly ILogger<PipeServer> _logger;
+    private readonly FirewallRuleCreateCoordinator _firewallRuleCreateCoordinator;
 
     public PipeServer(ServiceState state, EgressGuardDatabase database, IFirewallRuleManager firewall, EventHub eventHub, ILogger<PipeServer> logger)
     {
@@ -24,6 +25,11 @@ public sealed partial class PipeServer : BackgroundService
         _firewall = firewall;
         _eventHub = eventHub;
         _logger = logger;
+        _firewallRuleCreateCoordinator = new FirewallRuleCreateCoordinator(
+            _firewall,
+            _database.SaveRuleAsync,
+            logger,
+            _database.GetRulesAsync);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -131,28 +137,10 @@ public sealed partial class PipeServer : BackgroundService
                 return MessageEnvelope.Create(MessageTypes.GetAlerts, new AlertsMessage(await _database.GetRecentAlertsAsync(200, cancellationToken).ConfigureAwait(false)), request.CorrelationId);
             case MessageTypes.CreateRule:
                 var rule = request.ReadPayload<CreateRuleMessage>().Rule;
-                var duplicate = (await _database.GetRulesAsync(cancellationToken).ConfigureAwait(false)).FirstOrDefault(existing =>
-                    existing.Enabled
-                    && existing.Action == rule.Action
-                    && string.Equals(existing.ExecutablePath, rule.ExecutablePath, StringComparison.OrdinalIgnoreCase)
-                    && string.Equals(existing.ExecutableSha256, rule.ExecutableSha256, StringComparison.OrdinalIgnoreCase)
-                    && string.Equals(existing.RemoteAddress, rule.RemoteAddress, StringComparison.OrdinalIgnoreCase)
-                    && existing.RemotePort == rule.RemotePort
-                    && existing.Protocol == rule.Protocol);
-                if (duplicate is not null)
+                var result = await _firewallRuleCreateCoordinator.ApplyAsync(rule, cancellationToken, failOpen: false).ConfigureAwait(false);
+                if (result.ExistingRuleId is Guid duplicateId)
                 {
-                    return Success(request, $"Equivalent rule already exists: {duplicate.Id:D}.");
-                }
-
-                await _firewall.CreateAsync(rule, cancellationToken).ConfigureAwait(false);
-                try
-                {
-                    await _database.SaveRuleAsync(rule, cancellationToken).ConfigureAwait(false);
-                }
-                catch
-                {
-                    await _firewall.DeleteAsync(rule.Id, CancellationToken.None).ConfigureAwait(false);
-                    throw;
+                    return Success(request, $"Equivalent rule already exists: {duplicateId:D}.");
                 }
                 return Success(request, "Rule created.");
             case MessageTypes.DeleteRule:

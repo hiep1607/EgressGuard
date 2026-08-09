@@ -3,6 +3,9 @@
     <OutputType>Exe</OutputType>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="EgressGuard.Tests" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\EgressGuard.Core\EgressGuard.Core.csproj" />
     <ProjectReference Include="..\EgressGuard.Windows\EgressGuard.Windows.csproj" />
     <ProjectReference Include="..\EgressGuard.Persistence\EgressGuard.Persistence.csproj" />
