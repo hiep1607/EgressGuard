@@ -2,7 +2,7 @@
 
 Date: 2026-08-09. Host: Windows 11 x64. Session administrator: yes.
 Tested source baseline: `0c12bbd8fffe13426344d701c665198bf31f4e9a`, followed by the Phase 3.5 changes on `hardening/phase-3-5-acceptance`.
-Sanitized machine-readable evidence: [`docs/evidence/phase-3.5-validation.json`](evidence/phase-3.5-validation.json). It identifies the exact tested source commit and successful GitHub Actions run.
+The Phase 3.5 30-minute-soak evidence remains [`docs/evidence/phase-3.5-validation.json`](evidence/phase-3.5-validation.json) and identifies tested commit `c7273caac1106d54d5b327bfde20b13c7c2187f3`. It must not be interpreted as a 30-minute run on the later Phase 3.5.1 source.
 
 Status vocabulary in this report is deliberate: `Verified` means exercised on the current Windows host, `Integration tested` means exercised without the full production boundary, `Not verified` means no real test was performed, and `Blocked` requires owner or administrator action.
 
@@ -10,12 +10,13 @@ Status vocabulary in this report is deliberate: `Verified` means exercised on th
 |---|---|---|
 | Locked restore | Verified | .NET SDK 8.0.423; locked restore completed. |
 | Release build | Verified | 0 warnings, 0 errors. |
-| Executable tests | Verified | 27/27 passed, including graceful cancellation and automatic firewall rollback regressions. |
+| Executable tests | Verified | 32/32 passed, including graceful cancellation, process-tree cleanup, exact-rule reconciliation, concurrency and automatic firewall rollback regressions. |
 | Format verification | Verified | `dotnet format --verify-no-changes --no-restore` exited 0. |
 | Event architecture | Integration tested | Real Named Pipe subscription, reconnect, sequence, bounded overflow/resync and slow-client tests passed. |
 | Authenticode behavior | Verified | Embedded-signed .NET host, catalog-signed Windows binary, unsigned apphost, tampered signed file and missing file are covered. |
 | Firewall IPv4 and ownership | Verified | Earlier public connect-only acceptance passed; the Phase 3.5 SCM and soak cleanup both found zero owned rules. |
 | Automatic firewall persistence rollback | Verified | Tests cover create-success/database-failure rollback, cancellation after create, pre-existing-rule preservation, foreign-rule preservation, and separate logging of original plus rollback failures. |
+| Phase 3.5.1 PowerShell cancellation safety | Verified | Deterministic tests cover cancellation before start, cancellation/timeout after start, owned tree termination, unrelated PowerShell preservation, exact-rule reconciliation and concurrent duplicate requests. Real Administrator integration cancelled after a unique rule was created and left zero child processes/rules. |
 | Firewall IPv6 | Not verified | The workstation still has no usable IPv6 route for a public block/undo test. |
 | Final framework-dependent publish | Verified | Fresh immutable publish under an isolated `%TEMP%` directory; .NET 8 runtime 8.0.29 is installed machine-wide. |
 | Final service executable identity | Verified | `EgressGuard.Service.exe` SHA-256 `2B6D057BD3F189AC6A186CA6B7D2AED759422390ADD6596195CA3D1FC64737F5`; hash was unchanged after SCM acceptance. |
@@ -62,6 +63,14 @@ The hardened harness uses a unique timestamp/GUID run directory and database. Pr
 An initial hardened 30-minute diagnostic run correctly failed because its ownership set retained historical PIDs that Windows later reused. No EgressGuard process remained. The harness was corrected to remove a PID as soon as the owned process exit is confirmed, a 1-minute 20-cycle regression run passed, and the fresh 30-minute result reported above then passed. The failed diagnostic run is not used as acceptance evidence.
 
 Service and UI processes were deliberately restarted, so initial/final RAM values span different process instances and are not a single-process leak measurement. CPU values in the performance report are normalized by logical processor count and represent active churn workload, not idle CPU.
+
+## Phase 3.5.1 validation
+
+Phase 3.5.1 changes only the PowerShell/firewall mutation runner and the service create/persist transaction path; it does not change the soak harness, sensor, IPC protocol, UI lifecycle or reconnect implementation. The default executable suite passed 32/32. An Administrator-only real firewall integration delayed PowerShell immediately after a uniquely named owned rule was created, cancelled the operation, and verified exact-rule removal, owned child-process cleanup and survival of an unrelated PowerShell process.
+
+A fresh 2-minute smoke run `20260809T153826754Z-44c3679c3f324a6c9a5b528ecf4f05d9` completed 40 traffic/IPC cycles, 8 service restarts, 14 UI opens, 13 scheduled closes and 0 failures. The database lock was released; both strict inspections succeeded with zero EgressGuard process and zero owned firewall rule. A separate post-smoke inspection also found zero SCM service, UI/service process, test-owned PowerShell process and owned rule.
+
+The 30-minute soak was not repeated because neither the soak harness nor lifecycle/reconnect behavior changed. Targeted process-tree tests, the real firewall cancellation integration and the 2-minute lifecycle smoke cover the Phase 3.5.1 risk. The earlier 30-minute evidence remains scoped only to tested commit `c7273caac1106d54d5b327bfde20b13c7c2187f3`.
 
 ## Remaining manual acceptance
 

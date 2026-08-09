@@ -20,7 +20,7 @@ public sealed partial class FlowCoordinator : BackgroundService
     private readonly ServiceState _state;
     private readonly EventHub _eventHub;
     private readonly ILogger<FlowCoordinator> _logger;
-    private readonly AutomaticFirewallRuleApplier _automaticRuleApplier;
+    private readonly FirewallRuleCreateCoordinator _firewallRuleCreateCoordinator;
     private readonly Channel<NetworkFlow> _persistenceQueue;
     private readonly ConcurrentDictionary<string, byte> _seenExecutables = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _seenDestinations = new(StringComparer.OrdinalIgnoreCase);
@@ -43,7 +43,11 @@ public sealed partial class FlowCoordinator : BackgroundService
         _state = state;
         _eventHub = eventHub;
         _logger = logger;
-        _automaticRuleApplier = new AutomaticFirewallRuleApplier(_firewall, _database.SaveRuleAsync, logger);
+        _firewallRuleCreateCoordinator = new FirewallRuleCreateCoordinator(
+            _firewall,
+            _database.SaveRuleAsync,
+            logger,
+            _database.GetRulesAsync);
         _persistenceQueue = Channel.CreateBounded<NetworkFlow>(new BoundedChannelOptions(2048)
         {
             FullMode = BoundedChannelFullMode.Wait,
@@ -227,7 +231,7 @@ public sealed partial class FlowCoordinator : BackgroundService
             Enabled: true,
             DateTimeOffset.UtcNow,
             LastMatchedAt: null);
-        await _automaticRuleApplier.ApplyAsync(rule, cancellationToken).ConfigureAwait(false);
+        await _firewallRuleCreateCoordinator.ApplyAsync(rule, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task PersistAsync(CancellationToken cancellationToken)

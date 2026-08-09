@@ -5,6 +5,7 @@
 ```powershell
 dotnet build EgressGuard.sln -c Release
 dotnet run --project tests\EgressGuard.Tests\EgressGuard.Tests.csproj -c Release --no-build
+dotnet run --project tests\EgressGuard.Tests\EgressGuard.Tests.csproj -c Release --no-build -- --firewall-cancellation-integration
 dotnet format EgressGuard.sln --verify-no-changes --no-restore
 .\tools\run-performance-test.ps1 -UiProcessId <pid> -ServiceProcessId <pid> -DurationSeconds 30
 .\tools\run-soak-test.ps1 -DurationMinutes 30
@@ -14,7 +15,9 @@ The custom runner is retained: it has deterministic Windows integration setup an
 
 ## Automated coverage
 
-The suite covers process identity/churn, TCP IPv4/IPv6, UDP owner PID, flow sensing, executable cache invalidation, Authenticode status/HRESULT mapping, embedded and catalog signatures, tampered and missing files, firewall path/hash guards, risk/policy/baseline, SQLite schema/persistence/locking, graceful service cancellation, automatic-rule persistence rollback and rollback-failure logging, framing/oversize/disconnect, event ordering/gap/overflow/slow client, flow add/update/remove, and a real service Named Pipe reconnect/event subscription.
+The 32-test default suite covers process identity/churn, TCP IPv4/IPv6, UDP owner PID, flow sensing, executable cache invalidation, Authenticode status/HRESULT mapping, embedded and catalog signatures, tampered and missing files, firewall path/hash guards, risk/policy/baseline, SQLite schema/persistence/locking, graceful service cancellation, automatic-rule persistence rollback and rollback-failure logging, PowerShell pre-cancellation, owned process-tree cancellation/timeout cleanup, exact-rule reconciliation, concurrent duplicate creation, framing/oversize/disconnect, event ordering/gap/overflow/slow client, flow add/update/remove, and a real service Named Pipe reconnect/event subscription.
+
+The firewall cancellation integration command is intentionally opt-in and requires an Administrator token. It uses a unique rule ID and the test executable, delays the owned PowerShell immediately after `New-NetFirewallRule`, cancels, and verifies exact-rule reconciliation, zero owned child processes/rules, and survival of an unrelated PowerShell process. Cleanup runs in `finally`; CI runs only the non-mutating default suite.
 
 Access-denied Authenticode is not automated because a reliable fixture requires ACL mutation and can produce machine-specific behavior. The verifier maps access/I/O failures to `VerificationUnavailable`.
 
@@ -25,11 +28,14 @@ Access-denied Authenticode is not automated because a reliable fixture requires 
 - Duplicate request left exactly one owned rule.
 - Chrome retained established public TCP connections while the Simulator rule was active.
 - External rule deletion followed by two resets was idempotent; zero owned rules remained.
+- Phase 3.5.1 real cancellation integration created a uniquely named owned test rule, cancelled while its PowerShell was delayed after creation, reconciled and removed that exact rule, left an unrelated PowerShell running, and finished with zero owned child processes or firewall rules.
 - IPv6 was not verifiable because the workstation had no IPv6 route.
 - UI Automation at the host's real 125% scale selected and rendered Dashboard, Live Connections, Connection Detail, Alerts, Rules and Settings. Multi-row and IPv6 data, empty Rules, a selected connection, a 215-character database path, minimize and maximize were exercised. ComboBox and Alerts DataGrid contrast defects found during Phase 3.5 QA were fixed and visually rechecked.
 - True subscription was exercised over the real service pipe and preserved sequence order.
 - The bounded soak ran 2 minutes/40 cycles with normal, burst, beacon, UI open/close and IPC checks: 0 failures; service RAM 56.2–78.0 MB.
 - The fresh Phase 3.5 soak ran 30 minutes/585 cycles with 0 failures, 117 service restarts, 195 UI opens/closes and 585 IPC checks. Service RAM remained within 55.5–86.4 MB and UI RAM within 134.5–196.3 MB across deliberately restarted process instances. The database lock was released; both cleanup inspections succeeded and found zero process or owned firewall rule.
+
+- Phase 3.5.1 ran the 32/32 default suite plus the opt-in real firewall cancellation integration. Its fresh 2-minute smoke completed 40 traffic/IPC cycles, 8 service restarts and 0 failures; database lock release and both strict cleanup inspections passed with zero EgressGuard process, test-owned PowerShell process or owned firewall rule. The prior 30-minute soak was not relabeled or reused as Phase 3.5.1 evidence.
 
 ## Phase 3.5 limitations
 
