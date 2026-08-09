@@ -2,5 +2,7 @@
   <ItemGroup>
     <ProjectReference Include="..\EgressGuard.Core\EgressGuard.Core.csproj" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.29" />
+    <!-- Override the vulnerable bundled native SQLite library while retaining the .NET 8 provider API. -->
+    <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="3.53.3" />
   </ItemGroup>
 </Project>

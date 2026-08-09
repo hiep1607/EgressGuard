@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security reporting guidance
+    url: https://github.com/hiep1607/EgressGuard/security/policy
+    about: Read SECURITY.md before sharing any vulnerability information; never post secrets or personal data.

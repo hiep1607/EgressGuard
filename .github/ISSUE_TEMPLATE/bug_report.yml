@@ -1,0 +1,46 @@
+name: Bug report
+description: Report a reproducible EgressGuard defect using synthetic, non-sensitive data.
+title: '[Bug] '
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not attach credentials, personal data, real sensitive files, databases, logs, packet captures, dumps, or malware. Security issues should follow SECURITY.md.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the observed defect without sensitive data.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Safe reproduction
+      description: Use only synthetic inputs, Simulator, and Test Server commands.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+  - type: dropdown
+    id: admin
+    attributes:
+      label: Did the scenario require Administrator rights?
+      options: ['No', 'Yes', 'Unknown']
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: I removed credentials, personal data, sensitive files and malware from this report.
+          required: true

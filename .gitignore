@@ -1,10 +1,26 @@
+# Build and IDE output
 **/bin/
 **/obj/
 **/publish/
+publish/
+artifacts/
 .vs/
-.vscode/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
 *.user
 *.suo
+*.rsuser
+
+# Windows and editor local state
+Thumbs.db
+Desktop.ini
+*.tmp
+*.temp
+*.bak
+*.swp
 
 # Runtime state
 *.db
@@ -13,6 +29,8 @@
 *.sqlite
 *.sqlite3
 *.log
+*.dmp
+*.etl
 logs/
 runtime/
 
@@ -21,12 +39,18 @@ runtime/
 *.p12
 *.pem
 *.key
+*.snk
 *.cer
 *.crt
+
+# Local configuration and environment overrides
+.env
+.env.*
+appsettings.Local.json
+appsettings.*.Local.json
 
 # Local tooling and test artifacts
 .dotnet/
 TestResults/
 coverage/
-artifacts/
 *.trx

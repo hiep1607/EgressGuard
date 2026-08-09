@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "isRoot": true,
+  "tools": {
+    "dotnet-counters": {
+      "version": "8.0.547301",
+      "commands": [
+        "dotnet-counters"
+      ],
+      "rollForward": false
+    },
+    "dotnet-trace": {
+      "version": "8.0.547301",
+      "commands": [
+        "dotnet-trace"
+      ],
+      "rollForward": false
+    }
+  }
+}

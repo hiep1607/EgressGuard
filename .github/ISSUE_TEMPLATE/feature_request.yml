@@ -1,0 +1,29 @@
+name: Feature request
+description: Propose a scoped improvement for the current development phase.
+title: '[Feature] '
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: Do not disclose vulnerability details here; follow SECURITY.md. Driver or kernel proposals require a separate VM/signing safety plan.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user or engineering problem should be solved?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed scope
+      description: Describe the smallest useful change and what remains out of scope.
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security, privacy, and privilege impact
+      description: Include firewall, service, administrator, data collection, rollback, and VM requirements.
+    validations:
+      required: true

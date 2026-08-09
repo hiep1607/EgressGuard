@@ -1,87 +1,92 @@
 # EgressGuard
 
-EgressGuard is a Windows, local-first outbound connection monitor. It maps TCP/UDP endpoints to process identity, stores local history in SQLite, assesses explainable risk, and manages only firewall rules carrying the EgressGuard ownership marker.
+> Development prototype. Do not deploy on production systems in its current state.
 
-The repository implements Phases 0–3. It does **not** include ETW file correlation, packet payload capture, TLS interception, a driver, cloud telemetry, process killing, or malware execution.
+EgressGuard is a Windows, local-first outbound connection monitor. It maps TCP/UDP endpoints to process identity, stores local history in SQLite, evaluates explainable risk, and manages only Windows Firewall rules carrying the EgressGuard ownership marker.
 
-## Components
+EgressGuard does **not** claim to prevent 100% of data exfiltration. The current prototype has no ETW file correlation, packet payload capture, TLS interception, driver, cloud telemetry, process killing, or malware execution. See the [threat model](docs/threat-model.md) and [acceptance report](docs/acceptance-report.md) before evaluating its security properties.
+
+## Architecture
 
 ```text
-src/
-├─ EgressGuard.Core/         domain model, baseline, risk and policy
-├─ EgressGuard.Windows/      IP Helper, process, Authenticode and firewall adapters
-├─ EgressGuard.Persistence/  SQLite schema and repositories
-├─ EgressGuard.Protocol/     framed Named Pipe request and event clients
-├─ EgressGuard.Service/      sensor, bounded queues, event fan-out and IPC
-├─ EgressGuard.UI/           WPF dashboard, live/detail/alerts/rules/settings and tray
-└─ EgressGuard.Cli/          diagnostics and service commands
+Windows IP Helper + process metadata
+  → Service sensor / risk / policy
+  ├─→ SQLite persistence
+  └─→ bounded sequenced Named Pipe events
+       → WPF UI batched incremental updates
 ```
 
-## Build and test
+Projects live under `src/`; safe traffic generators and bounded acceptance scripts live under `tools/`. Details are in [architecture.md](docs/architecture.md).
 
-Windows 11 x64 and the .NET 8 SDK are required.
+## Requirements
+
+- Windows 11 x64
+- .NET 8 SDK
+- Administrator PowerShell only for explicitly documented firewall or SCM acceptance
+
+Never disable Windows Defender Firewall or use a blanket outbound block for development tests.
+
+## Build, test, and format
 
 ```powershell
-dotnet build EgressGuard.sln -c Release
+dotnet tool restore
+dotnet restore --locked-mode
+dotnet build EgressGuard.sln -c Release --no-restore
 dotnet run --project tests\EgressGuard.Tests\EgressGuard.Tests.csproj -c Release --no-build
 dotnet format EgressGuard.sln --verify-no-changes --no-restore
 ```
 
-## Development run
+The test project uses a custom executable runner, not `dotnet test`.
+
+## Run locally
+
+Terminal 1:
 
 ```powershell
 $env:EGRESSGUARD_DATA_DIR = Join-Path $env:LOCALAPPDATA 'EgressGuard-Dev'
-.\src\EgressGuard.Service\bin\Release\net8.0-windows\EgressGuard.Service.exe
-.\src\EgressGuard.UI\bin\Release\net8.0-windows\EgressGuard.UI.exe
+dotnet run --project src\EgressGuard.Service\EgressGuard.Service.csproj -c Release
 ```
 
-Closing the UI releases its request pipe, event pipe, timer and cancellation source. It does not stop the service. The tray provides Open Dashboard, current protection/service state, and Exit UI.
-
-## Safe synthetic traffic
+Terminal 2:
 
 ```powershell
-.\tools\EgressGuard.TestServer\bin\Release\net8.0-windows\EgressGuard.TestServer.exe --protocol both --port 5050
-.\tools\EgressGuard.Simulator\bin\Release\net8.0-windows\EgressGuard.Simulator.exe --protocol tcp --port 5050 --mode small --bytes 5120 --hold-seconds 5
+dotnet run --project src\EgressGuard.UI\EgressGuard.UI.csproj -c Release
 ```
 
-For a harmless public enforcement probe with no payload:
+Safe local traffic:
 
 ```powershell
-.\EgressGuard.Simulator.exe --host 1.1.1.1 --port 443 --connect-only --hold-seconds 0
+dotnet run --project tools\EgressGuard.TestServer\EgressGuard.TestServer.csproj -c Release -- --protocol both --port 5050
+dotnet run --project tools\EgressGuard.Simulator\EgressGuard.Simulator.csproj -c Release -- --protocol tcp --port 5050 --mode small --bytes 5120 --hold-seconds 5
 ```
 
-## Windows Service
+Closing the UI does not stop the service. The Simulator generates bytes in memory and never reads user documents or credentials.
 
-Administrator PowerShell:
+## Administrator operations
 
-```powershell
-dotnet publish .\src\EgressGuard.Service\EgressGuard.Service.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true
-.\tools\install-service.ps1 -PublishedDirectory .\src\EgressGuard.Service\bin\Release\net8.0-windows\win-x64\publish
-sc.exe qfailure EgressGuard.Service
-.\tools\uninstall-service.ps1
-```
+Service installation and real firewall acceptance are separate, opt-in Administrator tasks:
 
-Framework-dependent deployment requires a machine-wide .NET 8 runtime visible to LocalSystem. The installer now rolls back the SCM entry if configuration or start fails. This workstation had no registered runtime; a self-contained acceptance build initially ran, while a later rebuilt unsigned service was blocked by the workstation's Application Control policy. See [acceptance-report.md](docs/acceptance-report.md).
+- [Windows administrator checklist](docs/windows-admin-checklist.md)
+- [Testing guide](docs/testing.md)
 
-## Firewall acceptance
+Every firewall test must have cleanup. Windows Application Control currently blocks the final unsigned SCM binary on the acceptance workstation; do not bypass that policy.
 
-The service and calling client must both have the required administrator context. The script uses a public TCP connect-only probe, always resets owned rules in `finally`, and never changes a firewall profile.
+## Current limitations
 
-```powershell
-.\tools\test-firewall.ps1 `
-  -SimulatorPath 'D:\path with spaces\EgressGuard.Simulator.exe' `
-  -AlternateSimulatorPath 'D:\other path\EgressGuard.Simulator.exe'
-```
+- Phases 1–3 are hardened but final SCM restart/reconnect and forced multi-DPI acceptance remain open.
+- Windows Firewall enforcement is path-based; EgressGuard verifies SHA-256 before rule creation and in policy matching, but executable replacement requires identity refresh and rule recreation.
+- UDP owner tables do not expose a remote peer.
+- No release, installer, signing pipeline, or production support commitment exists yet.
 
-Rules are path-bound by Windows Firewall. EgressGuard verifies SHA-256 immediately before creation and policy matching includes path plus hash, but Windows Firewall cannot keep enforcing the hash after the file is replaced. Refresh identity and recreate the rule after executable changes.
-
-## Reports
+## Documentation
 
 - [Architecture](docs/architecture.md)
-- [Testing](docs/testing.md)
+- [Threat model](docs/threat-model.md)
 - [Privacy](docs/privacy.md)
+- [Testing](docs/testing.md)
+- [Development environment](docs/development-environment.md)
+- [Release process](docs/release-process.md)
 - [Acceptance](docs/acceptance-report.md)
 - [Performance](docs/performance-report.md)
-- [Administrator checklist](docs/windows-admin-checklist.md)
 
-Phase 4/ETW is intentionally not implemented. The final SCM restart and soak gates remain open, so the project is not yet declared ready for Phase 4.
+License status: [no license selected; all rights reserved](LICENSE-DECISION.md).

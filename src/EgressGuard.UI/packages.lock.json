@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net8.0-windows7.0": {
+      "egressguard.core": {
+        "type": "Project"
+      },
+      "egressguard.protocol": {
+        "type": "Project",
+        "dependencies": {
+          "EgressGuard.Core": "[1.0.0, )"
+        }
+      }
+    }
+  }
+}
