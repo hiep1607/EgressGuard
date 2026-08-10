@@ -11,7 +11,7 @@ Status vocabulary in this report is deliberate: `Verified` means exercised on th
 |---|---|---|
 | Locked restore | Verified | .NET SDK 8.0.423; locked restore completed. |
 | Release build | Verified | 0 warnings, 0 errors. |
-| Executable tests | Verified | The IPC lifecycle regression passed 5/5 consecutive targeted runs; the complete default suite then passed 34/34, including graceful cancellation, process-tree cleanup, complete firewall semantics, exact-rule reconciliation, concurrency and automatic firewall rollback regressions. |
+| Executable tests | Verified | The complete suite passed 35/35, including the explicit Named Pipe ACL regression, IPC lifecycle, graceful cancellation, process-tree cleanup, complete firewall semantics, exact-rule reconciliation, concurrency and automatic firewall rollback regressions. |
 | Format verification | Verified | `dotnet format --verify-no-changes --no-restore` exited 0. |
 | Event architecture | Integration tested | Real Named Pipe subscription, reconnect, sequence, bounded overflow/resync and slow-client tests passed. The real-service test now uses a per-run pipe and a subscription acknowledgement instead of a fixed readiness delay. |
 | Authenticode behavior | Verified | Embedded-signed .NET host, catalog-signed Windows binary, unsigned apphost, tampered signed file and missing file are covered. |
@@ -29,7 +29,7 @@ Status vocabulary in this report is deliberate: `Verified` means exercised on th
 | SCM stop/start and UI reconnect | Verified | UI displayed `Service disconnected · reconnecting`, then returned to `Service online · Monitor · dropped 0` and remained responsive. |
 | Flow collection after restart | Verified | Safe local traffic produced service status `Active=146`, `Dropped=0` after reconnect. |
 | SCM uninstall and cleanup | Verified | Final inspection: zero SCM service, service/UI processes and EgressGuard-owned firewall rules. |
-| Reboot acceptance | Scoped verification | Commit `c7689c4ba33dcfb9809163173a7e82a655a8c8ea` and its recorded service hashes passed the reboot checklist. PR #2 changes service/protocol/UI code, so the current head reboot status is `NotVerified` pending one final build/publish/reboot. |
+| Reboot acceptance | Verified | The corrected exact artifact from `2cf39c48c57853fedbfede2c9cf82704c5cf9b08` auto-started after reboot, retained all six hashes and completed UI/IPC/Simulator acceptance. The earlier `fbf98b2...` attempt remains recorded as failed. |
 | DPI 125% | Verified | All six tabs were selected and visually inspected; maximize/minimize remained responsive. Dashboard and Live Connections rendered many rows including IPv6, Connection Detail rendered a selected row, Rules rendered empty, and a 215-character database path wrapped without overlap. |
 | DPI 100% | Verified | At real 96 DPI/100%, all three Live Connections filter ComboBoxes remained readable in normal, dropdown, hover/focus and selected states, with explicit disabled-state colors. Long Authenticode/publisher content wrapped at normal and 900×560 sizes. Alerts, Settings, all six tabs and minimize/restore/maximize showed no regression. |
 | DPI 150% | Verified | The primary monitor and rebuilt UI both measured 144 DPI/150%. All six tabs, ComboBox states, long publisher wrapping/tooltip, 900×560 DIP, maximize/minimize/restore and regression surfaces passed after reducing the default window height from 720 to 640 DIP so its title bar remains on-screen. |
@@ -100,7 +100,7 @@ The first post-fix gate exposed an independent flaky test harness issue in `Serv
 - DPI 100%: `Verified`. The Live Connections ComboBox contrast and Connection Detail publisher wrapping fixes passed direct retesting at real 96 DPI/100%.
 - DPI 150%: `Verified`. The primary monitor and UI measured 144 DPI; all required layouts and window states passed after the default-height correction.
 - Tray icon/context menu: `Verified` through direct hidden-icons, right-click, menu invocation, restore and disposal interaction.
-- Current PR-head reboot: `NotVerified`. The earlier reboot line above applies only to commit `c7689c4...`; build/publish and reboot the final PR head once after restoring the original display scale.
+- Corrected final-artifact reboot: `Verified` for product-source commit `2cf39c48c57853fedbfede2c9cf82704c5cf9b08` and its six recorded hashes. Later evidence-only commits do not change that artifact.
 - Production signing/organizational approval: `Blocked – requires owner/administrator action`.
 
 ## DPI 150% and tray acceptance
@@ -119,6 +119,10 @@ Functional acceptance failed because both UI and CLI received `UnauthorizedAcces
 
 The correction creates a protected pipe DACL with FullControl for the service identity, `LocalSystem` and `Administrators`, plus ReadWrite for the Windows `INTERACTIVE` SID. It does not grant `Everyone` or `Authenticated Users`; mutating requests still require the existing administrator impersonation check. A new ACL regression test verifies the exact identities and rights. Locked restore, format verification, a zero-warning Release build, all 35 executable tests and vulnerable-package audit passed. A validation publish installed as `LocalSystem`; CLI status/flows and the framework-dependent UI then connected successfully at 120 DPI, and closing UI left the service Running. This is pre-reboot validation only and does not restore reboot acceptance.
 
+The corrected final artifact was then rebuilt from exact commit `2cf39c48c57853fedbfede2c9cf82704c5cf9b08` and installed from a stable non-temporary directory. Windows boot time advanced from `2026-08-10T05:12:24.5000000Z` to `2026-08-10T09:40:30.5000000Z`. Before any service-control mutation, SCM reported the service already `Running`, `Automatic` and `LocalSystem`; its image path, six hashes, 5/15-second recovery actions, 86400-second reset period and non-crash failure flag all matched. No related Code Integrity event, SCM 7000/7009 event or owned firewall rule appeared after boot.
+
+At 120 DPI/125%, the UI connected without hanging and displayed `Service online · Monitor · dropped 0`. Dashboard, Live Connections, Rules and Alerts were selected directly; minimize and restore returned `Minimized` and `Normal`. A bounded Simulator connection to the loopback Test Server on port 54325 appeared through service IPC. Closing UI left the service Running, with zero UI/test process and zero owned firewall rule. Current-head reboot acceptance is therefore `Verified` for the exact `2cf39c4...` artifact and recorded hashes. Any following documentation-only commit does not alter the tested product source or artifact.
+
 ## Decision
 
-Phases 1–3 retain verified DPI 100%, DPI 150%, direct tray interaction and earlier scoped reboot/soak evidence. The first final-artifact reboot exposed the named-pipe DACL defect and is `Failed`; the ACL correction has only pre-reboot validation. **Do not begin Phase 4/ETW yet.** Build and install a new artifact from the exact correction commit, then repeat final-artifact reboot acceptance once. Production signing/approval must also be resolved before any release claim.
+Phases 1–3 now have verified DPI 100%, DPI 150%, direct tray interaction, soak evidence and corrected final-artifact reboot acceptance. The failed `fbf98b2...` artifact remains explicitly rejected; the accepted artifact is tied to exact source commit `2cf39c4...` and its recorded hashes. The checkpoint is `ReadyForIndependentReview`. **Do not begin Phase 4/ETW or merge Draft PR #2 before independent review.** Production signing/Application Control approval remains blocked and must be resolved before any release claim.
