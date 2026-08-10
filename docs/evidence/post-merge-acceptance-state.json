@@ -1,21 +1,27 @@
 {
   "SchemaVersion": 1,
-  "Stage": "AwaitingManualDpi150",
+  "Stage": "AwaitingFinalArtifactReboot",
   "SourceCommit": "c7689c4ba33dcfb9809163173a7e82a655a8c8ea",
+  "CurrentHeadAtDpi150Start": "24e17dda364b23d572df9aaf732b63d231620f61",
   "Branch": "acceptance/post-merge-windows",
   "PreRebootBootTimeUtc": "2026-07-16T05:04:41.6789460Z",
   "PostRebootBootTimeUtc": "2026-08-09T16:39:28.5000000Z",
   "ServiceExeSha256": "CE8CE2AEB3C67508966B0FA5F0244232FA645D5270C74625E468842CE0DEF8E7",
   "ServiceDllSha256": "E16A797BEB0170C93EEF2C8182435ABE8785A9954AF76FC752EBAFD62A86679E",
-  "RebootStatus": "Verified",
+  "RebootStatus": "NotVerified",
+  "CurrentHeadRebootStatus": "NotVerified",
+  "PreviousRebootCommit": "c7689c4ba33dcfb9809163173a7e82a655a8c8ea",
+  "PreviousRebootStatus": "Verified",
+  "RebootEvidenceArtifactScope": "ServiceExeSha256 and ServiceDllSha256 identify the c7689c4 reboot-tested artifact, not the current PR head.",
   "Dpi100Status": "Verified",
-  "Dpi150Status": "NotVerified",
-  "TrayStatus": "NotVerified",
+  "Dpi150Status": "Verified",
+  "TrayStatus": "Verified",
   "SigningStatus": "Blocked – owner/administrator action required",
   "Remaining": [
-    "Manual DPI 150% acceptance",
     "Restore the original DPI after visual acceptance",
-    "Manual tray context-menu interaction",
+    "Build and publish the final PR head artifact",
+    "Reboot once and verify the final PR head artifact",
+    "Obtain production signing/Application Control approval",
     "Final safe cleanup"
   ]
 }
