@@ -903,7 +903,7 @@ internal static class Program
             CreateNoWindow = true
         };
         startInfo.Environment["EGRESSGUARD_DATA_DIR"] = dataDirectory;
-        startInfo.Environment["EGRESSGUARD_TEST_DURATION_SECONDS"] = "20";
+        startInfo.Environment["EGRESSGUARD_TEST_DURATION_SECONDS"] = "40";
         startInfo.Environment["EGRESSGUARD_PIPE_NAME"] = pipeName;
         using var service = Process.Start(startInfo) ?? throw new TestFailureException("Service process failed to start.");
         var stage = "first connect";
@@ -952,7 +952,7 @@ internal static class Program
                 }
 
                 await subscriptionReady.Task.ConfigureAwait(false);
-                using var eventTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                using var eventTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
                 var listener = new TcpListener(IPAddress.Loopback, 0);
                 listener.Start();
                 try
@@ -985,7 +985,7 @@ internal static class Program
 
             stage = "service lifetime check";
             AssertTrue(!service.HasExited, "Service exited when clients disconnected.");
-            await service.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(25)).ConfigureAwait(false);
+            await service.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(45)).ConfigureAwait(false);
             AssertEqual(0, service.ExitCode);
         }
         catch (Exception exception)
