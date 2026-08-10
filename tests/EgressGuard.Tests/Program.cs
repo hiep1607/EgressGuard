@@ -903,14 +903,36 @@ internal static class Program
         AssertPipeAccess(rules, serviceIdentity, PipeAccessRights.FullControl);
         AssertPipeAccess(rules, new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null), PipeAccessRights.FullControl);
         AssertPipeAccess(rules, new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null), PipeAccessRights.FullControl);
-        AssertPipeAccess(rules, new SecurityIdentifier(WellKnownSidType.InteractiveSid, null), PipeAccessRights.ReadWrite);
+        var interactiveIdentity = new SecurityIdentifier(WellKnownSidType.InteractiveSid, null);
+        var interactiveAllowRules = rules
+            .Where(rule =>
+                rule.AccessControlType == AccessControlType.Allow &&
+                rule.IdentityReference.Equals(interactiveIdentity))
+            .ToArray();
+        AssertTrue(interactiveAllowRules.Length > 0, "Pipe ACL has no allow rule for INTERACTIVE.");
+
+        var interactiveRights = interactiveAllowRules.Aggregate(
+            (PipeAccessRights)0,
+            (combined, rule) => combined | rule.PipeAccessRights);
+        var expectedInteractiveRights = PipeAccessRights.ReadWrite | PipeAccessRights.Synchronize;
+        AssertEqual(expectedInteractiveRights, interactiveRights);
+
+        var forbiddenInteractiveRights = PipeAccessRights.ChangePermissions
+            | PipeAccessRights.TakeOwnership
+            | PipeAccessRights.Delete
+            | PipeAccessRights.CreateNewInstance
+            | PipeAccessRights.AccessSystemSecurity;
+        AssertEqual((PipeAccessRights)0, interactiveRights & forbiddenInteractiveRights);
+        AssertEqual(
+            (PipeAccessRights)0,
+            interactiveRights & (PipeAccessRights.FullControl & ~expectedInteractiveRights));
 
         var expectedIdentities = new HashSet<string>(StringComparer.Ordinal)
         {
             serviceIdentity.Value,
             new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null).Value,
             new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null).Value,
-            new SecurityIdentifier(WellKnownSidType.InteractiveSid, null).Value
+            interactiveIdentity.Value
         };
         AssertTrue(
             rules.All(rule =>

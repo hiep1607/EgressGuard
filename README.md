@@ -77,7 +77,7 @@ The soak harness creates an isolated run/database directory for every invocation
 
 ## Current limitations
 
-- Phases 1–3 have verified final SCM restart/reconnect and a 30-minute soak. Real reboot acceptance, DPI 100%/150% QA, direct tray interaction and production signing/approval remain open; do not begin Phase 4/ETW yet.
+- Phases 1–3 have verified final SCM restart/reconnect, a 30-minute soak, exact-artifact reboot acceptance, DPI 100%/150% QA and direct tray interaction. Production signing/Application Control approval remains blocked, so this prototype is not a production release. Do not begin Phase 4/ETW until the acceptance PR is independently approved and merged.
 - Windows Firewall enforcement is path-based; EgressGuard verifies SHA-256 before rule creation and in policy matching, but executable replacement requires identity refresh and rule recreation.
 - UDP owner tables do not expose a remote peer.
 - No release, installer, signing pipeline, or production support commitment exists yet.
