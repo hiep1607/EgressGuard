@@ -1,7 +1,10 @@
 using System.Diagnostics;
+using System.IO.Pipes;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.AccessControl;
 using System.Security.Cryptography;
+using System.Security.Principal;
 using EgressGuard.Core;
 using EgressGuard.Persistence;
 using EgressGuard.Protocol;
@@ -57,6 +60,7 @@ internal static class Program
             ("Event buffer preserves order and detects gaps and overflow", TestEventBufferAsync),
             ("Slow event subscriber cannot block publisher", TestSlowSubscriberAsync),
             ("Flow state emits add update and remove transitions", TestFlowStateTransitionsAsync),
+            ("Service pipe ACL permits interactive clients without broad access", TestServicePipeAclAsync),
             ("Service pipe reconnect and event subscription", TestServicePipeReconnectAsync),
             ("Process churn does not crash collector", TestProcessChurnAsync)
         };
@@ -884,6 +888,47 @@ internal static class Program
         AssertEqual(StreamEventKind.FlowRemoved, removed.Single().Kind);
         AssertEqual(first.Id, removed.Single().FlowId);
         return Task.CompletedTask;
+    }
+
+    private static Task TestServicePipeAclAsync()
+    {
+        using var identity = WindowsIdentity.GetCurrent();
+        var serviceIdentity = identity.User ?? throw new TestFailureException("Current Windows identity has no SID.");
+        var security = PipeServer.CreatePipeSecurity(serviceIdentity);
+        var rules = security.GetAccessRules(includeExplicit: true, includeInherited: false, typeof(SecurityIdentifier))
+            .OfType<PipeAccessRule>()
+            .ToArray();
+
+        AssertTrue(security.AreAccessRulesProtected, "Pipe ACL unexpectedly inherits access rules.");
+        AssertPipeAccess(rules, serviceIdentity, PipeAccessRights.FullControl);
+        AssertPipeAccess(rules, new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null), PipeAccessRights.FullControl);
+        AssertPipeAccess(rules, new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null), PipeAccessRights.FullControl);
+        AssertPipeAccess(rules, new SecurityIdentifier(WellKnownSidType.InteractiveSid, null), PipeAccessRights.ReadWrite);
+
+        var expectedIdentities = new HashSet<string>(StringComparer.Ordinal)
+        {
+            serviceIdentity.Value,
+            new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null).Value,
+            new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null).Value,
+            new SecurityIdentifier(WellKnownSidType.InteractiveSid, null).Value
+        };
+        AssertTrue(
+            rules.All(rule =>
+                rule.AccessControlType == AccessControlType.Allow &&
+                rule.IdentityReference is SecurityIdentifier sid &&
+                expectedIdentities.Contains(sid.Value)),
+            "Pipe ACL grants access to an unexpected identity.");
+        return Task.CompletedTask;
+    }
+
+    private static void AssertPipeAccess(PipeAccessRule[] rules, SecurityIdentifier identity, PipeAccessRights expectedRights)
+    {
+        AssertTrue(
+            rules.Any(rule =>
+                rule.AccessControlType == AccessControlType.Allow &&
+                rule.IdentityReference.Equals(identity) &&
+                (rule.PipeAccessRights & expectedRights) == expectedRights),
+            $"Pipe ACL is missing {expectedRights} for {identity.Value}.");
     }
 
     private static async Task TestServicePipeReconnectAsync()
