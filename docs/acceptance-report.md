@@ -31,7 +31,8 @@ Status vocabulary in this report is deliberate: `Verified` means exercised on th
 | SCM uninstall and cleanup | Verified | Final inspection: zero SCM service, service/UI processes and EgressGuard-owned firewall rules. |
 | Reboot acceptance | Verified | Windows boot time advanced from `2026-07-16T05:04:41.6789460Z` to `2026-08-09T16:39:28.5000000Z`. Without a manual service start, SCM exposed the service as Running with its automatic/LocalSystem/recovery configuration and exact artifact hashes unchanged. UI/database reads and a controlled Simulator flow passed after boot. |
 | DPI 125% | Verified | All six tabs were selected and visually inspected; maximize/minimize remained responsive. Dashboard and Live Connections rendered many rows including IPv6, Connection Detail rendered a selected row, Rules rendered empty, and a 215-character database path wrapped without overlap. |
-| DPI 100% and 150% | Not verified | The active display was 120 DPI (125%). Display scaling was not changed because a real scale change can disrupt the user session and was not separately authorized. |
+| DPI 100% | Failed | Real 96 DPI/100% visual QA found unreadable light text on the three Live Connections filter ComboBoxes and horizontal clipping of the long Authenticode/publisher line in Connection Detail. No source fix was attempted in this evidence task. |
+| DPI 150% | Not verified | The display has not yet been changed to 144 DPI/150% for this acceptance sequence. |
 | Tray interaction | Not verified | The real `NotifyIcon` construction/disposal path ran during UI open/close cycles, but the shell icon and context menu were not independently discoverable through UI Automation. |
 | Visual contrast regression | Verified | Fixed light-on-light ComboBox text and Alerts DataGrid rows; post-fix screenshots at 125% show readable text and selection surfaces. Screenshots remain temporary and are not committed. |
 | Thirty-minute soak | Verified | Fresh isolated run `20260809T141839100Z-a33cfce431bd4ba1bf54c0de7348a8ea`: 585 cycles, 0 failures; 585 normal, burst and beacon runs; 585 IPC checks; 117 service restarts; 195 UI opens and 195 closes. |
@@ -89,13 +90,16 @@ The UI connected without hanging and displayed the service-online state. Its sta
 
 ## Remaining manual acceptance
 
-The post-reboot system DPI probe reported 120 DPI (125% scale), matching the previously accepted level. This is the original scale that must be restored after the 100% and 150% visual checks. The continuation checkpoint is now `AwaitingManualDpi100`; no registry or display-setting mutation was performed automatically.
+The post-reboot system DPI probe reported 120 DPI (125% scale), matching the previously accepted level. This is the original scale that must be restored after the 100% and 150% visual checks. The continuation checkpoint was set to `AwaitingManualDpi100`; no registry or display-setting mutation was performed automatically.
+
+At real 96 DPI/100% scale, UI Automation selected all six tabs and a live connection. Dashboard and Live Connections rendered many rows including existing IPv6 rows; Connection Detail displayed the selected item; Alerts rendered populated rows; Rules rendered its empty grid; Settings displayed the database path. Minimize, maximize and the 900×560 minimum window remained responsive, with no primary control reported outside the window bounds. Visual inspection nevertheless found two acceptance failures: the Live Connections protocol/IP/risk ComboBox selections were nearly white on a white background, and the long Authenticode/publisher text in Connection Detail was cut off at the right edge instead of wrapping or exposing horizontal scrolling. The active database path was only 41 characters, so the previous 215-character path evidence was not relabeled as a 100% DPI check. Temporary screenshots were deleted and not committed. DPI 100% is `Failed`; source was not changed.
 
 - Reboot acceptance: `Verified`. The real post-merge artifact auto-started and completed the post-boot service/UI/database/Simulator checklist.
-- DPI 100% and 150%: `Not verified`. Set each real display scale, sign out/restart applications if Windows requests it, and repeat the six-tab, tray, long-path, IPv6, empty-state and resize checks.
+- DPI 100%: `Failed`. Resolve the Live Connections ComboBox contrast and Connection Detail publisher-line clipping, then repeat the real 100% check.
+- DPI 150%: `Not verified`. Do not proceed as though DPI acceptance is complete while the 100% failure remains unresolved.
 - Tray icon/context menu: `Not verified` for direct user interaction.
 - Production signing/organizational approval: `Blocked – requires owner/administrator action`.
 
 ## Decision
 
-Phases 1–3 now have verified final SCM lifecycle and a verified 30-minute soak, but Phase 3.5 is not fully closed. **Do not begin Phase 4/ETW yet.** Real reboot acceptance, DPI 100% and 150% visual QA, and direct tray interaction remain open. Production signing/approval must also be resolved before any release claim.
+Phases 1–3 now have verified final SCM lifecycle, reboot acceptance and a verified 30-minute soak, but Phase 3.5 is not fully closed. **Do not begin Phase 4/ETW yet.** DPI 100% failed visual QA; DPI 150% and direct tray interaction remain open. Production signing/approval must also be resolved before any release claim.

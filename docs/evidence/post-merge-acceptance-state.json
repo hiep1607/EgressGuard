@@ -1,6 +1,6 @@
 {
   "SchemaVersion": 1,
-  "Stage": "AwaitingManualDpi100",
+  "Stage": "Dpi100Failed",
   "SourceCommit": "c7689c4ba33dcfb9809163173a7e82a655a8c8ea",
   "Branch": "acceptance/post-merge-windows",
   "PreRebootBootTimeUtc": "2026-07-16T05:04:41.6789460Z",
@@ -8,12 +8,12 @@
   "ServiceExeSha256": "CE8CE2AEB3C67508966B0FA5F0244232FA645D5270C74625E468842CE0DEF8E7",
   "ServiceDllSha256": "E16A797BEB0170C93EEF2C8182435ABE8785A9954AF76FC752EBAFD62A86679E",
   "RebootStatus": "Verified",
-  "Dpi100Status": "NotVerified",
+  "Dpi100Status": "Failed",
   "Dpi150Status": "NotVerified",
   "TrayStatus": "NotVerified",
   "SigningStatus": "Blocked – owner/administrator action required",
   "Remaining": [
-    "Manual DPI 100% acceptance",
+    "Resolve the DPI 100% UI defects and repeat acceptance",
     "Manual DPI 150% acceptance",
     "Restore the original DPI after visual acceptance",
     "Manual tray context-menu interaction",
