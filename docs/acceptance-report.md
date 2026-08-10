@@ -11,9 +11,9 @@ Status vocabulary in this report is deliberate: `Verified` means exercised on th
 |---|---|---|
 | Locked restore | Verified | .NET SDK 8.0.423; locked restore completed. |
 | Release build | Verified | 0 warnings, 0 errors. |
-| Executable tests | Verified | 34/34 passed, including graceful cancellation, process-tree cleanup, complete firewall semantics, exact-rule reconciliation, concurrency and automatic firewall rollback regressions. |
+| Executable tests | Verified | The IPC lifecycle regression passed 5/5 consecutive targeted runs; the complete default suite then passed 34/34, including graceful cancellation, process-tree cleanup, complete firewall semantics, exact-rule reconciliation, concurrency and automatic firewall rollback regressions. |
 | Format verification | Verified | `dotnet format --verify-no-changes --no-restore` exited 0. |
-| Event architecture | Integration tested | Real Named Pipe subscription, reconnect, sequence, bounded overflow/resync and slow-client tests passed. |
+| Event architecture | Integration tested | Real Named Pipe subscription, reconnect, sequence, bounded overflow/resync and slow-client tests passed. The real-service test now uses a per-run pipe and a subscription acknowledgement instead of a fixed readiness delay. |
 | Authenticode behavior | Verified | Embedded-signed .NET host, catalog-signed Windows binary, unsigned apphost, tampered signed file and missing file are covered. |
 | Firewall IPv4 and ownership | Verified | Earlier public connect-only acceptance passed; the Phase 3.5 SCM and soak cleanup both found zero owned rules. |
 | Automatic firewall persistence rollback | Verified | Tests cover create-success/database-failure rollback, cancellation after create, pre-existing-rule preservation, foreign-rule preservation, and separate logging of original plus rollback failures. |
@@ -31,7 +31,7 @@ Status vocabulary in this report is deliberate: `Verified` means exercised on th
 | SCM uninstall and cleanup | Verified | Final inspection: zero SCM service, service/UI processes and EgressGuard-owned firewall rules. |
 | Reboot acceptance | Verified | Windows boot time advanced from `2026-07-16T05:04:41.6789460Z` to `2026-08-09T16:39:28.5000000Z`. Without a manual service start, SCM exposed the service as Running with its automatic/LocalSystem/recovery configuration and exact artifact hashes unchanged. UI/database reads and a controlled Simulator flow passed after boot. |
 | DPI 125% | Verified | All six tabs were selected and visually inspected; maximize/minimize remained responsive. Dashboard and Live Connections rendered many rows including IPv6, Connection Detail rendered a selected row, Rules rendered empty, and a 215-character database path wrapped without overlap. |
-| DPI 100% | Failed | Real 96 DPI/100% visual QA found unreadable light text on the three Live Connections filter ComboBoxes and horizontal clipping of the long Authenticode/publisher line in Connection Detail. No source fix was attempted in this evidence task. |
+| DPI 100% | Verified | At real 96 DPI/100%, all three Live Connections filter ComboBoxes remained readable in normal, dropdown, hover/focus and selected states, with explicit disabled-state colors. Long Authenticode/publisher content wrapped at normal and 900×560 sizes. Alerts, Settings, all six tabs and minimize/restore/maximize showed no regression. |
 | DPI 150% | Not verified | The display has not yet been changed to 144 DPI/150% for this acceptance sequence. |
 | Tray interaction | Not verified | The real `NotifyIcon` construction/disposal path ran during UI open/close cycles, but the shell icon and context menu were not independently discoverable through UI Automation. |
 | Visual contrast regression | Verified | Fixed light-on-light ComboBox text and Alerts DataGrid rows; post-fix screenshots at 125% show readable text and selection surfaces. Screenshots remain temporary and are not committed. |
@@ -92,14 +92,16 @@ The UI connected without hanging and displayed the service-online state. Its sta
 
 The post-reboot system DPI probe reported 120 DPI (125% scale), matching the previously accepted level. This is the original scale that must be restored after the 100% and 150% visual checks. The continuation checkpoint was set to `AwaitingManualDpi100`; no registry or display-setting mutation was performed automatically.
 
-At real 96 DPI/100% scale, UI Automation selected all six tabs and a live connection. Dashboard and Live Connections rendered many rows including existing IPv6 rows; Connection Detail displayed the selected item; Alerts rendered populated rows; Rules rendered its empty grid; Settings displayed the database path. Minimize, maximize and the 900×560 minimum window remained responsive, with no primary control reported outside the window bounds. Visual inspection nevertheless found two acceptance failures: the Live Connections protocol/IP/risk ComboBox selections were nearly white on a white background, and the long Authenticode/publisher text in Connection Detail was cut off at the right edge instead of wrapping or exposing horizontal scrolling. The active database path was only 41 characters, so the previous 215-character path evidence was not relabeled as a 100% DPI check. Temporary screenshots were deleted and not committed. DPI 100% is `Failed`; source was not changed.
+At real 96 DPI/100% scale, UI Automation selected all six tabs and a live connection. The two defects found on the first pass were corrected in XAML: the implicit ComboBox style now supplies readable selected-content/item colors for normal, hover, selected and disabled states, while Connection Detail constrains horizontal layout and wraps the Signature value with a full-value tooltip. Direct retesting showed readable Live Connections filters and complete Authenticode/publisher content at normal and 900×560 sizes. Alerts, Settings, all six tabs and minimize/restore/maximize remained usable. Temporary screenshots were deleted and not committed.
+
+The first post-fix gate exposed an independent flaky test harness issue in `Service pipe reconnect and event subscription`. The test service shared the production pipe name, started event generation after a fixed 500 ms delay without proving subscription readiness, and consumed its bounded event/lifetime budget before readiness on a busy host. The harness now gives every service-test process a unique pipe name, waits for the real subscription acknowledgement, and supports exact-name targeted execution. The targeted lifecycle test passed 5/5 consecutive runs, followed by a 34/34 full suite; locked restore, format verification, Release build with 0 warnings/errors and vulnerable-package audit also passed. Cleanup found no test process, test pipe, temporary service database or EgressGuard-owned firewall rule.
 
 - Reboot acceptance: `Verified`. The real post-merge artifact auto-started and completed the post-boot service/UI/database/Simulator checklist.
-- DPI 100%: `Failed`. Resolve the Live Connections ComboBox contrast and Connection Detail publisher-line clipping, then repeat the real 100% check.
-- DPI 150%: `Not verified`. Do not proceed as though DPI acceptance is complete while the 100% failure remains unresolved.
+- DPI 100%: `Verified`. The Live Connections ComboBox contrast and Connection Detail publisher wrapping fixes passed direct retesting at real 96 DPI/100%.
+- DPI 150%: `Not verified`. The next manual checkpoint is 144 DPI/150%; no display setting was changed automatically.
 - Tray icon/context menu: `Not verified` for direct user interaction.
 - Production signing/organizational approval: `Blocked – requires owner/administrator action`.
 
 ## Decision
 
-Phases 1–3 now have verified final SCM lifecycle, reboot acceptance and a verified 30-minute soak, but Phase 3.5 is not fully closed. **Do not begin Phase 4/ETW yet.** DPI 100% failed visual QA; DPI 150% and direct tray interaction remain open. Production signing/approval must also be resolved before any release claim.
+Phases 1–3 now have verified final SCM lifecycle, reboot acceptance, DPI 100% acceptance and a verified 30-minute soak, but Phase 3.5 is not fully closed. **Do not begin Phase 4/ETW yet.** DPI 150% and direct tray interaction remain open. Production signing/approval must also be resolved before any release claim.

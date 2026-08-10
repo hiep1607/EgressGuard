@@ -61,6 +61,21 @@ internal static class Program
             ("Process churn does not crash collector", TestProcessChurnAsync)
         };
 
+        if (args.Length == 2 && args[0] == "--test")
+        {
+            tests = tests.Where(test => string.Equals(test.Name, args[1], StringComparison.Ordinal)).ToArray();
+            if (tests.Length == 0)
+            {
+                Console.Error.WriteLine($"Unknown test: {args[1]}");
+                return 2;
+            }
+        }
+        else if (args.Length != 0)
+        {
+            Console.Error.WriteLine("Usage: EgressGuard.Tests [--test <exact-test-name>]");
+            return 2;
+        }
+
         var failures = 0;
         foreach (var test in tests)
         {
@@ -880,6 +895,7 @@ internal static class Program
         }
 
         var dataDirectory = Path.Combine(Path.GetTempPath(), "EgressGuard-ServiceTests-" + Guid.NewGuid().ToString("N"));
+        var pipeName = $"{ProtocolConstants.PipeName}.Tests.{Environment.ProcessId}.{Guid.NewGuid():N}";
         Directory.CreateDirectory(dataDirectory);
         var startInfo = new ProcessStartInfo(servicePath)
         {
@@ -888,11 +904,12 @@ internal static class Program
         };
         startInfo.Environment["EGRESSGUARD_DATA_DIR"] = dataDirectory;
         startInfo.Environment["EGRESSGUARD_TEST_DURATION_SECONDS"] = "20";
+        startInfo.Environment["EGRESSGUARD_PIPE_NAME"] = pipeName;
         using var service = Process.Start(startInfo) ?? throw new TestFailureException("Service process failed to start.");
         var stage = "first connect";
         try
         {
-            await using (var first = new EgressGuardPipeClient())
+            await using (var first = new EgressGuardPipeClient(pipeName))
             {
                 await ConnectWithRetryAsync(first).ConfigureAwait(false);
                 stage = "first status request";
@@ -902,7 +919,7 @@ internal static class Program
 
             long snapshotSequence;
             stage = "second connect";
-            await using (var second = new EgressGuardPipeClient())
+            await using (var second = new EgressGuardPipeClient(pipeName))
             {
                 await ConnectWithRetryAsync(second).ConfigureAwait(false);
                 stage = "second flows request";
@@ -911,10 +928,11 @@ internal static class Program
             }
 
             stage = "event subscription";
-            using (var eventTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(8)))
-            await using (var eventClient = new EgressGuardEventClient())
+            using (var subscriptionCancellation = new CancellationTokenSource())
+            await using (var eventClient = new EgressGuardEventClient(pipeName))
             {
                 var observed = new TaskCompletionSource<StreamEventMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var subscriptionReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                 var subscribeTask = eventClient.SubscribeAsync(snapshotSequence, streamEvent =>
                 {
                     if (streamEvent.Flow?.ProcessIdentity?.ProcessId == Environment.ProcessId)
@@ -923,8 +941,18 @@ internal static class Program
                     }
 
                     return ValueTask.CompletedTask;
-                }, eventTimeout.Token);
-                await Task.Delay(500, eventTimeout.Token).ConfigureAwait(false);
+                }, () => subscriptionReady.TrySetResult(), subscriptionCancellation.Token);
+                using var readinessTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                var readinessResult = await Task.WhenAny(subscriptionReady.Task, subscribeTask)
+                    .WaitAsync(readinessTimeout.Token)
+                    .ConfigureAwait(false);
+                if (ReferenceEquals(readinessResult, subscribeTask))
+                {
+                    await subscribeTask.ConfigureAwait(false);
+                }
+
+                await subscriptionReady.Task.ConfigureAwait(false);
+                using var eventTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
                 var listener = new TcpListener(IPAddress.Loopback, 0);
                 listener.Start();
                 try
@@ -933,14 +961,22 @@ internal static class Program
                     var acceptTask = listener.AcceptTcpClientAsync(eventTimeout.Token);
                     await controlledClient.ConnectAsync((IPEndPoint)listener.LocalEndpoint, eventTimeout.Token).ConfigureAwait(false);
                     using var accepted = await acceptTask.ConfigureAwait(false);
-                    var streamEvent = await observed.Task.WaitAsync(eventTimeout.Token).ConfigureAwait(false);
+                    var eventResult = await Task.WhenAny(observed.Task, subscribeTask)
+                        .WaitAsync(eventTimeout.Token)
+                        .ConfigureAwait(false);
+                    if (ReferenceEquals(eventResult, subscribeTask))
+                    {
+                        await subscribeTask.ConfigureAwait(false);
+                    }
+
+                    var streamEvent = await observed.Task.ConfigureAwait(false);
                     AssertTrue(streamEvent.Kind is StreamEventKind.FlowAdded or StreamEventKind.FlowUpdated, "Controlled flow produced the wrong event kind.");
                     AssertTrue(streamEvent.Sequence > snapshotSequence, "Stream event sequence did not advance beyond the snapshot.");
                 }
                 finally
                 {
                     listener.Stop();
-                    eventTimeout.Cancel();
+                    subscriptionCancellation.Cancel();
                     await eventClient.DisconnectAsync().ConfigureAwait(false);
                     try { await subscribeTask.ConfigureAwait(false); }
                     catch (Exception exception) when (exception is OperationCanceledException or IOException or ObjectDisposedException) { }

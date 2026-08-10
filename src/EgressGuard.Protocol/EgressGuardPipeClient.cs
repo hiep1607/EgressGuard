@@ -4,15 +4,21 @@ namespace EgressGuard.Protocol;
 
 public sealed class EgressGuardPipeClient : IAsyncDisposable
 {
+    private readonly string _pipeName;
     private NamedPipeClientStream? _pipe;
     private readonly SemaphoreSlim _gate = new(1, 1);
+
+    public EgressGuardPipeClient(string? pipeName = null)
+    {
+        _pipeName = string.IsNullOrWhiteSpace(pipeName) ? ProtocolConstants.PipeName : pipeName;
+    }
 
     public bool IsConnected => _pipe?.IsConnected == true;
 
     public async Task ConnectAsync(TimeSpan timeout, CancellationToken cancellationToken)
     {
         await DisconnectAsync().ConfigureAwait(false);
-        _pipe = new NamedPipeClientStream(".", ProtocolConstants.PipeName, PipeDirection.InOut, PipeOptions.Asynchronous, System.Security.Principal.TokenImpersonationLevel.Impersonation);
+        _pipe = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous, System.Security.Principal.TokenImpersonationLevel.Impersonation);
         using var timeoutCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeoutCancellation.CancelAfter(timeout);
         await _pipe.ConnectAsync(timeoutCancellation.Token).ConfigureAwait(false);

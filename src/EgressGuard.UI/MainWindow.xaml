@@ -65,12 +65,12 @@
             </TabItem>
 
             <TabItem Header="Connection Detail">
-                <ScrollViewer><StackPanel Margin="22" DataContext="{Binding SelectedFlow}">
+                <ScrollViewer HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto"><StackPanel Margin="22" MinWidth="0" DataContext="{Binding SelectedFlow}">
                     <TextBlock Text="Connection Detail" FontSize="22" Margin="0,0,0,14" />
                     <TextBlock Text="{Binding Identity}" TextWrapping="Wrap" Margin="0,4" />
                     <TextBlock Text="{Binding ExecutablePath}" TextWrapping="Wrap" Margin="0,4" />
                     <TextBlock Text="{Binding Hash}" TextWrapping="Wrap" Margin="0,4" />
-                    <TextBlock Text="{Binding Signature}" Margin="0,4" />
+                    <TextBlock Text="{Binding Signature}" TextWrapping="Wrap" ToolTip="{Binding Signature}" Margin="0,4" />
                     <TextBlock Text="{Binding Parent}" Margin="0,4" />
                     <TextBlock Text="{Binding Destination}" Margin="0,4" />
                     <TextBlock Text="{Binding Reasons}" TextWrapping="Wrap" Margin="0,12" />

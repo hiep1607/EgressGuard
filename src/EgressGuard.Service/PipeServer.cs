@@ -34,10 +34,11 @@ public sealed partial class PipeServer : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        var pipeName = ProtocolConstants.ResolvePipeName();
         while (!stoppingToken.IsCancellationRequested)
         {
             var pipe = new NamedPipeServerStream(
-                ProtocolConstants.PipeName,
+                pipeName,
                 PipeDirection.InOut,
                 8,
                 PipeTransmissionMode.Byte,
