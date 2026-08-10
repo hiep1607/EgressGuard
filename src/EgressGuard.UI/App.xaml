@@ -25,6 +25,36 @@
             <Setter Property="Margin" Value="4" />
             <Setter Property="Foreground" Value="#101820" />
             <Setter Property="Background" Value="#F3F6F8" />
+            <Setter Property="ItemTemplate">
+                <Setter.Value>
+                    <DataTemplate>
+                        <TextBlock Text="{Binding}" Foreground="#101820" />
+                    </DataTemplate>
+                </Setter.Value>
+            </Setter>
+            <Setter Property="ItemContainerStyle">
+                <Setter.Value>
+                    <Style TargetType="ComboBoxItem">
+                        <Setter Property="Padding" Value="8,5" />
+                        <Setter Property="Foreground" Value="#101820" />
+                        <Setter Property="Background" Value="#F3F6F8" />
+                        <Style.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Foreground" Value="#101820" />
+                                <Setter Property="Background" Value="#D8E2EA" />
+                            </Trigger>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter Property="Foreground" Value="#0E141B" />
+                                <Setter Property="Background" Value="#45D1A3" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Foreground" Value="#596670" />
+                                <Setter Property="Background" Value="#E2E7EA" />
+                            </Trigger>
+                        </Style.Triggers>
+                    </Style>
+                </Setter.Value>
+            </Setter>
         </Style>
         <Style TargetType="DataGrid">
             <Setter Property="EnableRowVirtualization" Value="True" />

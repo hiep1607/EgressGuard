@@ -10,6 +10,12 @@ public static class ProtocolConstants
     public const int Version = 1;
     public const int MaximumMessageBytes = 1024 * 1024;
     public const string PipeName = "EgressGuard.Service.v1";
+
+    public static string ResolvePipeName()
+    {
+        var configured = Environment.GetEnvironmentVariable("EGRESSGUARD_PIPE_NAME");
+        return string.IsNullOrWhiteSpace(configured) ? PipeName : configured;
+    }
 }
 
 public static class MessageTypes

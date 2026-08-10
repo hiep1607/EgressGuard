@@ -1,4 +1,5 @@
 using System.IO.Pipes;
+using System.Security.AccessControl;
 using System.Security.Principal;
 using EgressGuard.Core;
 using EgressGuard.Persistence;
@@ -34,14 +35,10 @@ public sealed partial class PipeServer : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        var pipeName = ProtocolConstants.ResolvePipeName();
         while (!stoppingToken.IsCancellationRequested)
         {
-            var pipe = new NamedPipeServerStream(
-                ProtocolConstants.PipeName,
-                PipeDirection.InOut,
-                8,
-                PipeTransmissionMode.Byte,
-                PipeOptions.Asynchronous | PipeOptions.WriteThrough);
+            var pipe = CreateServerPipe(pipeName);
             try
             {
                 await pipe.WaitForConnectionAsync(stoppingToken).ConfigureAwait(false);
@@ -58,6 +55,38 @@ public sealed partial class PipeServer : BackgroundService
                 LogAcceptFailed(_logger, exception);
             }
         }
+    }
+
+    private static NamedPipeServerStream CreateServerPipe(string pipeName)
+    {
+        using var identity = WindowsIdentity.GetCurrent();
+        var serviceIdentity = identity.User ?? throw new InvalidOperationException("The service Windows identity has no SID.");
+        return NamedPipeServerStreamAcl.Create(
+            pipeName,
+            PipeDirection.InOut,
+            8,
+            PipeTransmissionMode.Byte,
+            PipeOptions.Asynchronous | PipeOptions.WriteThrough,
+            0,
+            0,
+            CreatePipeSecurity(serviceIdentity));
+    }
+
+    internal static PipeSecurity CreatePipeSecurity(SecurityIdentifier serviceIdentity)
+    {
+        ArgumentNullException.ThrowIfNull(serviceIdentity);
+        var security = new PipeSecurity();
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        AddAllowRule(security, serviceIdentity, PipeAccessRights.FullControl);
+        AddAllowRule(security, new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null), PipeAccessRights.FullControl);
+        AddAllowRule(security, new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null), PipeAccessRights.FullControl);
+        AddAllowRule(security, new SecurityIdentifier(WellKnownSidType.InteractiveSid, null), PipeAccessRights.ReadWrite);
+        return security;
+    }
+
+    private static void AddAllowRule(PipeSecurity security, SecurityIdentifier identity, PipeAccessRights rights)
+    {
+        security.AddAccessRule(new PipeAccessRule(identity, rights, AccessControlType.Allow));
     }
 
     private async Task HandleClientAsync(NamedPipeServerStream pipe, CancellationToken stoppingToken)

@@ -4,18 +4,31 @@ namespace EgressGuard.Protocol;
 
 public sealed class EgressGuardEventClient : IAsyncDisposable
 {
+    private readonly string _pipeName;
     private NamedPipeClientStream? _pipe;
+
+    public EgressGuardEventClient(string? pipeName = null)
+    {
+        _pipeName = string.IsNullOrWhiteSpace(pipeName) ? ProtocolConstants.PipeName : pipeName;
+    }
+
+    public Task SubscribeAsync(
+        long lastSequence,
+        Func<StreamEventMessage, ValueTask> onEvent,
+        CancellationToken cancellationToken) =>
+        SubscribeAsync(lastSequence, onEvent, onSubscribed: null, cancellationToken);
 
     public async Task SubscribeAsync(
         long lastSequence,
         Func<StreamEventMessage, ValueTask> onEvent,
+        Action? onSubscribed,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(onEvent);
         await DisconnectAsync().ConfigureAwait(false);
         _pipe = new NamedPipeClientStream(
             ".",
-            ProtocolConstants.PipeName,
+            _pipeName,
             PipeDirection.InOut,
             PipeOptions.Asynchronous,
             System.Security.Principal.TokenImpersonationLevel.Identification);
@@ -35,6 +48,13 @@ public sealed class EgressGuardEventClient : IAsyncDisposable
         {
             throw new InvalidDataException(accepted.ReadPayload<ErrorMessage>().Message);
         }
+
+        if (accepted.Type != MessageTypes.Success)
+        {
+            throw new InvalidDataException($"Unexpected subscription response: {accepted.Type}");
+        }
+
+        onSubscribed?.Invoke();
 
         while (!cancellationToken.IsCancellationRequested && _pipe.IsConnected)
         {
