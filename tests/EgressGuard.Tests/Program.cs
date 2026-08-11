@@ -44,8 +44,15 @@ internal static class Program
 
         if (args.Length == 1 && args[0] == "--etw-lifecycle-integration")
         {
-            await TestRealEtwLifecycleIntegrationAsync().ConfigureAwait(false);
+            await TestRealEtwLifecycleIntegrationAsync(10).ConfigureAwait(false);
             Console.WriteLine("PASS  Real ETW ten-cycle lifecycle cleanup");
+            return 0;
+        }
+
+        if (args.Length == 1 && args[0] == "--etw-lifecycle-smoke")
+        {
+            await TestRealEtwLifecycleIntegrationAsync(3).ConfigureAwait(false);
+            Console.WriteLine("PASS  Real ETW three-cycle lifecycle smoke");
             return 0;
         }
 
@@ -944,7 +951,7 @@ internal static class Program
         }
     }
 
-    private static async Task TestRealEtwLifecycleIntegrationAsync()
+    private static async Task TestRealEtwLifecycleIntegrationAsync(int cycleCount)
     {
         if (!WindowsFirewallManager.IsAdministrator())
         {
@@ -960,7 +967,7 @@ internal static class Program
         string? lingering = null;
         try
         {
-            for (var cycle = 0; cycle < 10; cycle++)
+            for (var cycle = 0; cycle < cycleCount; cycle++)
             {
                 var ownershipDirectory = Path.Combine(directory, $"ownership-{cycle}");
                 await using var sensor = new EtwFileActivitySensor([ownershipDirectory], ownershipDirectory: ownershipDirectory);

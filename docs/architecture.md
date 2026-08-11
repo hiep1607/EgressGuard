@@ -17,12 +17,13 @@ UI never opens SQLite or changes Windows Firewall directly. Mutations cross the 
 ```text
 IP Helper + process snapshot
   → WindowsFlowSensor
+  → FlowCoordinator → RiskEngine / PolicyEngine
 Windows kernel File I/O ETW (optional)
   → non-blocking bounded raw staging (4,096; cheap path checks)
   → dual-index recent raw buffer (4,096 global / 256 per PID / 35-second retention)
   → exact PID/start-time promotion when a network flow appears
   → FileCorrelationEngine (-30/+5 seconds; max 20 evidence rows)
-  → FlowCoordinator / RiskEngine / PolicyEngine
+  → FlowCoordinator (descriptive evidence only; no risk/policy input)
   ├─→ bounded persistence queue (2,048) → SQLite
   └─→ ServiceState transitions
        → EventHub sequence + per-client bounded channel (512)

@@ -10,9 +10,10 @@ EgressGuard does **not** claim to prevent 100% of data exfiltration. Phase 4 add
 
 ```text
 Windows IP Helper + process metadata
+  → deterministic risk / policy
 Windows kernel File I/O ETW (optional, observe-only)
   → bounded raw events → exact PID/start-time pre-flow promotion
-  → deterministic temporal correlation / risk / policy
+  → deterministic temporal correlation evidence
   ├─→ SQLite persistence
   └─→ bounded sequenced Named Pipe events
        → WPF UI batched incremental updates
@@ -64,7 +65,7 @@ dotnet run --project tools\EgressGuard.Simulator\EgressGuard.Simulator.csproj -c
 
 Closing the UI does not stop the service. The Simulator generates bytes in memory and never reads user documents or credentials.
 
-File correlation is disabled by default. Set `EGRESSGUARD_ENABLE_FILE_CORRELATION=true` before service startup for an authorized development test. The ETW provider may require elevation; failure degrades only this optional sensor while network monitoring continues. The callback uses bounded raw staging and never resolves process identity per File I/O event; recent raw events are promoted only after an exact network `(PID, ProcessStartTime)` is known. The safe `.egfixture` reads a generated temporary file before opening a loopback connection without transmitting file bytes, and cleans up:
+File correlation is disabled by default. Set `EGRESSGUARD_ENABLE_FILE_CORRELATION=true` before service startup for an authorized development test. The ETW provider may require elevation; failure degrades only this optional sensor while network monitoring continues. The callback uses bounded raw staging and never resolves process identity per File I/O event; recent raw events are promoted only after an exact network `(PID, ProcessStartTime)` is known. A normalized raw path can exist briefly in bounded memory, but EgressGuard never opens the file for content analysis and persists/returns only salted and redacted correlation evidence. File evidence never changes risk, policy or firewall behavior. The safe `.egfixture` reads a generated temporary file before opening a loopback connection without transmitting file bytes, and cleans up:
 
 ```powershell
 dotnet run --project tools\EgressGuard.Simulator\EgressGuard.Simulator.csproj -c Release -- --file-correlation-test --port 5050 --hold-seconds 5
@@ -85,7 +86,7 @@ The soak harness creates an isolated run/database directory for every invocation
 
 ## Current limitations
 
-- Phases 1–3 have verified final SCM restart/reconnect, a 30-minute soak, exact-artifact reboot acceptance, DPI 100%/150% QA and direct tray interaction. On the Phase 4 Draft head, real ETW pre-flow promotion, PID-reuse generation handling, 10-cycle exact session lifecycle, crash/orphan reclaim, service IPC with zero transmitted fixture bytes, path redaction, and UI QA at the current 125% scale are verified. The final warm steady-state smoke now passes the unchanged CPU budget: disabled baseline 0.833%, enabled idle 0.894%, normal pre-flow 1.100%, and stress/churn 0.833% service CPU. Phase 4 DPI 100%/150%, a stable direct `Running` sensor presentation, and tooltip appearance remain not verified. Production signing/Application Control approval remains blocked, so this prototype is not a production release.
+- Phases 1–3 have verified final SCM restart/reconnect, a 30-minute soak, exact-artifact reboot acceptance, DPI 100%/150% QA and direct tray interaction. On Phase 4, real ETW pre-flow promotion, PID-reuse generation handling, the reviewed 10-cycle exact session lifecycle, crash/orphan reclaim, service IPC with zero transmitted fixture bytes, path redaction, and UI QA at 125% are verified. The latest technical-finding checkpoint reran the real pre-flow service fixture and a bounded 3-cycle lifecycle smoke successfully. The reviewed baseline's final warm smoke passed the unchanged CPU budget: disabled 0.833%, enabled idle 0.894%, normal pre-flow 1.100%, and stress/churn 0.833% service CPU; the latest checkpoint has deterministic bounded-work coverage but does not relabel those baseline CPU figures as current-head measurements. The host remains at 125%, so Phase 4 DPI 100%/150%, a stable direct `Running` sensor presentation, and tooltip appearance remain not verified. Production signing/Application Control approval remains blocked, so this prototype is not a production release.
 - Windows Firewall enforcement is path-based; EgressGuard verifies SHA-256 before rule creation and in policy matching, but executable replacement requires identity refresh and rule recreation.
 - UDP owner tables do not expose a remote peer.
 - No release, installer, signing pipeline, or production support commitment exists yet.

@@ -10,6 +10,8 @@ The focused promoted-load diagnostic installs network interests, promotes 4,096 
 
 The existing raw-buffer microbenchmark was also rerun on the final local source: 100,000 synthetic events completed in 42.485 ms (2,353,783 events/s), with exact global/per-PID peaks of 4,096/128 for the distributed case; the hot-PID case completed in 9.412 ms and stayed at the 256 per-PID bound. These results guard the earlier raw-buffer improvement but do not measure service/UI CPU.
 
+The final documentation/acceptance checkpoint reran the same no-threshold diagnostic after rebuilding: 45.407 ms (2,202,328 events/s) for 100,000 events and 10.242 ms for the hot-PID case, with the same 4,096/128 and 256 structural peaks. The small timing variation is retained rather than selecting one run; the deterministic bounds/counters are the acceptance evidence.
+
 ## Final warm steady-state smoke (2026-08-11)
 
 Each phase used the same final artifact, an isolated pipe/database, a 25-second warm-up that excluded startup inventory, then 45 seconds of sampling. The installed artifact service was paused and restored. The UI had to report `Service online` before and after sampling; it produced zero not-responding samples. The disabled baseline was below the 2% noisy-run threshold, so no baseline retry was permitted or needed.
