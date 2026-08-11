@@ -56,6 +56,12 @@ internal static class Program
             return 0;
         }
 
+        if (args.Length == 1 && args[0] == "--raw-buffer-benchmark")
+        {
+            await RunRawBufferBenchmarkAsync().ConfigureAwait(false);
+            return 0;
+        }
+
         if (args.Length == 2 && args[0] == "--etw-orphan-child")
         {
             return await RunEtwOrphanChildAsync(args[1]).ConfigureAwait(false);
@@ -108,6 +114,7 @@ internal static class Program
             ("Automatic firewall rule rolls back on cancellation", TestAutomaticRuleCancellationRollbackAsync),
             ("Automatic firewall rollback logs original and rollback failures", TestAutomaticRuleRollbackFailureLoggingAsync),
             ("Protocol frame roundtrip", TestProtocolRoundTripAsync),
+            ("Default UI clients honor configured pipe name", TestConfiguredPipeNameAsync),
             ("File correlation IPC stays compatible and bounded", TestFileCorrelationProtocolAsync),
             ("UI correlation refresh coalesces updates and cancels stale selection", TestUiCorrelationRefreshAsync),
             ("Protocol rejects oversized message", TestOversizedMessageAsync),
@@ -360,6 +367,68 @@ internal static class Program
         AssertTrue(published.Length <= 8, "Dropped notifications were not coalesced.");
     }
 
+    private static async Task RunRawBufferBenchmarkAsync()
+    {
+        const int eventCount = 100_000;
+        var now = DateTimeOffset.UtcNow;
+        await using var sensor = new EtwFileActivitySensor(
+            new FixedProcessIdentityResolver(new ProcessIdentity(1, now.AddMinutes(-1)), "benchmark"),
+            capacity: 4096,
+            recentRawCapacity: 4096,
+            recentRawPerProcessCapacity: 256,
+            recentRawRetention: TimeSpan.FromMinutes(5));
+
+        _ = sensor.PromoteRawForTest(
+            Enumerable.Range(0, 10_000).Select(index => new RawFileActivity(
+                index, now.AddMilliseconds(-(index % 250)), 10_000 + (index % 32), "benchmark",
+                FileActivityOperation.Read, $"C:\\Synthetic\\warmup-{index}.egfixture")),
+            []);
+
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        var allocatedBefore = GC.GetTotalAllocatedBytes(precise: true);
+        var started = Stopwatch.StartNew();
+        _ = sensor.PromoteRawForTest(
+            Enumerable.Range(0, eventCount).Select(index => new RawFileActivity(
+                10_000 + index, now.AddMilliseconds(-(index % 250)), 20_000 + (index % 32), "benchmark",
+                FileActivityOperation.Read, $"C:\\Synthetic\\measured-{index}.egfixture")),
+            []);
+        started.Stop();
+        var allocated = GC.GetTotalAllocatedBytes(precise: true) - allocatedBefore;
+
+        Console.WriteLine($"Events={eventCount}");
+        Console.WriteLine($"ElapsedMs={started.Elapsed.TotalMilliseconds:F3}");
+        Console.WriteLine($"EventsPerSecond={eventCount / started.Elapsed.TotalSeconds:F0}");
+        Console.WriteLine($"AllocatedBytes={allocated}");
+        Console.WriteLine($"GlobalPeak={sensor.RecentRawPeak}");
+        Console.WriteLine($"PerPidPeak={sensor.RecentRawPerProcessPeak}");
+        Console.WriteLine($"Dropped={sensor.Status.DroppedEvents}");
+
+        await using var perPidSensor = new EtwFileActivitySensor(
+            new FixedProcessIdentityResolver(new ProcessIdentity(1, now.AddMinutes(-1)), "benchmark"),
+            capacity: 4096,
+            recentRawCapacity: 4096,
+            recentRawPerProcessCapacity: 256,
+            recentRawRetention: TimeSpan.FromMinutes(5));
+        _ = perPidSensor.PromoteRawForTest(
+            Enumerable.Range(0, 3_800).Select(index => new RawFileActivity(
+                index, now, 30_000 + index, "background", FileActivityOperation.Read,
+                $"C:\\Synthetic\\background-{index}.egfixture")),
+            []);
+        var perPidStarted = Stopwatch.StartNew();
+        _ = perPidSensor.PromoteRawForTest(
+            Enumerable.Range(0, 20_000).Select(index => new RawFileActivity(
+                3_800 + index, now, 77, "hot-pid", FileActivityOperation.Read,
+                $"C:\\Synthetic\\hot-{index}.egfixture")),
+            []);
+        perPidStarted.Stop();
+        Console.WriteLine($"PerPidScenarioElapsedMs={perPidStarted.Elapsed.TotalMilliseconds:F3}");
+        Console.WriteLine($"PerPidScenarioGlobalPeak={perPidSensor.RecentRawPeak}");
+        Console.WriteLine($"PerPidScenarioPerPidPeak={perPidSensor.RecentRawPerProcessPeak}");
+        Console.WriteLine($"PerPidScenarioDropped={perPidSensor.Status.DroppedEvents}");
+    }
+
     private static Task TestProcessIdentityCacheAsync()
     {
         var now = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
@@ -443,6 +512,7 @@ internal static class Program
         _ = sensor.PromoteRawForTest(events, []);
         AssertTrue(sensor.RecentRawEventCount <= 8, "Recent raw event buffer exceeded its global hard bound.");
         AssertTrue(sensor.RecentRawPeak <= 8, "Recent raw event peak exceeded its global hard bound.");
+        AssertTrue(sensor.RecentRawPerProcessPeak <= 3, "Recent raw per-process peak exceeded its hard bound.");
         AssertTrue(sensor.Status.DroppedEvents > 0, "No bounded-buffer drop was recorded for a noisy process.");
 
         await Task.Delay(75).ConfigureAwait(false);
@@ -452,6 +522,44 @@ internal static class Program
             [new FileActivityProcessInterest(identity, "noisy")]);
         AssertEqual(0, expired.Count);
         AssertEqual(0, sensor.RecentRawEventCount);
+
+        var outOfOrderSensor = new EtwFileActivitySensor(
+            new FixedProcessIdentityResolver(identity, "out-of-order"),
+            capacity: 8,
+            recentRawCapacity: 8,
+            recentRawPerProcessCapacity: 4,
+            recentRawRetention: TimeSpan.FromSeconds(1));
+        var outOfOrder = outOfOrderSensor.PromoteRawForTest(
+            [
+                new RawFileActivity(1, now.AddMilliseconds(-500), identity.ProcessId, "out-of-order", FileActivityOperation.Read, "C:\\Synthetic\\current-a.egfixture"),
+                new RawFileActivity(2, now.AddSeconds(-2), identity.ProcessId, "out-of-order", FileActivityOperation.Read, "C:\\Synthetic\\expired-middle.egfixture"),
+                new RawFileActivity(3, now.AddMilliseconds(-250), identity.ProcessId, "out-of-order", FileActivityOperation.Read, "C:\\Synthetic\\current-b.egfixture")
+            ],
+            [new FileActivityProcessInterest(identity, "out-of-order")]);
+        AssertEqual(2, outOfOrder.Count);
+        AssertTrue(outOfOrder.All(item => !item.Path.Contains("expired-middle", StringComparison.Ordinal)), "Out-of-order expiration promoted an expired event.");
+
+        var globalSensor = new EtwFileActivitySensor(
+            new FixedProcessIdentityResolver(identity, "global-bound"),
+            capacity: 8,
+            recentRawCapacity: 4,
+            recentRawPerProcessCapacity: 4,
+            recentRawRetention: TimeSpan.FromMinutes(1));
+        var globalPromoted = globalSensor.PromoteRawForTest(
+            Enumerable.Range(1, 5).Select(processId => new RawFileActivity(
+                processId,
+                now,
+                processId,
+                $"global-{processId}",
+                FileActivityOperation.Read,
+                $"C:\\Synthetic\\global-{processId}.egfixture")),
+            [
+                new FileActivityProcessInterest(new ProcessIdentity(1, now.AddMinutes(-1)), "global-1"),
+                new FileActivityProcessInterest(new ProcessIdentity(5, now.AddMinutes(-1)), "global-5")
+            ]);
+        AssertEqual(1, globalPromoted.Count);
+        AssertTrue(globalPromoted[0].Path.EndsWith("global-5.egfixture", StringComparison.Ordinal), "Global eviction left a stale per-PID index or removed the newest event.");
+        AssertTrue(globalSensor.RecentRawPeak <= 4, "Global raw buffer peak exceeded its hard bound.");
     }
 
     private static Task TestPidReuseRawPromotionAsync()
@@ -697,6 +805,9 @@ internal static class Program
 
                 AssertTrue(!registry.IsActive(sessionName), $"Exact ETW session remained active in cycle {cycle}.");
                 AssertTrue(!File.Exists(Path.Combine(ownershipDirectory, "file-activity-session-owner.json")), $"Ownership marker remained in cycle {cycle}.");
+                AssertTrue(
+                    !TraceEventSession.GetActiveSessionNames().Any(name => name.StartsWith(EtwSessionOwnershipManager.SessionPrefix, StringComparison.Ordinal)),
+                    $"An EgressGuard ETW session remained before lifecycle cycle {cycle + 1}.");
                 AssertTrue(foreignBefore.All(registry.IsActive), "Lifecycle test changed a foreign/shared ETW session.");
             }
         }
@@ -1308,6 +1419,68 @@ internal static class Program
         AssertEqual(message.CorrelationId, result?.CorrelationId);
     }
 
+    private static async Task TestConfiguredPipeNameAsync()
+    {
+        var original = Environment.GetEnvironmentVariable("EGRESSGUARD_PIPE_NAME");
+        try
+        {
+            var requestPipeName = $"{ProtocolConstants.PipeName}.Configured.Request.{Guid.NewGuid():N}";
+            Environment.SetEnvironmentVariable("EGRESSGUARD_PIPE_NAME", requestPipeName);
+            using (var server = new NamedPipeServerStream(requestPipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous))
+            {
+                var serverTask = Task.Run(async () =>
+                {
+                    await server.WaitForConnectionAsync().ConfigureAwait(false);
+                    var handshake = await MessageFraming.ReadAsync(server, CancellationToken.None).ConfigureAwait(false);
+                    AssertEqual(MessageTypes.Handshake, handshake?.Type);
+                    await MessageFraming.WriteAsync(
+                        server,
+                        MessageEnvelope.Create(MessageTypes.Success, new SuccessMessage("configured request pipe accepted")),
+                        CancellationToken.None).ConfigureAwait(false);
+                });
+                await using var client = new EgressGuardPipeClient();
+                await client.ConnectAsync(TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(false);
+                await serverTask.ConfigureAwait(false);
+            }
+
+            var eventPipeName = $"{ProtocolConstants.PipeName}.Configured.Events.{Guid.NewGuid():N}";
+            Environment.SetEnvironmentVariable("EGRESSGUARD_PIPE_NAME", eventPipeName);
+            using var eventServer = new NamedPipeServerStream(eventPipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+            var eventServerTask = Task.Run(async () =>
+            {
+                await eventServer.WaitForConnectionAsync().ConfigureAwait(false);
+                var handshake = await MessageFraming.ReadAsync(eventServer, CancellationToken.None).ConfigureAwait(false);
+                AssertEqual(MessageTypes.Handshake, handshake?.Type);
+                await MessageFraming.WriteAsync(
+                    eventServer,
+                    MessageEnvelope.Create(MessageTypes.Success, new SuccessMessage("configured event pipe accepted")),
+                    CancellationToken.None).ConfigureAwait(false);
+                var subscribe = await MessageFraming.ReadAsync(eventServer, CancellationToken.None).ConfigureAwait(false);
+                AssertEqual(MessageTypes.SubscribeEvents, subscribe?.Type);
+                await MessageFraming.WriteAsync(
+                    eventServer,
+                    MessageEnvelope.Create(MessageTypes.Success, new SuccessMessage("subscription accepted")),
+                    CancellationToken.None).ConfigureAwait(false);
+            });
+            await using var eventClient = new EgressGuardEventClient();
+            var subscribed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var subscribeTask = eventClient.SubscribeAsync(
+                0,
+                _ => ValueTask.CompletedTask,
+                () => subscribed.TrySetResult(),
+                CancellationToken.None);
+            await subscribed.Task.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+            await eventServerTask.ConfigureAwait(false);
+            await eventClient.DisconnectAsync().ConfigureAwait(false);
+            try { await subscribeTask.ConfigureAwait(false); }
+            catch (Exception exception) when (exception is EndOfStreamException or IOException or ObjectDisposedException) { }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("EGRESSGUARD_PIPE_NAME", original);
+        }
+    }
+
     private static async Task TestFileCorrelationProtocolAsync()
     {
         var flow = SampleFlow();
@@ -1813,6 +1986,12 @@ internal static class Program
         var port = ((IPEndPoint)portProbe.LocalEndpoint).Port;
         portProbe.Stop();
         Directory.CreateDirectory(dataDirectory);
+        var ownershipDirectory = Path.Combine(dataDirectory, "etw-ownership");
+        var ownershipMarkerPath = Path.Combine(ownershipDirectory, "file-activity-session-owner.json");
+        var sessionRegistry = new TraceEventSessionRegistry();
+        AssertEqual(
+            0,
+            TraceEventSession.GetActiveSessionNames().Count(name => name.StartsWith(EtwSessionOwnershipManager.SessionPrefix, StringComparison.Ordinal)));
 
         using var service = StartIntegrationProcess(servicePath, [], redirectOutput: false, new Dictionary<string, string>
         {
@@ -1823,10 +2002,13 @@ internal static class Program
         });
         using var server = StartIntegrationProcess(serverPath, ["--port", port.ToString(System.Globalization.CultureInfo.InvariantCulture), "--protocol", "tcp", "--duration-seconds", "45"], redirectOutput: true);
         Process? simulator = null;
+        string? ownedSessionName = null;
         try
         {
             await using var client = new EgressGuardPipeClient(pipeName);
             await ConnectWithRetryAsync(client).ConfigureAwait(false);
+            ownedSessionName = await ReadEtwSessionNameFromMarkerAsync(ownershipMarkerPath).ConfigureAwait(false);
+            AssertTrue(sessionRegistry.IsActive(ownedSessionName), "The service-owned exact ETW session was not active after startup.");
             await Task.Delay(500).ConfigureAwait(false);
             simulator = StartIntegrationProcess(simulatorPath, ["--file-correlation-test", "--port", port.ToString(System.Globalization.CultureInfo.InvariantCulture), "--hold-seconds", "30"], redirectOutput: true);
 
@@ -1883,7 +2065,7 @@ internal static class Program
                 "The synthetic .egfixture read before the first network flow was not correlated inside the -30/+5 second window.");
             AssertTrue(observedEvidence.Correlations.All(item => !item.DisplayPath.Contains("EgressGuard-FileCorrelation-", StringComparison.OrdinalIgnoreCase)), "IPC leaked the synthetic raw path.");
 
-            await simulator.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(30)).ConfigureAwait(false);
+            await simulator.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(40)).ConfigureAwait(false);
             AssertEqual(0, simulator.ExitCode);
             var simulatorOutput = await simulator.StandardOutput.ReadToEndAsync().ConfigureAwait(false);
             AssertTrue(simulatorOutput.Contains("without transmitting file contents", StringComparison.Ordinal), "Simulator did not report connect-only behavior.");
@@ -1893,6 +2075,11 @@ internal static class Program
             AssertTrue(serverOutput.Contains("closed after 0 test bytes", StringComparison.Ordinal), "Test server observed transmitted bytes during the file-correlation fixture.");
             await service.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(15)).ConfigureAwait(false);
             AssertEqual(0, service.ExitCode);
+            AssertTrue(!sessionRegistry.IsActive(ownedSessionName), "The service exited normally but left its exact ETW session active.");
+            AssertTrue(!File.Exists(ownershipMarkerPath), "The service exited normally but left its ETW ownership marker.");
+            AssertEqual(
+                0,
+                TraceEventSession.GetActiveSessionNames().Count(name => name.StartsWith(EtwSessionOwnershipManager.SessionPrefix, StringComparison.Ordinal)));
 
             await using var connection = new SqliteConnection($"Data Source={Path.Combine(dataDirectory, "egressguard.db")};Mode=ReadOnly");
             await connection.OpenAsync().ConfigureAwait(false);
@@ -1920,8 +2107,10 @@ internal static class Program
                 }
             }
 
-            var ownershipDirectory = Path.Combine(dataDirectory, "etw-ownership");
-            if (File.Exists(Path.Combine(ownershipDirectory, "file-activity-session-owner.json")))
+            // Failure-path recovery only. Any success-path leak is asserted
+            // above before this exact-marker recovery can return the machine
+            // to a clean state; the original test failure still propagates.
+            if (File.Exists(ownershipMarkerPath))
             {
                 await using var orphanReclaimer = new EtwFileActivitySensor([ownershipDirectory], ownershipDirectory: ownershipDirectory);
                 await orphanReclaimer.StartAsync(CancellationToken.None).ConfigureAwait(false);
@@ -1931,6 +2120,21 @@ internal static class Program
             SqliteConnection.ClearAllPools();
             await DeleteDirectoryWithRetryAsync(dataDirectory).ConfigureAwait(false);
         }
+    }
+
+    private static async Task<string> ReadEtwSessionNameFromMarkerAsync(string markerPath)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        while (!File.Exists(markerPath))
+        {
+            await Task.Delay(50, timeout.Token).ConfigureAwait(false);
+        }
+
+        using var document = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(markerPath, timeout.Token).ConfigureAwait(false));
+        var sessionName = document.RootElement.GetProperty("SessionName").GetString();
+        return string.IsNullOrWhiteSpace(sessionName)
+            ? throw new TestFailureException("The ETW ownership marker did not contain an exact session name.")
+            : sessionName;
     }
 
     private static Process StartIntegrationProcess(

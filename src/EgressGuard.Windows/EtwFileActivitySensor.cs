@@ -21,6 +21,7 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
     internal static readonly TimeSpan DefaultProcessIdentityTtl = TimeSpan.FromMinutes(1);
     internal static readonly TimeSpan DefaultRecentRawRetention = TimeSpan.FromSeconds(35);
     private static readonly TimeSpan DefaultStatusPublishInterval = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan DefaultRecentRawCleanupInterval = TimeSpan.FromSeconds(1);
 
     private readonly Channel<RawFileActivity> _staging;
     private readonly Channel<FileActivity> _output;
@@ -35,9 +36,9 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
     private readonly TimeSpan _recentRawRetention;
     private readonly object _sync = new();
     private readonly object _correlationSync = new();
-    private readonly LinkedList<RawFileActivity> _recentRaw = [];
+    private readonly LinkedList<BufferedRawFileActivity> _recentRaw = [];
     private readonly LinkedList<FileActivity> _pendingPromoted = [];
-    private readonly Dictionary<int, int> _recentRawByProcess = [];
+    private readonly Dictionary<int, LinkedList<BufferedRawFileActivity>> _recentRawByProcess = [];
     private readonly Dictionary<int, ResolvedProcessIdentity> _processInterests = [];
     private TraceEventSession? _session;
     private Task? _traceTask;
@@ -49,6 +50,8 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
     private long _sequence;
     private long _dropped;
     private int _recentRawPeak;
+    private int _recentRawPerProcessPeak;
+    private DateTimeOffset _nextRecentRawCleanupUtc = DateTimeOffset.MinValue;
     private FileSensorStatus _status = new(FileSensorState.Stopped, 0, null, DateTimeOffset.UtcNow);
 
     public EtwFileActivitySensor(IEnumerable<string>? excludedRoots = null, int capacity = DefaultCapacity, string? ownershipDirectory = null)
@@ -121,6 +124,7 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
     internal int ProcessIdentityCacheCount => _processIdentities.Count;
     internal int RecentRawEventCount { get { lock (_correlationSync) return _recentRaw.Count; } }
     internal int RecentRawPeak => Volatile.Read(ref _recentRawPeak);
+    internal int RecentRawPerProcessPeak => Volatile.Read(ref _recentRawPerProcessPeak);
     internal string? SessionName => _sessionLease?.SessionName;
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -201,7 +205,7 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
         var promoted = new List<FileActivity>();
         lock (_correlationSync)
         {
-            CleanupRecentRaw(observedAt);
+            CleanupRecentRaw(observedAt, force: true);
             foreach (var process in processes)
             {
                 var resolved = new ResolvedProcessIdentity(process.Identity, process.ProcessName);
@@ -388,7 +392,7 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
         lock (_correlationSync)
         {
             var now = DateTimeOffset.UtcNow;
-            CleanupRecentRaw(now);
+            CleanupRecentRaw(now, force: false);
             if (_processInterests.TryGetValue(item.ProcessId, out var interest))
             {
                 if (item.TimestampUtc >= interest.Identity.StartTime && item.TimestampUtc <= now.AddSeconds(5))
@@ -441,20 +445,19 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
 
     private void PromoteForInterest(ResolvedProcessIdentity interest, DateTimeOffset observedAt, List<FileActivity> promoted)
     {
-        var node = _recentRaw.First;
+        if (!_recentRawByProcess.TryGetValue(interest.Identity.ProcessId, out var processEvents)) return;
+        var node = processEvents.First;
         while (node is not null)
         {
             var next = node.Next;
-            var item = node.Value;
-            if (item.ProcessId == interest.Identity.ProcessId)
+            var buffered = node.Value;
+            var item = buffered.Activity;
+            RemoveRecentRaw(buffered);
+            if (item.TimestampUtc >= interest.Identity.StartTime
+                && item.TimestampUtc <= observedAt.AddSeconds(5))
             {
-                RemoveRecentRaw(node);
-                if (item.TimestampUtc >= interest.Identity.StartTime
-                    && item.TimestampUtc <= observedAt.AddSeconds(5))
-                {
-                    var activity = Resolve(item, interest);
-                    if (activity is not null) promoted.Add(activity);
-                }
+                var activity = Resolve(item, interest);
+                if (activity is not null) promoted.Add(activity);
             }
 
             node = next;
@@ -463,44 +466,55 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
 
     private void AddRecentRaw(RawFileActivity item)
     {
-        var node = _recentRaw.AddLast(item);
-        _recentRawByProcess[item.ProcessId] = _recentRawByProcess.GetValueOrDefault(item.ProcessId) + 1;
-        _recentRawPeak = Math.Max(_recentRawPeak, _recentRaw.Count);
-        while (_recentRawByProcess[item.ProcessId] > _recentRawPerProcessCapacity)
+        if (_recentRawByProcess.TryGetValue(item.ProcessId, out var existingProcessEvents)
+            && existingProcessEvents.Count >= _recentRawPerProcessCapacity)
         {
-            var old = _recentRaw.FirstOrDefaultNode(value => value.ProcessId == item.ProcessId);
-            if (old is null) break;
-            RemoveRecentRaw(old);
+            RemoveRecentRaw(existingProcessEvents.First!.Value);
             RecordDrop("Per-process recent ETW buffer reached its hard bound; events were dropped.");
         }
 
-        while (_recentRaw.Count > _recentRawCapacity)
+        if (_recentRaw.Count >= _recentRawCapacity)
         {
-            RemoveRecentRaw(_recentRaw.First!);
+            RemoveRecentRaw(_recentRaw.First!.Value);
             RecordDrop("Global recent ETW buffer reached its hard bound; events were dropped.");
         }
+
+        if (!_recentRawByProcess.TryGetValue(item.ProcessId, out var processEvents))
+        {
+            processEvents = [];
+            _recentRawByProcess[item.ProcessId] = processEvents;
+        }
+
+        var buffered = new BufferedRawFileActivity(item);
+        buffered.GlobalNode = _recentRaw.AddLast(buffered);
+        buffered.ProcessNode = processEvents.AddLast(buffered);
+        _recentRawPeak = Math.Max(_recentRawPeak, _recentRaw.Count);
+        _recentRawPerProcessPeak = Math.Max(_recentRawPerProcessPeak, processEvents.Count);
     }
 
-    private void CleanupRecentRaw(DateTimeOffset now)
+    private void CleanupRecentRaw(DateTimeOffset now, bool force)
     {
+        if (!force && now < _nextRecentRawCleanupUtc) return;
         var cutoff = now - _recentRawRetention;
         var node = _recentRaw.First;
         while (node is not null)
         {
             var next = node.Next;
-            if (node.Value.TimestampUtc < cutoff) RemoveRecentRaw(node);
+            if (node.Value.Activity.TimestampUtc < cutoff) RemoveRecentRaw(node.Value);
             node = next;
         }
+        _nextRecentRawCleanupUtc = now + DefaultRecentRawCleanupInterval;
     }
 
-    private void RemoveRecentRaw(LinkedListNode<RawFileActivity> node)
+    private void RemoveRecentRaw(BufferedRawFileActivity buffered)
     {
-        var processId = node.Value.ProcessId;
-        _recentRaw.Remove(node);
-        if (_recentRawByProcess.TryGetValue(processId, out var count))
+        var processId = buffered.Activity.ProcessId;
+        if (buffered.GlobalNode is { List: not null }) _recentRaw.Remove(buffered.GlobalNode);
+        if (_recentRawByProcess.TryGetValue(processId, out var processEvents)
+            && buffered.ProcessNode is { List: not null })
         {
-            if (count <= 1) _recentRawByProcess.Remove(processId);
-            else _recentRawByProcess[processId] = count - 1;
+            processEvents.Remove(buffered.ProcessNode);
+            if (processEvents.Count == 0) _recentRawByProcess.Remove(processId);
         }
     }
 
@@ -768,15 +782,9 @@ internal sealed class RuntimeProcessIdentityResolver : IProcessIdentityResolver
     }
 }
 
-internal static class LinkedListExtensions
+internal sealed class BufferedRawFileActivity(RawFileActivity activity)
 {
-    public static LinkedListNode<T>? FirstOrDefaultNode<T>(this LinkedList<T> list, Func<T, bool> predicate)
-    {
-        for (var node = list.First; node is not null; node = node.Next)
-        {
-            if (predicate(node.Value)) return node;
-        }
-
-        return null;
-    }
+    public RawFileActivity Activity { get; } = activity;
+    public LinkedListNode<BufferedRawFileActivity>? GlobalNode { get; set; }
+    public LinkedListNode<BufferedRawFileActivity>? ProcessNode { get; set; }
 }

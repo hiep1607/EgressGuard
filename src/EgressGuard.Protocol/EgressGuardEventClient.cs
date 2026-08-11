@@ -9,7 +9,7 @@ public sealed class EgressGuardEventClient : IAsyncDisposable
 
     public EgressGuardEventClient(string? pipeName = null)
     {
-        _pipeName = string.IsNullOrWhiteSpace(pipeName) ? ProtocolConstants.PipeName : pipeName;
+        _pipeName = string.IsNullOrWhiteSpace(pipeName) ? ProtocolConstants.ResolvePipeName() : pipeName;
     }
 
     public Task SubscribeAsync(
