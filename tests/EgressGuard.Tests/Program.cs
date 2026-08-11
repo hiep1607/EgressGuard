@@ -127,6 +127,9 @@ internal static class Program
             ("Automatic firewall rule rolls back on cancellation", TestAutomaticRuleCancellationRollbackAsync),
             ("Automatic firewall rollback logs original and rollback failures", TestAutomaticRuleRollbackFailureLoggingAsync),
             ("Protocol frame roundtrip", TestProtocolRoundTripAsync),
+            ("Phase 5B-01 contracts serialize and preserve exact identity", TestOutboundGateContractRoundTripAsync),
+            ("Phase 5B-01 contracts reject invalid versions bounds and coverage", TestOutboundGateContractValidationAsync),
+            ("Phase 5B-01 contracts preserve compatibility and omit sensitive fields", TestOutboundGateContractCompatibilityAsync),
             ("Default UI clients honor configured pipe name", TestConfiguredPipeNameAsync),
             ("File correlation IPC stays compatible and bounded", TestFileCorrelationProtocolAsync),
             ("UI correlation refresh coalesces updates and cancels stale selection", TestUiCorrelationRefreshAsync),
@@ -1698,6 +1701,129 @@ internal static class Program
         AssertEqual(message.Type, result?.Type);
         AssertEqual(message.CorrelationId, result?.CorrelationId);
     }
+
+    private static Task TestOutboundGateContractRoundTripAsync()
+    {
+        var sample = OutboundGateSamples();
+        var values = new object[]
+        {
+            sample.File,
+            sample.Subject,
+            sample.Destination,
+            sample.Intent,
+            sample.Request,
+            sample.Ack,
+            sample.Disposition,
+            sample.Completion,
+            sample.Challenge,
+            sample.Decision,
+            sample.Ticket,
+            sample.Grant,
+            sample.Status
+        };
+
+        foreach (var value in values)
+        {
+            var json = System.Text.Json.JsonSerializer.Serialize(value, value.GetType(), JsonDefaults.Options);
+            var roundTripped = System.Text.Json.JsonSerializer.Deserialize(json, value.GetType(), JsonDefaults.Options);
+            AssertTrue(roundTripped is not null, $"Contract {value.GetType().Name} did not deserialize.");
+            var secondJson = System.Text.Json.JsonSerializer.Serialize(roundTripped, value.GetType(), JsonDefaults.Options);
+            AssertEqual(json, secondJson);
+        }
+
+        var envelope = MessageEnvelope.Create(OutboundGateMessageTypes.GateArmRequest, new GateArmRequestMessage(sample.Request));
+        var payload = envelope.ReadPayload<GateArmRequestMessage>();
+        AssertEqual(sample.Request.IntentId, payload.Request.IntentId);
+        AssertEqual(sample.Request.Subject.ProcessIdentity, payload.Request.Subject.ProcessIdentity);
+        AssertEqual(sample.Request.RequestNonce, payload.Request.RequestNonce);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestOutboundGateContractValidationAsync()
+    {
+        var sample = OutboundGateSamples();
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new GateCoverage(1, (GateCoverageFlags)(1 << 5)));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new GateCoverage(2, GateCoverageFlags.NewTcp));
+        AssertThrows<ArgumentException>(() => _ = new GateSubject(1, new ProcessIdentity(0, sample.Start), "sha256:app", null, [new ProcessIdentity(0, sample.Start)]));
+        AssertThrows<ArgumentException>(() => _ = new GateSubject(1, sample.Process, new string('x', OutboundGateLimits.MaximumIdentifierLength + 1), null, [sample.Process]));
+        AssertThrows<ArgumentException>(() => _ = new GateSubject(1, sample.Process, "C:\\not-an-identity", null, [sample.Process]));
+        AssertThrows<ArgumentException>(() => _ = new GateSubject(1, sample.Process, "sha256:app", Guid.NewGuid(), Enumerable.Repeat(sample.Process, OutboundGateLimits.MaximumGroupMembers + 1).ToArray()));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new DestinationBinding(1, IPAddress.Loopback, IpVersion.IPv6, 443, TransportProtocol.Tcp, null));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new DestinationBinding(1, IPAddress.Loopback, IpVersion.IPv4, 0, TransportProtocol.Tcp, null));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new FileReadIntent(1, Guid.NewGuid(), sample.Subject, sample.File, FileActivityOperation.Write, sample.Start, 1, sample.Boot, 1));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new GateArmRequest(1, Guid.NewGuid(), sample.Subject, new GateCoverage(1, GateCoverageFlags.None), 1, sample.DriverGeneration, Guid.NewGuid(), sample.Start, 1));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new FileReadDisposition(1, Guid.NewGuid(), sample.Process, sample.File, FileReadDispositionKind.ReleaseAfterGateArmed, null, 1, "reason", 1));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new OneTimeTicket(1, Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), sample.Subject, sample.File, sample.Destination, 1, 1, sample.Boot, sample.Start, sample.Start, 1, 2, 1, 1, [1]));
+
+        var partial = new GateArmAck(1, sample.Ack.AckId, sample.Ack.IntentId, sample.Ack.Subject, sample.Ack.RequiredCoverage, new GateCoverage(1, GateCoverageFlags.NewTcp), sample.Ack.PolicyEpoch, sample.Ack.DriverGeneration, sample.Ack.RequestNonce, sample.Ack.AckNonce, sample.Ack.AcknowledgedAtUtc, sample.Ack.ArmedDeadlineUtc, sample.Ack.ArmedDeadlineTicks, "unsupported existing coverage");
+        AssertThrows<InvalidOperationException>(() => partial.ValidateFor(sample.Request));
+        sample.Ack.ValidateFor(sample.Request);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestOutboundGateContractCompatibilityAsync()
+    {
+        var sample = OutboundGateSamples();
+        var json = System.Text.Json.JsonSerializer.Serialize(sample.File, JsonDefaults.Options);
+        foreach (var forbidden in new[] { "RawPath", "Content", "PacketPayload", "ContentHash", "TicketSecret" })
+        {
+            AssertTrue(!json.Contains(forbidden, StringComparison.Ordinal), $"Sensitive contract field name {forbidden} was exposed.");
+        }
+
+        var decision = new UserDecision(1, Guid.NewGuid(), sample.Challenge.ChallengeId, UserDecisionKind.AllowOnce, sample.Start.AddYears(20), "interactive-user");
+        AssertEqual(UserDecisionKind.AllowOnce, decision.Decision);
+        AssertTrue(decision.UiTimestampUtc > DateTimeOffset.UtcNow.AddYears(10), "UI audit timestamp fixture was not retained as metadata.");
+
+        var legacy = MessageEnvelope.Create(MessageTypes.GetStatus, new { Request = true });
+        AssertEqual(MessageTypes.GetStatus, legacy.Type);
+        AssertEqual(ProtocolConstants.Version, legacy.Version);
+        AssertTrue(!System.Text.Json.JsonSerializer.Serialize(legacy, JsonDefaults.Options).Contains("Phase5B", StringComparison.Ordinal), "Legacy protocol message was changed by the new vocabulary.");
+        return Task.CompletedTask;
+    }
+
+    private static OutboundGateSample OutboundGateSamples()
+    {
+        var start = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var process = new ProcessIdentity(42, start);
+        var boot = Guid.Parse("10000000-0000-0000-0000-000000000001");
+        var driver = Guid.Parse("20000000-0000-0000-0000-000000000002");
+        var intentId = Guid.Parse("30000000-0000-0000-0000-000000000003");
+        var requestNonce = Guid.Parse("40000000-0000-0000-0000-000000000004");
+        var subject = new GateSubject(1, process, "sha256:application", null, [process]);
+        var file = new FileVersionIdentity(1, "volume-1", "file-42", start, 1024, start.AddMinutes(1), "version-token-1");
+        var destination = new DestinationBinding(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, "localhost");
+        var coverage = new GateCoverage(1, GateCoverageFlags.NewTcp | GateCoverageFlags.NewUdp | GateCoverageFlags.ExistingTcpStream | GateCoverageFlags.ExistingUdpDatagram | GateCoverageFlags.ReconnectRequiredSimulation);
+        var intent = new FileReadIntent(1, intentId, subject, file, FileActivityOperation.Read, start, 2_000, boot, 1);
+        var request = new GateArmRequest(1, intentId, subject, coverage, 7, driver, requestNonce, start.AddSeconds(2), 2_000);
+        var ack = new GateArmAck(1, Guid.Parse("50000000-0000-0000-0000-000000000005"), intentId, subject, coverage, coverage, 7, driver, requestNonce, Guid.Parse("60000000-0000-0000-0000-000000000006"), start.AddMilliseconds(10), start.AddSeconds(2), 2_000, null);
+        var disposition = new FileReadDisposition(1, intentId, process, file, FileReadDispositionKind.ReleaseAfterGateArmed, ack.AckId, 2_000, "gate-armed", 2);
+        var completion = new FileReadCompletionAck(1, Guid.Parse("70000000-0000-0000-0000-000000000007"), intentId, process, file, 2, FileReadCompletionResult.Released, "read-released", 3);
+        var challenge = new NetworkGateChallenge(1, Guid.Parse("80000000-0000-0000-0000-000000000008"), intentId, subject, destination, 1, false, coverage, 15_000, start, null);
+        var decision = new UserDecision(1, Guid.Parse("90000000-0000-0000-0000-000000000009"), challenge.ChallengeId, UserDecisionKind.AllowOnce, start, "interactive-user");
+        var ticket = new OneTimeTicket(1, Guid.Parse("a0000000-0000-0000-0000-00000000000a"), Guid.Parse("b0000000-0000-0000-0000-00000000000b"), intentId, subject, file, destination, 1, 7, boot, start, start.AddSeconds(5), 4_000, 9_000, 512L * 1024 * 1024, TimeSpan.FromMinutes(5).Ticks, [1, 2, 3]);
+        var grant = new EphemeralFlowGrant(1, Guid.Parse("c0000000-0000-0000-0000-00000000000c"), ticket.TicketId, intentId, subject, destination, 1, 7, boot, ticket.GrantMaxBytes, 9_000);
+        var status = new GateStatus(1, OutboundGateMode.Simulation, GateRuntimeState.Armed, intentId, coverage, 2_000, start, "Simulation only");
+        return new OutboundGateSample(start, process, boot, driver, file, subject, destination, intent, request, ack, disposition, completion, challenge, decision, ticket, grant, status);
+    }
+
+    private sealed record OutboundGateSample(
+        DateTimeOffset Start,
+        ProcessIdentity Process,
+        Guid Boot,
+        Guid DriverGeneration,
+        FileVersionIdentity File,
+        GateSubject Subject,
+        DestinationBinding Destination,
+        FileReadIntent Intent,
+        GateArmRequest Request,
+        GateArmAck Ack,
+        FileReadDisposition Disposition,
+        FileReadCompletionAck Completion,
+        NetworkGateChallenge Challenge,
+        UserDecision Decision,
+        OneTimeTicket Ticket,
+        EphemeralFlowGrant Grant,
+        GateStatus Status);
 
     private static async Task TestConfiguredPipeNameAsync()
     {
