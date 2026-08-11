@@ -22,6 +22,7 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
     internal static readonly TimeSpan DefaultRecentRawRetention = TimeSpan.FromSeconds(35);
     private static readonly TimeSpan DefaultStatusPublishInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan DefaultRecentRawCleanupInterval = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan DefaultCallbackDedupeWindow = TimeSpan.FromMilliseconds(750);
 
     private readonly Channel<RawFileActivity> _staging;
     private readonly Channel<FileActivity> _output;
@@ -30,6 +31,7 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
     private readonly string[] _lowValueSystemRoots;
     private readonly IProcessIdentityResolver _processResolver;
     private readonly ProcessIdentityCache _processIdentities;
+    private readonly EtwCallbackAdmissionCache _callbackAdmission;
     private readonly EtwSessionOwnershipManager _ownershipManager;
     private readonly TimeSpan _statusPublishInterval;
     private readonly int _recentRawCapacity;
@@ -41,7 +43,9 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
     private readonly LinkedList<BufferedPromotedFileActivity> _pendingPromoted = [];
     private readonly Dictionary<ProcessIdentity, LinkedList<BufferedPromotedFileActivity>> _pendingPromotedByProcess = [];
     private readonly Dictionary<int, LinkedList<BufferedRawFileActivity>> _recentRawByProcess = [];
+    private readonly Dictionary<RawFileActivityKey, BufferedRawFileActivity> _recentRawByKey = new(RawFileActivityKeyComparer.Instance);
     private readonly Dictionary<int, ResolvedProcessIdentity> _processInterests = [];
+    private HashSet<int> _interestedProcessIds = [];
     private TraceEventSession? _session;
     private Task? _traceTask;
     private Task? _projectionTask;
@@ -67,7 +71,8 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
             DefaultStatusPublishInterval,
             DefaultRecentRawCapacity,
             DefaultRecentRawPerProcessCapacity,
-            DefaultRecentRawRetention)
+            DefaultRecentRawRetention,
+            callbackAdmission: new EtwCallbackAdmissionCache(DefaultCapacity, DefaultCallbackDedupeWindow))
     {
     }
 
@@ -81,7 +86,8 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
         int recentRawCapacity = DefaultRecentRawCapacity,
         int recentRawPerProcessCapacity = DefaultRecentRawPerProcessCapacity,
         TimeSpan? recentRawRetention = null,
-        IEnumerable<string>? lowValueSystemRoots = null)
+        IEnumerable<string>? lowValueSystemRoots = null,
+        EtwCallbackAdmissionCache? callbackAdmission = null)
     {
         ArgumentNullException.ThrowIfNull(processResolver);
         ArgumentOutOfRangeException.ThrowIfLessThan(capacity, 1);
@@ -89,6 +95,7 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
         ArgumentOutOfRangeException.ThrowIfLessThan(recentRawPerProcessCapacity, 1);
         _processResolver = processResolver;
         _processIdentities = processIdentities ?? new ProcessIdentityCache(DefaultProcessIdentityCapacity, DefaultProcessIdentityTtl);
+        _callbackAdmission = callbackAdmission ?? new EtwCallbackAdmissionCache(DefaultCapacity, DefaultCallbackDedupeWindow);
         _ownershipManager = ownershipManager ?? new EtwSessionOwnershipManager(ResolveOwnershipDirectory(excludedRoots, null));
         _statusPublishInterval = statusPublishInterval ?? DefaultStatusPublishInterval;
         _recentRawCapacity = recentRawCapacity;
@@ -128,12 +135,14 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
     public event EventHandler<FileSensorStatus>? StatusChanged;
     internal int ProcessIdentityCacheCount => _processIdentities.Count;
     internal int RecentRawEventCount { get { lock (_correlationSync) return _recentRaw.Count; } }
+    internal int RecentRawDedupeCount { get { lock (_correlationSync) return _recentRawByKey.Count; } }
     internal int RecentRawPeak => Volatile.Read(ref _recentRawPeak);
     internal int RecentRawPerProcessPeak => Volatile.Read(ref _recentRawPerProcessPeak);
     internal int PendingPromotedCount { get { lock (_correlationSync) return _pendingPromoted.Count; } }
     internal int PendingPromotedIdentityCount { get { lock (_correlationSync) return _pendingPromotedByProcess.Count; } }
     internal long PendingPromotionNodesVisited => Interlocked.Read(ref _pendingPromotionNodesVisited);
     internal int StagedEventCount => _staging.Reader.Count;
+    internal int CallbackAdmissionCount => _callbackAdmission.Count;
     internal string? SessionName => _sessionLease?.SessionName;
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -210,12 +219,13 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
     public IReadOnlyList<FileActivity> UpdateProcessInterests(IEnumerable<FileActivityProcessInterest> processes)
     {
         ArgumentNullException.ThrowIfNull(processes);
+        var currentProcesses = processes as FileActivityProcessInterest[] ?? processes.ToArray();
         var observedAt = DateTimeOffset.UtcNow;
         var promoted = new List<FileActivity>();
         lock (_correlationSync)
         {
             CleanupRecentRaw(observedAt, force: true);
-            foreach (var process in processes)
+            foreach (var process in currentProcesses)
             {
                 var resolved = new ResolvedProcessIdentity(process.Identity, process.ProcessName);
                 _processIdentities.ObserveProcessStart(resolved, observedAt);
@@ -223,6 +233,13 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
                 PromoteForInterest(resolved, observedAt, promoted);
                 DrainPendingPromoted(resolved.Identity, promoted);
             }
+
+            // Publish an immutable snapshot for the ETW callback. Unknown
+            // processes only need pre-flow reads; once a network identity is
+            // known, the callback may admit the remaining operations too.
+            Volatile.Write(
+                ref _interestedProcessIds,
+                currentProcesses.Select(process => process.Identity.ProcessId).ToHashSet());
         }
 
         return promoted;
@@ -236,6 +253,7 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
             if (_processInterests.TryGetValue(identity.ProcessId, out var current) && current.Identity == identity)
             {
                 _processInterests.Remove(identity.ProcessId);
+                Volatile.Write(ref _interestedProcessIds, _processInterests.Keys.ToHashSet());
             }
         }
     }
@@ -350,6 +368,24 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
             || !Path.IsPathFullyQualified(path)
             || IsExcluded(path)
             || IsLowValueSystemPathCore(path, _lowValueSystemRoots))
+        {
+            return;
+        }
+
+        // Kernel FileIOCreate/Write/Rename/Delete are extremely noisy during
+        // provider startup and do not establish that an as-yet unknown process
+        // read data before opening a network flow. Retain pre-flow Read events;
+        // after FlowCoordinator publishes an exact process interest, preserve
+        // every supported operation for that process.
+        if (operation != FileActivityOperation.Read
+            && !Volatile.Read(ref _interestedProcessIds).Contains(processId))
+        {
+            return;
+        }
+
+        if (!_callbackAdmission.ShouldAdmit(
+                new RawFileActivityKey(processId, operation, path),
+                DateTimeOffset.UtcNow))
         {
             return;
         }
@@ -497,11 +533,20 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
 
     private void AddRecentRaw(RawFileActivity item)
     {
+        var key = new RawFileActivityKey(item.ProcessId, item.Operation, item.Path);
+        if (_recentRawByKey.TryGetValue(key, out var duplicate))
+        {
+            // Kernel FileIORead is emitted per I/O chunk. One newest event for
+            // the same PID/path/operation preserves the useful pre-flow signal
+            // without allowing a single file read to exhaust the per-PID cap.
+            RemoveRecentRaw(duplicate);
+        }
+
         if (_recentRawByProcess.TryGetValue(item.ProcessId, out var existingProcessEvents)
             && existingProcessEvents.Count >= _recentRawPerProcessCapacity)
         {
             RemoveRecentRaw(existingProcessEvents.First!.Value);
-            RecordDrop("Per-process recent ETW buffer reached its hard bound; events were dropped.");
+            RecordDrop($"Per-process recent ETW buffer for PID {item.ProcessId} reached its hard bound; events were dropped.");
         }
 
         if (_recentRaw.Count >= _recentRawCapacity)
@@ -519,6 +564,7 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
         var buffered = new BufferedRawFileActivity(item);
         buffered.GlobalNode = _recentRaw.AddLast(buffered);
         buffered.ProcessNode = processEvents.AddLast(buffered);
+        _recentRawByKey[key] = buffered;
         _recentRawPeak = Math.Max(_recentRawPeak, _recentRaw.Count);
         _recentRawPerProcessPeak = Math.Max(_recentRawPerProcessPeak, processEvents.Count);
     }
@@ -540,12 +586,18 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
     private void RemoveRecentRaw(BufferedRawFileActivity buffered)
     {
         var processId = buffered.Activity.ProcessId;
+        var key = new RawFileActivityKey(processId, buffered.Activity.Operation, buffered.Activity.Path);
         if (buffered.GlobalNode is { List: not null }) _recentRaw.Remove(buffered.GlobalNode);
         if (_recentRawByProcess.TryGetValue(processId, out var processEvents)
             && buffered.ProcessNode is { List: not null })
         {
             processEvents.Remove(buffered.ProcessNode);
             if (processEvents.Count == 0) _recentRawByProcess.Remove(processId);
+        }
+
+        if (_recentRawByKey.TryGetValue(key, out var current) && ReferenceEquals(current, buffered))
+        {
+            _recentRawByKey.Remove(key);
         }
     }
 
@@ -851,6 +903,82 @@ internal sealed class BufferedRawFileActivity(RawFileActivity activity)
     public RawFileActivity Activity { get; } = activity;
     public LinkedListNode<BufferedRawFileActivity>? GlobalNode { get; set; }
     public LinkedListNode<BufferedRawFileActivity>? ProcessNode { get; set; }
+}
+
+internal readonly record struct RawFileActivityKey(int ProcessId, FileActivityOperation Operation, string Path);
+
+internal sealed class RawFileActivityKeyComparer : IEqualityComparer<RawFileActivityKey>
+{
+    public static RawFileActivityKeyComparer Instance { get; } = new();
+
+    public bool Equals(RawFileActivityKey x, RawFileActivityKey y) =>
+        x.ProcessId == y.ProcessId
+        && x.Operation == y.Operation
+        && string.Equals(x.Path, y.Path, StringComparison.OrdinalIgnoreCase);
+
+    public int GetHashCode(RawFileActivityKey obj) => HashCode.Combine(
+        obj.ProcessId,
+        obj.Operation,
+        StringComparer.OrdinalIgnoreCase.GetHashCode(obj.Path));
+}
+
+/// <summary>
+/// Single-ETW-callback-thread coalescing cache. It prevents per-chunk events for
+/// one file operation from filling the staging channel before the projector can
+/// apply its longer-lived raw-history dedupe. Both its index and eviction queue
+/// have the same hard bound.
+/// </summary>
+internal sealed class EtwCallbackAdmissionCache
+{
+    private readonly int _capacity;
+    private readonly TimeSpan _window;
+    private readonly Dictionary<RawFileActivityKey, DateTimeOffset> _entries = new(RawFileActivityKeyComparer.Instance);
+    private readonly Queue<(RawFileActivityKey Key, DateTimeOffset ObservedAt)> _order = [];
+
+    public EtwCallbackAdmissionCache(int capacity, TimeSpan window)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(capacity, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(window, TimeSpan.Zero);
+        _capacity = capacity;
+        _window = window;
+    }
+
+    public int Count => _entries.Count;
+
+    public bool ShouldAdmit(RawFileActivityKey key, DateTimeOffset observedAt)
+    {
+        Cleanup(observedAt);
+        if (_entries.TryGetValue(key, out var previous) && observedAt - previous <= _window)
+        {
+            return false;
+        }
+
+        _entries[key] = observedAt;
+        _order.Enqueue((key, observedAt));
+        while (_order.Count > _capacity)
+        {
+            RemoveOldest();
+        }
+
+        return true;
+    }
+
+    private void Cleanup(DateTimeOffset observedAt)
+    {
+        while (_order.TryPeek(out var oldest) && observedAt - oldest.ObservedAt > _window)
+        {
+            RemoveOldest();
+        }
+    }
+
+    private void RemoveOldest()
+    {
+        var oldest = _order.Dequeue();
+        if (_entries.TryGetValue(oldest.Key, out var current) && current == oldest.ObservedAt)
+        {
+            _entries.Remove(oldest.Key);
+        }
+    }
 }
 
 internal sealed class BufferedPromotedFileActivity(FileActivity activity)

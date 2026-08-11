@@ -86,11 +86,14 @@ internal static class Program
             ("File correlation eviction preserves newer dedupe entries", TestFileCorrelationDedupeEvictionAsync),
             ("File correlation excludes EgressGuard-owned storage", TestFileCorrelationExclusionAsync),
             ("System path filtering uses normalized directory boundaries", TestSystemPathFilteringAsync),
+            ("Pre-flow admission retains reads and gates unrelated mutation noise", TestPreFlowAdmissionAsync),
+            ("ETW callback coalescing is bounded and expires deterministically", TestEtwCallbackAdmissionAsync),
             ("Disabled and degraded file sensors remain bounded", TestFileSensorStatesAsync),
             ("File sensor publishes coalesced final dropped count", TestFileSensorDroppedCountNotificationsAsync),
             ("File sensor rejects events older than resolved process identity", TestFileSensorPidReuseProjectionAsync),
             ("Process identity cache is bounded, expires, and rejects PID reuse", TestProcessIdentityCacheAsync),
             ("Pre-flow raw events promote through the production interest path", TestPreFlowRawPromotionAsync),
+            ("Pre-flow repeated reads retain only the newest useful signal", TestPreFlowRawDedupeAsync),
             ("Pre-flow raw buffer retention and per-process bounds are enforced", TestPreFlowRawBufferBoundsAsync),
             ("PID reuse promotes only the current process generation", TestPidReuseRawPromotionAsync),
             ("Pending promotion is indexed by exact process identity", TestPendingPromotionIndexAsync),
@@ -599,6 +602,98 @@ internal static class Program
         AssertEqual(1, globalPromoted.Count);
         AssertTrue(globalPromoted[0].Path.EndsWith("global-5.egfixture", StringComparison.Ordinal), "Global eviction left a stale per-PID index or removed the newest event.");
         AssertTrue(globalSensor.RecentRawPeak <= 4, "Global raw buffer peak exceeded its hard bound.");
+    }
+
+    private static Task TestPreFlowRawDedupeAsync()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var identity = new ProcessIdentity(82, now.AddMinutes(-1));
+        var sensor = new EtwFileActivitySensor(
+            new FixedProcessIdentityResolver(identity, "chunked-read"),
+            capacity: 8,
+            recentRawCapacity: 8,
+            recentRawPerProcessCapacity: 3,
+            recentRawRetention: TimeSpan.FromMinutes(1));
+        var path = "C:\\Synthetic\\chunked-read.egfixture";
+        var events = Enumerable.Range(0, 1_000)
+            .Select(index => new RawFileActivity(
+                index,
+                now.AddMilliseconds(index),
+                identity.ProcessId,
+                "chunked-read",
+                FileActivityOperation.Read,
+                path));
+
+        _ = sensor.PromoteRawForTest(events, []);
+        AssertEqual(1, sensor.RecentRawEventCount);
+        AssertEqual(1, sensor.RecentRawDedupeCount);
+        AssertEqual(0L, sensor.Status.DroppedEvents);
+
+        var promoted = sensor.UpdateProcessInterests([new FileActivityProcessInterest(identity, "chunked-read")]);
+        AssertEqual(1, promoted.Count);
+        AssertEqual(999L, promoted[0].Sequence);
+        AssertEqual(now.AddMilliseconds(999), promoted[0].TimestampUtc);
+        AssertEqual(0, sensor.RecentRawEventCount);
+        AssertEqual(0, sensor.RecentRawDedupeCount);
+        return Task.CompletedTask;
+    }
+
+    private static async Task TestPreFlowAdmissionAsync()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var identity = new ProcessIdentity(81, now.AddMinutes(-1));
+        await using var sensor = new EtwFileActivitySensor(
+            new FixedProcessIdentityResolver(identity, "admission"),
+            capacity: 16,
+            recentRawCapacity: 16,
+            recentRawPerProcessCapacity: 8,
+            recentRawRetention: TimeSpan.FromMinutes(1),
+            lowValueSystemRoots: []);
+
+        foreach (var operation in new[]
+        {
+            FileActivityOperation.OpenCreate,
+            FileActivityOperation.Write,
+            FileActivityOperation.Rename,
+            FileActivityOperation.Delete
+        })
+        {
+            sensor.StageForTest(identity.ProcessId, "admission", $"C:\\Synthetic\\unknown-{operation}.egfixture", operation, now.UtcDateTime);
+        }
+
+        AssertEqual(0, sensor.StagedEventCount);
+        AssertEqual(0L, sensor.Status.DroppedEvents);
+
+        sensor.StageForTest(identity.ProcessId, "admission", "C:\\Synthetic\\unknown-read.egfixture", FileActivityOperation.Read, now.UtcDateTime);
+        AssertEqual(1, sensor.StagedEventCount);
+
+        _ = sensor.UpdateProcessInterests([new FileActivityProcessInterest(identity, "admission")]);
+        sensor.StageForTest(identity.ProcessId, "admission", "C:\\Synthetic\\known-write.egfixture", FileActivityOperation.Write, now.UtcDateTime);
+        AssertEqual(2, sensor.StagedEventCount);
+
+        sensor.ObserveProcessStop(identity, now);
+        sensor.StageForTest(identity.ProcessId, "admission", "C:\\Synthetic\\stopped-write.egfixture", FileActivityOperation.Write, now.UtcDateTime);
+        AssertEqual(2, sensor.StagedEventCount);
+    }
+
+    private static Task TestEtwCallbackAdmissionAsync()
+    {
+        var cache = new EtwCallbackAdmissionCache(2, TimeSpan.FromMilliseconds(750));
+        var now = DateTimeOffset.UtcNow;
+        var first = new RawFileActivityKey(1, FileActivityOperation.Read, "C:\\Synthetic\\first.egfixture");
+        var second = new RawFileActivityKey(1, FileActivityOperation.Read, "C:\\Synthetic\\second.egfixture");
+        var third = new RawFileActivityKey(2, FileActivityOperation.Read, "C:\\Synthetic\\third.egfixture");
+
+        AssertTrue(cache.ShouldAdmit(first, now), "The first callback event was not admitted.");
+        AssertTrue(!cache.ShouldAdmit(first, now.AddMilliseconds(100)), "A duplicate chunk was admitted inside the coalescing window.");
+        AssertTrue(cache.ShouldAdmit(second, now.AddMilliseconds(200)), "A distinct file event was not admitted.");
+        AssertTrue(cache.ShouldAdmit(third, now.AddMilliseconds(300)), "A distinct process event was not admitted.");
+        AssertEqual(2, cache.Count);
+        AssertTrue(cache.ShouldAdmit(first, now.AddMilliseconds(301)), "The oldest bounded entry was not evicted.");
+        AssertEqual(2, cache.Count);
+        AssertTrue(cache.ShouldAdmit(first, now.AddSeconds(2)), "An expired callback entry suppressed a later event.");
+        AssertEqual(1, cache.Count);
+        return Task.CompletedTask;
     }
 
     private static Task TestPidReuseRawPromotionAsync()
