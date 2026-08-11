@@ -475,6 +475,13 @@
           "Microsoft.Extensions.Hosting.WindowsServices": "[8.0.1, )"
         }
       },
+      "egressguard.ui": {
+        "type": "Project",
+        "dependencies": {
+          "EgressGuard.Core": "[1.0.0, )",
+          "EgressGuard.Protocol": "[1.0.0, )"
+        }
+      },
       "egressguard.windows": {
         "type": "Project",
         "dependencies": {

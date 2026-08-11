@@ -17,6 +17,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     private readonly SequencedEventBuffer _eventBuffer = new(4096);
     private readonly CancellationTokenSource _lifetimeCancellation = new();
     private readonly DispatcherTimer _batchTimer;
+    private readonly BoundedSelectionRefresh<FileCorrelationsMessage> _correlationRefresh;
     private Task? _subscriptionTask;
     private long _lastSequence;
     private int _resyncRequested;
@@ -42,6 +43,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         FlowView = CollectionViewSource.GetDefaultView(Flows);
         FlowView.Filter = FilterFlow;
         _batchTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(_refreshIntervalMilliseconds) };
+        _correlationRefresh = new BoundedSelectionRefresh<FileCorrelationsMessage>(
+            FetchFileCorrelationsAsync,
+            ApplyFileCorrelations,
+            HandleFileCorrelationFailure,
+            TimeSpan.FromSeconds(1));
         _batchTimer.Tick += OnBatchTimerTick;
         RefreshCommand = new AsyncCommand(RefreshAsync);
         AllowCommand = new AsyncCommand(() => CreateRuleAsync(FirewallAction.Allow));
@@ -96,7 +102,13 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         {
             if (Set(ref _selectedFlow, value))
             {
-                _ = RefreshFileCorrelationsAsync(value);
+                if (value is null)
+                {
+                    Replace(FileCorrelations, []);
+                    OnPropertyChanged(nameof(FileCorrelationEmptyState));
+                }
+
+                _correlationRefresh.Select(value?.Flow.Id);
             }
         }
     }
@@ -257,6 +269,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
                 var updateIndex = IndexOfFlow(streamEvent.Flow.Id);
                 if (updateIndex >= 0) Flows[updateIndex] = new FlowRow(streamEvent.Flow);
                 else Flows.Add(new FlowRow(streamEvent.Flow));
+                _correlationRefresh.NotifyFlowUpdated(streamEvent.Flow.Id);
                 break;
             case StreamEventKind.FlowRemoved when streamEvent.FlowId is not null:
                 var removeIndex = IndexOfFlow(streamEvent.FlowId);
@@ -286,43 +299,39 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         return -1;
     }
 
-    private async Task EnsureConnectedAsync()
+    private async Task EnsureConnectedAsync(CancellationToken cancellationToken = default)
     {
         if (!_client.IsConnected)
         {
-            await _client.ConnectAsync(TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(true);
+            await _client.ConnectAsync(TimeSpan.FromSeconds(3), cancellationToken).ConfigureAwait(true);
             LastOperation = "Connected to EgressGuard Service.";
         }
     }
 
-    private async Task RefreshFileCorrelationsAsync(FlowRow? selected)
+    private async Task<FileCorrelationsMessage> FetchFileCorrelationsAsync(string flowId, CancellationToken cancellationToken)
     {
-        try
-        {
-            if (selected is null)
-            {
-                Replace(FileCorrelations, []);
-                OnPropertyChanged(nameof(FileCorrelationEmptyState));
-                return;
-            }
+        await EnsureConnectedAsync(cancellationToken).ConfigureAwait(true);
+        var response = await _client.SendAsync(
+            MessageEnvelope.Create(MessageTypes.GetFileCorrelations, new GetFileCorrelationsMessage(flowId, 20)),
+            TimeSpan.FromSeconds(3), cancellationToken).ConfigureAwait(true);
+        return response.ReadPayload<FileCorrelationsMessage>();
+    }
 
-            await EnsureConnectedAsync().ConfigureAwait(true);
-            var response = await _client.SendAsync(
-                MessageEnvelope.Create(MessageTypes.GetFileCorrelations, new GetFileCorrelationsMessage(selected.Flow.Id, 20)),
-                TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(true);
-            var payload = response.ReadPayload<FileCorrelationsMessage>();
-            if (SelectedFlow?.Flow.Id != selected.Flow.Id) return;
-            Replace(FileCorrelations, payload.Correlations);
-            FileSensorStatus = FormatFileSensor(payload.SensorStatus);
-            OnPropertyChanged(nameof(FileCorrelationEmptyState));
-        }
-        catch (Exception exception) when (exception is IOException or TimeoutException or OperationCanceledException or InvalidDataException)
-        {
-            Replace(FileCorrelations, []);
-            FileSensorStatus = "File correlation unavailable";
-            LastOperation = exception.Message;
-            OnPropertyChanged(nameof(FileCorrelationEmptyState));
-        }
+    private void ApplyFileCorrelations(string flowId, FileCorrelationsMessage payload)
+    {
+        if (SelectedFlow?.Flow.Id != flowId) return;
+        Replace(FileCorrelations, payload.Correlations);
+        FileSensorStatus = FormatFileSensor(payload.SensorStatus);
+        OnPropertyChanged(nameof(FileCorrelationEmptyState));
+    }
+
+    private void HandleFileCorrelationFailure(Exception exception)
+    {
+        if (exception is not (IOException or TimeoutException or InvalidDataException)) return;
+        Replace(FileCorrelations, []);
+        FileSensorStatus = "File correlation unavailable";
+        LastOperation = exception.Message;
+        OnPropertyChanged(nameof(FileCorrelationEmptyState));
     }
 
     private void UpdateFileSensor(ServiceStatusMessage status)
@@ -409,6 +418,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     {
         _batchTimer.Stop();
         _lifetimeCancellation.Cancel();
+        await _correlationRefresh.DisposeAsync().ConfigureAwait(false);
         await _eventClient.DisposeAsync().ConfigureAwait(false);
         await _client.DisposeAsync().ConfigureAwait(false);
         if (_subscriptionTask is not null)

@@ -111,7 +111,7 @@ public sealed record FileCorrelationOptions(
 public sealed class FileCorrelationEngine
 {
     private readonly FileCorrelationOptions _options;
-    private readonly LinkedList<FileActivity> _events = [];
+    private readonly LinkedList<BufferedFileActivity> _events = [];
     private readonly Dictionary<string, DateTimeOffset> _dedupe = new(StringComparer.OrdinalIgnoreCase);
     private readonly string[] _excludedRoots;
     private readonly byte[] _pathSalt;
@@ -137,6 +137,8 @@ public sealed class FileCorrelationEngine
     }
 
     public long DroppedEvents => Interlocked.Read(ref _droppedEvents);
+    internal int BufferedEventCount { get { lock (_sync) return _events.Count; } }
+    internal int DedupeEntryCount { get { lock (_sync) return _dedupe.Count; } }
 
     public bool Add(FileActivity activity)
     {
@@ -173,11 +175,11 @@ public sealed class FileCorrelationEngine
             _dedupe[key] = normalized.TimestampUtc;
             if (_events.Count >= _options.MaximumBufferedEvents)
             {
-                _events.RemoveFirst();
+                RemoveNode(_events.First!);
                 Interlocked.Increment(ref _droppedEvents);
             }
 
-            _events.AddLast(normalized);
+            _events.AddLast(new BufferedFileActivity(normalized, key));
             return true;
         }
     }
@@ -196,6 +198,7 @@ public sealed class FileCorrelationEngine
         {
             CleanupCore(flow.FirstSeen + _options.AfterFlow);
             return _events
+                .Select(item => item.Activity)
                 .Where(item => item.ProcessIdentity == flow.ProcessIdentity && item.TimestampUtc >= lower && item.TimestampUtc <= upper)
                 .OrderBy(item => Math.Abs((item.TimestampUtc - flow.FirstSeen).TotalMilliseconds))
                 .ThenBy(item => item.Sequence)
@@ -238,21 +241,26 @@ public sealed class FileCorrelationEngine
         while (node is not null)
         {
             var next = node.Next;
-            if (node.Value.TimestampUtc < cutoff)
+            if (node.Value.Activity.TimestampUtc < cutoff)
             {
-                _events.Remove(node);
+                RemoveNode(node);
                 removed++;
             }
 
             node = next;
         }
 
-        foreach (var key in _dedupe.Where(item => item.Value < cutoff).Select(item => item.Key).ToArray())
-        {
-            _dedupe.Remove(key);
-        }
-
         return removed;
+    }
+
+    private void RemoveNode(LinkedListNode<BufferedFileActivity> node)
+    {
+        var item = node.Value;
+        _events.Remove(node);
+        if (_dedupe.TryGetValue(item.DedupeKey, out var timestamp) && timestamp == item.Activity.TimestampUtc)
+        {
+            _dedupe.Remove(item.DedupeKey);
+        }
     }
 
     private static Guid DeterministicId(string flowId, FileActivity activity)
@@ -275,4 +283,6 @@ public sealed class FileCorrelationEngine
     private static bool IsUnderRoot(string path, string root) =>
         path.StartsWith(root, StringComparison.OrdinalIgnoreCase)
         || string.Equals(path.TrimEnd(Path.DirectorySeparatorChar), root.TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase);
+
+    private sealed record BufferedFileActivity(FileActivity Activity, string DedupeKey);
 }

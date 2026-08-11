@@ -246,7 +246,7 @@ public sealed class EgressGuardDatabase
         ArgumentNullException.ThrowIfNull(correlations);
         await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-        foreach (var item in correlations.Take(100))
+        foreach (var item in correlations)
         {
             var command = connection.CreateCommand();
             command.Transaction = transaction;

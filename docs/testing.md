@@ -8,6 +8,8 @@ dotnet run --project tests\EgressGuard.Tests\EgressGuard.Tests.csproj -c Release
 dotnet run --project tests\EgressGuard.Tests\EgressGuard.Tests.csproj -c Release --no-build -- --test "Service pipe reconnect and event subscription"
 dotnet run --project tests\EgressGuard.Tests\EgressGuard.Tests.csproj -c Release --no-build -- --firewall-cancellation-integration
 dotnet run --project tests\EgressGuard.Tests\EgressGuard.Tests.csproj -c Release --no-build -- --etw-file-integration
+dotnet run --project tests\EgressGuard.Tests\EgressGuard.Tests.csproj -c Release --no-build -- --etw-orphan-reclaim-integration
+dotnet run --project tests\EgressGuard.Tests\EgressGuard.Tests.csproj -c Release --no-build -- --file-correlation-service-integration
 dotnet format EgressGuard.sln --verify-no-changes --no-restore
 .\tools\run-performance-test.ps1 -UiProcessId <pid> -ServiceProcessId <pid> -DurationSeconds 30
 .\tools\run-soak-test.ps1 -DurationMinutes 30
@@ -17,9 +19,9 @@ The custom runner is retained: it has deterministic Windows integration setup an
 
 ## Automated coverage
 
-The 44-test default suite retains all 35 prior regressions and adds file-correlation coverage for exact process identity/window matching, PID reuse, out-of-order delivery, dedupe, multiple files/flows, evidence caps, bounded overflow/drop counters, retention, self-storage exclusion, disabled/AccessDenied lifecycle safety, SQLite schema v3/Clear history, and bounded backward-compatible IPC. The ACL regression still combines every explicit allow rule for the `INTERACTIVE` SID and requires exactly `ReadWrite | Synchronize`, rejecting any additional ownership, permission-changing, deletion, instance-creation or system-security rights.
+The 50-test default suite retains all prior regressions and adds file-correlation coverage for exact process identity/window matching, sensor-side PID-reuse rejection, out-of-order delivery, hard-bounded dedupe and safe eviction, multiple files/flows, evidence caps, bounded overflow/drop/status notifications, exact ETW ownership, retention, self-storage exclusion, disabled/AccessDenied lifecycle safety, complete multi-flow SQLite batches, live UI refresh cancellation/throttling, schema v3/Clear history, and bounded backward-compatible IPC. The ACL regression still combines every explicit allow rule for the `INTERACTIVE` SID and requires exactly `ReadWrite | Synchronize`, rejecting any additional ownership, permission-changing, deletion, instance-creation or system-security rights.
 
-The real ETW integration command is opt-in and requires Administrator. It creates and reads only a synthetic temporary file, verifies that the process-owned ETW session reports it, then performs bounded session/file cleanup. Default CI uses fake sensors and never changes system auditing or policy.
+The three real ETW/service commands are opt-in and require Administrator. The first observes a synthetic file. The orphan test kills a child controller and proves exact protected-marker reclaim with final cleanup. The service test creates a loopback Simulator flow, reads correlations over IPC, verifies the server received zero bytes and SQLite contains no raw fixture path, then removes every fixture. Default CI uses fakes and never changes system auditing or policy.
 
 The real-service IPC test assigns a unique Named Pipe name to each service process through `EGRESSGUARD_PIPE_NAME`, passes that name explicitly to both clients, and waits for the server's subscription acknowledgement before creating the controlled TCP flow. This prevents an installed service from competing for a shared pipe and removes the fixed-delay readiness race. The default production pipe remains `EgressGuard.Service.v1` when no override is supplied.
 

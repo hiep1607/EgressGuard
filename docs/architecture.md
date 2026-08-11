@@ -18,7 +18,7 @@ UI never opens SQLite or changes Windows Firewall directly. Mutations cross the 
 IP Helper + process snapshot
   → WindowsFlowSensor
 Windows kernel File I/O ETW (optional)
-  → non-blocking bounded staging (4,096) → exact process identity
+  → non-blocking bounded staging (4,096) → PID/start-time validation
   → FileCorrelationEngine (-30/+5 seconds; max 20 evidence rows)
   → FlowCoordinator / RiskEngine / PolicyEngine
   ├─→ bounded persistence queue (2,048) → SQLite
@@ -28,6 +28,7 @@ Windows kernel File I/O ETW (optional)
        → UI SequencedEventBuffer (4,096)
        → 250 ms dispatcher batch
        → incremental ObservableCollection update
+       → selected correlation refresh (capacity 1; at most 1/second)
 ```
 
 Snapshots are used only for initial connection, reconnect, manual refresh, queue overflow or a sequence gap. A slow subscriber cannot block the sensor: its channel is drained, a `ResyncRequired` marker is queued, and further events are skipped until reconnect. Disconnected subscriptions are removed from `EventHub`.
@@ -44,9 +45,9 @@ Event kinds are `FlowAdded`, `FlowUpdated`, `FlowRemoved`, `AlertRaised`, `Servi
 
 ## Phase 4 file correlation
 
-`IFileActivitySensor` is a Core boundary. `EtwFileActivitySensor` is the Windows implementation backed by Microsoft's TraceEvent library and kernel File I/O keywords. The callback performs only validation/exclusion and `TryWrite`; process start-time lookup occurs on the channel consumer. Session names are `EgressGuard.FileActivity.v1-{PID}` and the sensor stops only its own instance. Permission/provider/overflow failures become explicit states and do not stop network monitoring.
+`IFileActivitySensor` is a Core boundary. `EtwFileActivitySensor` is the Windows implementation backed by Microsoft's TraceEvent library and kernel File I/O keywords. The callback performs only validation/exclusion, atomic drop accounting and `TryWrite`; a capacity-one status channel coalesces subscriber work. Process lookup occurs on the consumer, which drops unverifiable identities and events older than the current process start. Session names are `EgressGuard.FileActivity.v2-{nonce}`. A protected exact-identity marker permits restart to reclaim only a dead EgressGuard controller's exact session; missing, invalid, live-owner, foreign and shared sessions are never stopped.
 
-The pure engine matches exact `(PID, ProcessStartTime)` and a configurable temporal window, handles out-of-order events, deduplicates short repeats, expires old events, and enforces hard buffer/evidence caps. Stored paths are salted SHA-256 identifiers with redacted display identifiers and extensions. Correlation is descriptive evidence only: it never changes risk, policy, or firewall state and does not prove file transmission.
+The pure engine matches exact `(PID, ProcessStartTime)` and a configurable temporal window, handles out-of-order events, deduplicates short repeats, expires old events, and gives event and dedupe state the same hard capacity. Eviction removes a dedupe key only when it still represents that exact timestamp. Stored paths are salted SHA-256 identifiers with redacted display identifiers and extensions. Correlation is descriptive evidence only: it never changes risk, policy, or firewall state and does not prove file transmission.
 
 ## Authenticode
 
