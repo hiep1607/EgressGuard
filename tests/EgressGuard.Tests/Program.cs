@@ -26,9 +26,24 @@ internal static class Program
             return 0;
         }
 
+        if (args.Length == 1 && args[0] == "--etw-file-integration")
+        {
+            await TestRealEtwFileIntegrationAsync().ConfigureAwait(false);
+            Console.WriteLine("PASS  Real ETW file activity sensor");
+            return 0;
+        }
+
         var tests = new (string Name, Func<Task> Run)[]
         {
             ("Process identity includes start time", TestProcessIdentityAsync),
+            ("File correlation matches exact identity inside configured window", TestFileCorrelationWindowAsync),
+            ("File correlation rejects PID reuse and out-of-window events", TestFileCorrelationIdentityAsync),
+            ("File correlation handles out-of-order, duplicate and multiple file events", TestFileCorrelationOrderingAsync),
+            ("File correlation supports multiple flows and caps evidence", TestFileCorrelationCapacityAsync),
+            ("File correlation buffer overflow and retention are bounded", TestFileCorrelationRetentionAsync),
+            ("File correlation excludes EgressGuard-owned storage", TestFileCorrelationExclusionAsync),
+            ("Disabled and degraded file sensors remain bounded", TestFileSensorStatesAsync),
+            ("AccessDenied file sensor does not crash network service", TestFileSensorDegradedServiceAsync),
             ("Native port conversion", TestPortConversionAsync),
             ("Endpoint formatting", TestEndpointFormattingAsync),
             ("Executable metadata hashes and caches", TestExecutableMetadataAsync),
@@ -55,6 +70,7 @@ internal static class Program
             ("Automatic firewall rule rolls back on cancellation", TestAutomaticRuleCancellationRollbackAsync),
             ("Automatic firewall rollback logs original and rollback failures", TestAutomaticRuleRollbackFailureLoggingAsync),
             ("Protocol frame roundtrip", TestProtocolRoundTripAsync),
+            ("File correlation IPC stays compatible and bounded", TestFileCorrelationProtocolAsync),
             ("Protocol rejects oversized message", TestOversizedMessageAsync),
             ("Protocol handles disconnect", TestProtocolDisconnectAsync),
             ("Event buffer preserves order and detects gaps and overflow", TestEventBufferAsync),
@@ -107,6 +123,172 @@ internal static class Program
         AssertEqual(new ProcessIdentity(42, startA), new ProcessIdentity(42, startA));
         return Task.CompletedTask;
     }
+
+    private static Task TestFileCorrelationWindowAsync()
+    {
+        var flow = SampleFlow();
+        var engine = NewCorrelationEngine();
+        AssertTrue(engine.Add(FileEvent(flow, 1, -2, FileActivityOperation.Read, "C:\\Synthetic\\report.pdf")), "Expected valid file event to be staged.");
+        var result = engine.Correlate(flow, flow.FirstSeen.AddSeconds(1));
+        AssertEqual(1, result.Count);
+        AssertEqual(CorrelationConfidence.High, result[0].Confidence);
+        AssertTrue(result[0].Reason.Contains("does not", StringComparison.OrdinalIgnoreCase) is false, "Reason should describe deterministic timing only.");
+        AssertTrue(result[0].DisplayPath.StartsWith("file-", StringComparison.Ordinal) && result[0].DisplayPath.EndsWith(".pdf", StringComparison.Ordinal), "Display identifier was not redacted.");
+        AssertTrue(!result[0].ProtectedFileIdentifier.Contains("Synthetic", StringComparison.OrdinalIgnoreCase), "Protected identifier leaked the path.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestFileCorrelationIdentityAsync()
+    {
+        var flow = SampleFlow();
+        var engine = NewCorrelationEngine();
+        var reused = FileEvent(flow, 1, -1, FileActivityOperation.Read, "C:\\Synthetic\\reuse.txt") with
+        {
+            ProcessIdentity = new ProcessIdentity(flow.ProcessIdentity!.Value.ProcessId, flow.ProcessIdentity.Value.StartTime.AddMinutes(1))
+        };
+        _ = engine.Add(reused);
+        _ = engine.Add(FileEvent(flow, 2, -31, FileActivityOperation.Read, "C:\\Synthetic\\early.txt"));
+        _ = engine.Add(FileEvent(flow, 3, 6, FileActivityOperation.Read, "C:\\Synthetic\\late.txt"));
+        AssertEqual(0, engine.Correlate(flow, flow.FirstSeen).Count);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestFileCorrelationOrderingAsync()
+    {
+        var flow = SampleFlow();
+        var engine = NewCorrelationEngine();
+        AssertTrue(engine.Add(FileEvent(flow, 3, 2, FileActivityOperation.Write, "C:\\Synthetic\\b.txt")), "First event was rejected.");
+        AssertTrue(engine.Add(FileEvent(flow, 1, -3, FileActivityOperation.Read, "C:\\Synthetic\\a.txt")), "Out-of-order event was rejected.");
+        AssertTrue(!engine.Add(FileEvent(flow, 2, -2.8, FileActivityOperation.Read, "C:\\Synthetic\\a.txt")), "Duplicate event was not deduplicated.");
+        var result = engine.Correlate(flow, flow.FirstSeen.AddSeconds(3));
+        AssertEqual(2, result.Count);
+        AssertTrue(result[0].TimeDeltaSeconds == 2, "Closest out-of-order event was not first.");
+        AssertTrue(result[1].TimeDeltaSeconds == -3, "Second out-of-order event was incorrect.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestFileCorrelationCapacityAsync()
+    {
+        var flow = SampleFlow();
+        var engine = NewCorrelationEngine(maxEvidence: 2);
+        for (var index = 0; index < 4; index++)
+        {
+            _ = engine.Add(FileEvent(flow, index, -index, FileActivityOperation.Read, $"C:\\Synthetic\\{index}.txt"));
+        }
+
+        AssertEqual(2, engine.Correlate(flow, flow.FirstSeen).Count);
+        var secondFlow = flow with { Id = "second-flow", FirstSeen = flow.FirstSeen.AddSeconds(1) };
+        AssertEqual(2, engine.Correlate(secondFlow, secondFlow.FirstSeen).Count);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestFileCorrelationRetentionAsync()
+    {
+        var flow = SampleFlow();
+        var engine = NewCorrelationEngine(maxBuffered: 2);
+        _ = engine.Add(FileEvent(flow, 1, -2, FileActivityOperation.Read, "C:\\Synthetic\\1.txt"));
+        _ = engine.Add(FileEvent(flow, 2, -1, FileActivityOperation.Read, "C:\\Synthetic\\2.txt"));
+        _ = engine.Add(FileEvent(flow, 3, 0, FileActivityOperation.Read, "C:\\Synthetic\\3.txt"));
+        AssertEqual(1L, engine.DroppedEvents);
+        AssertEqual(2, engine.Correlate(flow, flow.FirstSeen).Count);
+        AssertEqual(2, engine.Cleanup(flow.FirstSeen.AddMinutes(3)));
+        AssertEqual(0, engine.Correlate(flow, flow.FirstSeen.AddMinutes(3)).Count);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestFileCorrelationExclusionAsync()
+    {
+        var flow = SampleFlow();
+        var engine = NewCorrelationEngine(excludedRoots: ["C:\\ProgramData\\EgressGuard"]);
+        AssertTrue(!engine.Add(FileEvent(flow, 1, -1, FileActivityOperation.Write, "C:\\ProgramData\\EgressGuard\\egressguard.db-wal")), "Owned database event was accepted.");
+        AssertEqual(0, engine.Correlate(flow, flow.FirstSeen).Count);
+        return Task.CompletedTask;
+    }
+
+    private static async Task TestFileSensorStatesAsync()
+    {
+        await using var disabled = new DisabledFileActivitySensor();
+        await disabled.StartAsync(CancellationToken.None).ConfigureAwait(false);
+        AssertEqual(FileSensorState.Disabled, disabled.Status.State);
+
+        await using var sensor = new EtwFileActivitySensor(capacity: 1);
+        var path = Path.Combine(Path.GetTempPath(), "EgressGuard-Synthetic", "overflow.txt");
+        sensor.StageForTest(Environment.ProcessId, "test", path, FileActivityOperation.Read, DateTime.UtcNow);
+        sensor.StageForTest(Environment.ProcessId, "test", path + ".second", FileActivityOperation.Read, DateTime.UtcNow);
+        AssertEqual(FileSensorState.OverflowDegraded, sensor.Status.State);
+        AssertEqual(1L, sensor.Status.DroppedEvents);
+    }
+
+    private static async Task TestFileSensorDegradedServiceAsync()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "EgressGuard-DegradedSensor-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var database = new EgressGuardDatabase(Path.Combine(directory, "test.db"));
+            await database.InitializeAsync().ConfigureAwait(false);
+            await database.SetSettingAsync("enable_file_correlation", "true").ConfigureAwait(false);
+            var logger = new ListLogger<FlowCoordinator>();
+            var state = new ServiceState();
+            var coordinator = new FlowCoordinator(
+                new EmptyFlowSensor(), database, new RiskEngine(), new BaselineTracker(), new FakeFirewallRuleManager(),
+                state, new EventHub(), logger, new AccessDeniedFileSensor(), NewCorrelationEngine());
+            await coordinator.StartAsync(CancellationToken.None).ConfigureAwait(false);
+            await Task.Delay(150).ConfigureAwait(false);
+            await coordinator.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            AssertEqual(FileSensorState.Stopped, state.FileSensorStatus.State);
+            AssertTrue(!logger.Entries.Any(item => item.Level == LogLevel.Error), "Degraded file sensor produced a service error.");
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    private static async Task TestRealEtwFileIntegrationAsync()
+    {
+        if (!WindowsFirewallManager.IsAdministrator())
+        {
+            throw new TestFailureException("Real ETW file integration requires an Administrator token.");
+        }
+
+        var directory = Path.Combine(Path.GetTempPath(), $"EgressGuard-Etw-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, "synthetic.txt");
+        await using var sensor = new EtwFileActivitySensor();
+        try
+        {
+            await sensor.StartAsync(CancellationToken.None).ConfigureAwait(false);
+            AssertEqual(FileSensorState.Running, sensor.Status.State);
+            await File.WriteAllTextAsync(path, "synthetic non-sensitive fixture").ConfigureAwait(false);
+            _ = await File.ReadAllTextAsync(path).ConfigureAwait(false);
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            await foreach (var activity in sensor.ReadAllAsync(timeout.Token).ConfigureAwait(false))
+            {
+                if (activity.ProcessIdentity.ProcessId == Environment.ProcessId
+                    && string.Equals(activity.Path, path, StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+            }
+
+            throw new TestFailureException("ETW sensor did not observe the synthetic file before timeout.");
+        }
+        finally
+        {
+            using var stopTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            await sensor.StopAsync(stopTimeout.Token).ConfigureAwait(false);
+            if (File.Exists(path)) File.Delete(path);
+            if (Directory.Exists(directory)) Directory.Delete(directory);
+        }
+    }
+
+    private static FileCorrelationEngine NewCorrelationEngine(int maxBuffered = 32, int maxEvidence = 20, IEnumerable<string>? excludedRoots = null) =>
+        new(new FileCorrelationOptions(TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(5), TimeSpan.FromMinutes(2), TimeSpan.FromMilliseconds(750), maxBuffered, maxEvidence), excludedRoots, [1, 2, 3, 4]);
+
+    private static FileActivity FileEvent(NetworkFlow flow, long sequence, double secondsFromFlow, FileActivityOperation operation, string path) =>
+        new(sequence, flow.FirstSeen.AddSeconds(secondsFromFlow), flow.ProcessIdentity!.Value, flow.ProcessName, operation, path, Path.GetExtension(path), "Test", true);
 
     private static Task TestPortConversionAsync()
     {
@@ -626,6 +808,13 @@ internal static class Program
             var history = await database.GetRecentFlowsAsync(10).ConfigureAwait(false);
             AssertEqual(1, history.Count);
             AssertEqual(SampleFlow().Id, history[0].Id);
+            var correlation = NewCorrelationEngine().Correlate(sample, sample.FirstSeen);
+            AssertEqual(0, correlation.Count);
+            var engine = NewCorrelationEngine();
+            _ = engine.Add(FileEvent(sample, 10, -1, FileActivityOperation.Read, "C:\\Synthetic\\persist.txt"));
+            var selected = engine.Correlate(sample, sample.FirstSeen);
+            await database.SaveFileCorrelationsAsync(selected).ConfigureAwait(false);
+            AssertEqual(1, (await database.GetFileCorrelationsAsync(sample.Id, 20).ConfigureAwait(false)).Count);
             await database.SaveBaselineObservationsAsync([sample]).ConfigureAwait(false);
             AssertEqual(1, (await database.GetBaselinesAsync().ConfigureAwait(false)).Count);
             await database.ResetBaselineAsync(sample.Executable!.Sha256).ConfigureAwait(false);
@@ -638,6 +827,7 @@ internal static class Program
             await database.ApplyRetentionAsync(30).ConfigureAwait(false);
             await database.ClearHistoryAsync().ConfigureAwait(false);
             AssertEqual(0, (await database.GetRecentFlowsAsync(10).ConfigureAwait(false)).Count);
+            AssertEqual(0, (await database.GetFileCorrelationsAsync(sample.Id, 20).ConfigureAwait(false)).Count);
         }
         finally
         {
@@ -655,6 +845,29 @@ internal static class Program
         var result = await MessageFraming.ReadAsync(stream, CancellationToken.None).ConfigureAwait(false);
         AssertEqual(message.Type, result?.Type);
         AssertEqual(message.CorrelationId, result?.CorrelationId);
+    }
+
+    private static async Task TestFileCorrelationProtocolAsync()
+    {
+        var flow = SampleFlow();
+        var engine = NewCorrelationEngine(maxEvidence: 20);
+        for (var index = 0; index < 20; index++)
+        {
+            _ = engine.Add(FileEvent(flow, index, -index, FileActivityOperation.Read, $"C:\\Synthetic\\protocol-{index}.txt"));
+        }
+
+        var status = new FileSensorStatus(FileSensorState.Running, 0, null, DateTimeOffset.UtcNow);
+        var message = MessageEnvelope.Create(MessageTypes.GetFileCorrelations, new FileCorrelationsMessage(flow.Id, engine.Correlate(flow), status));
+        await using var stream = new MemoryStream();
+        await MessageFraming.WriteAsync(stream, message, CancellationToken.None).ConfigureAwait(false);
+        AssertTrue(stream.Length < ProtocolConstants.MaximumMessageBytes, "Bounded correlation response exceeded protocol framing limit.");
+        stream.Position = 0;
+        var result = await MessageFraming.ReadAsync(stream, CancellationToken.None).ConfigureAwait(false);
+        AssertEqual(20, result!.ReadPayload<FileCorrelationsMessage>().Correlations.Count);
+
+        var legacyJson = """{"mode":1,"isRunning":true,"activeFlowCount":0,"droppedEvents":0,"databasePath":"test.db","timestamp":"2026-01-01T00:00:00Z"}""";
+        var legacyStatus = System.Text.Json.JsonSerializer.Deserialize<ServiceStatusMessage>(legacyJson, JsonDefaults.Options);
+        AssertTrue(legacyStatus is not null && legacyStatus.FileSensor is null && !legacyStatus.FileCorrelationEnabled, "Legacy status payload was not backward compatible.");
     }
 
     private static async Task TestDatabaseLockAsync()
@@ -1366,6 +1579,34 @@ internal static class Program
     private sealed class EmptyFlowSensor : INetworkFlowSensor
     {
         public IReadOnlyList<NetworkFlow> Capture() => [];
+    }
+
+    private sealed class AccessDeniedFileSensor : IFileActivitySensor
+    {
+        private FileSensorStatus _status = new(FileSensorState.Stopped, 0, null, DateTimeOffset.UtcNow);
+        public FileSensorStatus Status => _status;
+        public event EventHandler<FileSensorStatus>? StatusChanged;
+        public Task StartAsync(CancellationToken cancellationToken)
+        {
+            _status = new FileSensorStatus(FileSensorState.AccessDenied, 0, "Controlled test.", DateTimeOffset.UtcNow);
+            StatusChanged?.Invoke(this, _status);
+            return Task.CompletedTask;
+        }
+
+        public Task StopAsync(CancellationToken cancellationToken)
+        {
+            _status = new FileSensorStatus(FileSensorState.Stopped, 0, null, DateTimeOffset.UtcNow);
+            StatusChanged?.Invoke(this, _status);
+            return Task.CompletedTask;
+        }
+
+        public async IAsyncEnumerable<FileActivity> ReadAllAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
+            yield break;
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private sealed class FakeFirewallRuleManager : IFirewallRuleManager

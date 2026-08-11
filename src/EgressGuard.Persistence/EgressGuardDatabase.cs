@@ -11,7 +11,7 @@ public sealed record PersistedBaseline(string ExecutableSha256, string Destinati
 
 public sealed class EgressGuardDatabase
 {
-    public const int CurrentSchemaVersion = 2;
+    public const int CurrentSchemaVersion = 3;
     private readonly string _connectionString;
 
     public EgressGuardDatabase(string databasePath)
@@ -51,6 +51,12 @@ public sealed class EgressGuardDatabase
         {
             await ApplyVersion2Async(connection, cancellationToken).ConfigureAwait(false);
             version = 2;
+        }
+
+        if (version < 3)
+        {
+            await ApplyVersion3Async(connection, cancellationToken).ConfigureAwait(false);
+            version = 3;
         }
 
         if (version > CurrentSchemaVersion)
@@ -222,7 +228,7 @@ public sealed class EgressGuardDatabase
 
         await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
         var command = connection.CreateCommand();
-        command.CommandText = "DELETE FROM network_flows WHERE last_seen < $cutoff;";
+        command.CommandText = "DELETE FROM file_correlations WHERE created_at < $cutoff; DELETE FROM network_flows WHERE last_seen < $cutoff;";
         command.Parameters.AddWithValue("$cutoff", DateTimeOffset.UtcNow.AddDays(-retentionDays).ToString("O", CultureInfo.InvariantCulture));
         _ = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
@@ -231,8 +237,69 @@ public sealed class EgressGuardDatabase
     {
         await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-        await ExecuteAsync(connection, transaction, "DELETE FROM alerts; DELETE FROM network_flows; DELETE FROM processes;", cancellationToken).ConfigureAwait(false);
+        await ExecuteAsync(connection, transaction, "DELETE FROM file_correlations; DELETE FROM alerts; DELETE FROM network_flows; DELETE FROM processes;", cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task SaveFileCorrelationsAsync(IEnumerable<FileCorrelation> correlations, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(correlations);
+        await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        foreach (var item in correlations.Take(100))
+        {
+            var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO file_correlations(id,flow_id,pid,process_start_ticks,process_name,file_operation,protected_file_id,display_path,extension,activity_timestamp,time_delta_seconds,confidence,reason,created_at)
+                VALUES($id,$flow,$pid,$start,$process,$operation,$protected,$display,$extension,$activity,$delta,$confidence,$reason,$created)
+                ON CONFLICT(id) DO NOTHING;
+                """;
+            Add(command, "$id", item.Id.ToString("D"));
+            Add(command, "$flow", item.FlowId);
+            Add(command, "$pid", item.ProcessIdentity.ProcessId);
+            Add(command, "$start", item.ProcessIdentity.StartTime.UtcTicks);
+            Add(command, "$process", item.ProcessName);
+            Add(command, "$operation", item.Operation.ToString());
+            Add(command, "$protected", item.ProtectedFileIdentifier);
+            Add(command, "$display", item.DisplayPath);
+            Add(command, "$extension", item.Extension);
+            Add(command, "$activity", item.ActivityTimestampUtc.ToString("O", CultureInfo.InvariantCulture));
+            Add(command, "$delta", item.TimeDeltaSeconds);
+            Add(command, "$confidence", item.Confidence.ToString());
+            Add(command, "$reason", item.Reason);
+            Add(command, "$created", item.CreatedAtUtc.ToString("O", CultureInfo.InvariantCulture));
+            _ = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<IReadOnlyList<FileCorrelation>> GetFileCorrelationsAsync(string flowId, int limit, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
+        if (limit is < 1 or > 100) throw new ArgumentOutOfRangeException(nameof(limit));
+        await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT id,flow_id,pid,process_start_ticks,process_name,file_operation,protected_file_id,display_path,extension,activity_timestamp,time_delta_seconds,confidence,reason,created_at
+            FROM file_correlations WHERE flow_id=$flow ORDER BY ABS(time_delta_seconds),activity_timestamp LIMIT $limit;
+            """;
+        Add(command, "$flow", flowId);
+        Add(command, "$limit", limit);
+        var result = new List<FileCorrelation>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            result.Add(new FileCorrelation(
+                Guid.Parse(reader.GetString(0)), reader.GetString(1),
+                new ProcessIdentity(reader.GetInt32(2), new DateTimeOffset(reader.GetInt64(3), TimeSpan.Zero)),
+                reader.GetString(4), Enum.Parse<FileActivityOperation>(reader.GetString(5)), reader.GetString(6), reader.GetString(7), reader.GetString(8),
+                DateTimeOffset.Parse(reader.GetString(9), CultureInfo.InvariantCulture), reader.GetDouble(10),
+                Enum.Parse<CorrelationConfidence>(reader.GetString(11)), reader.GetString(12), DateTimeOffset.Parse(reader.GetString(13), CultureInfo.InvariantCulture)));
+        }
+
+        return result;
     }
 
     public async Task<string?> GetSettingAsync(string key, CancellationToken cancellationToken = default)
@@ -359,6 +426,24 @@ public sealed class EgressGuardDatabase
             transaction,
             "ALTER TABLE executables ADD COLUMN signature_status TEXT NOT NULL DEFAULT 'Unknown'; INSERT INTO schema_versions(version,applied_at) VALUES(2,strftime('%Y-%m-%dT%H:%M:%fZ','now'));",
             cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task ApplyVersion3Async(SqliteConnection connection, CancellationToken cancellationToken)
+    {
+        await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        const string sql = """
+            CREATE TABLE IF NOT EXISTS file_correlations(
+                id TEXT PRIMARY KEY, flow_id TEXT NOT NULL, pid INTEGER NOT NULL, process_start_ticks INTEGER NOT NULL,
+                process_name TEXT NOT NULL, file_operation TEXT NOT NULL, protected_file_id TEXT NOT NULL,
+                display_path TEXT NOT NULL, extension TEXT NOT NULL, activity_timestamp TEXT NOT NULL,
+                time_delta_seconds REAL NOT NULL, confidence TEXT NOT NULL, reason TEXT NOT NULL, created_at TEXT NOT NULL,
+                FOREIGN KEY(flow_id) REFERENCES network_flows(id) ON DELETE CASCADE);
+            CREATE INDEX IF NOT EXISTS ix_file_correlations_flow_time ON file_correlations(flow_id,activity_timestamp);
+            CREATE INDEX IF NOT EXISTS ix_file_correlations_created ON file_correlations(created_at);
+            INSERT INTO schema_versions(version,applied_at) VALUES(3,strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+            """;
+        await ExecuteAsync(connection, transaction, sql, cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
 

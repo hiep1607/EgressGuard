@@ -7,8 +7,10 @@ namespace EgressGuard.Service;
 public sealed class ServiceState
 {
     private readonly ConcurrentDictionary<string, NetworkFlow> _flows = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, IReadOnlyList<FileCorrelation>> _fileCorrelations = new(StringComparer.Ordinal);
     private long _droppedEvents;
     private int _mode = (int)ProtectionMode.Learning;
+    private FileSensorStatus _fileSensorStatus = new(FileSensorState.Disabled, 0, "File correlation is disabled by configuration.", DateTimeOffset.UtcNow);
 
     public ProtectionMode Mode
     {
@@ -18,8 +20,17 @@ public sealed class ServiceState
 
     public long DroppedEvents => Interlocked.Read(ref _droppedEvents);
     public int ActiveFlowCount => _flows.Count;
+    public FileSensorStatus FileSensorStatus => Volatile.Read(ref _fileSensorStatus);
+    public bool FileCorrelationEnabled { get; set; }
 
     public IReadOnlyList<NetworkFlow> Snapshot() => _flows.Values.OrderByDescending(flow => flow.LastSeen).ToArray();
+    public IReadOnlyList<FileCorrelation> FileCorrelations(string flowId) =>
+        _fileCorrelations.TryGetValue(flowId, out var value) ? value : [];
+
+    public void SetFileCorrelations(string flowId, IReadOnlyList<FileCorrelation> correlations) =>
+        _fileCorrelations[flowId] = correlations;
+
+    public void SetFileSensorStatus(FileSensorStatus status) => Volatile.Write(ref _fileSensorStatus, status);
 
     public IReadOnlyList<FlowStateChange> ReplaceSnapshot(IEnumerable<NetworkFlow> flows)
     {
@@ -49,6 +60,7 @@ public sealed class ServiceState
         foreach (var stale in _flows.Keys.Except(current.Keys, StringComparer.Ordinal).ToArray())
         {
             _flows.TryRemove(stale, out _);
+            _fileCorrelations.TryRemove(stale, out _);
             changes.Add(new FlowStateChange(StreamEventKind.FlowRemoved, null, stale));
         }
 

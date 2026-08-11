@@ -25,6 +25,7 @@ public static class MessageTypes
     public const string GetActiveFlows = "GetActiveFlows";
     public const string GetRules = "GetRules";
     public const string GetAlerts = "GetAlerts";
+    public const string GetFileCorrelations = "GetFileCorrelations";
     public const string SubscribeEvents = "SubscribeEvents";
     public const string CreateRule = "CreateRule";
     public const string DeleteRule = "DeleteRule";
@@ -53,10 +54,20 @@ public sealed record MessageEnvelope(
 }
 
 public sealed record HandshakeMessage(string ClientName, int MinimumVersion, int MaximumVersion);
-public sealed record ServiceStatusMessage(ProtectionMode Mode, bool IsRunning, int ActiveFlowCount, long DroppedEvents, string DatabasePath, DateTimeOffset Timestamp);
+public sealed record ServiceStatusMessage(
+    ProtectionMode Mode,
+    bool IsRunning,
+    int ActiveFlowCount,
+    long DroppedEvents,
+    string DatabasePath,
+    DateTimeOffset Timestamp,
+    FileSensorStatus? FileSensor = null,
+    bool FileCorrelationEnabled = false);
 public sealed record ActiveFlowsMessage(IReadOnlyList<NetworkFlow> Flows, long Sequence = 0);
 public sealed record RulesMessage(IReadOnlyList<FirewallRule> Rules);
 public sealed record AlertsMessage(IReadOnlyList<SecurityAlert> Alerts);
+public sealed record GetFileCorrelationsMessage(string FlowId, int Limit = 20);
+public sealed record FileCorrelationsMessage(string FlowId, IReadOnlyList<FileCorrelation> Correlations, FileSensorStatus SensorStatus);
 public sealed record FlowObservedMessage(NetworkFlow Flow);
 public sealed record AlertRaisedMessage(SecurityAlert Alert);
 public sealed record CreateRuleMessage(FirewallRule Rule);

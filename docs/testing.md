@@ -7,6 +7,7 @@ dotnet build EgressGuard.sln -c Release
 dotnet run --project tests\EgressGuard.Tests\EgressGuard.Tests.csproj -c Release --no-build
 dotnet run --project tests\EgressGuard.Tests\EgressGuard.Tests.csproj -c Release --no-build -- --test "Service pipe reconnect and event subscription"
 dotnet run --project tests\EgressGuard.Tests\EgressGuard.Tests.csproj -c Release --no-build -- --firewall-cancellation-integration
+dotnet run --project tests\EgressGuard.Tests\EgressGuard.Tests.csproj -c Release --no-build -- --etw-file-integration
 dotnet format EgressGuard.sln --verify-no-changes --no-restore
 .\tools\run-performance-test.ps1 -UiProcessId <pid> -ServiceProcessId <pid> -DurationSeconds 30
 .\tools\run-soak-test.ps1 -DurationMinutes 30
@@ -16,7 +17,9 @@ The custom runner is retained: it has deterministic Windows integration setup an
 
 ## Automated coverage
 
-The 35-test default suite covers process identity/churn, TCP IPv4/IPv6, UDP owner PID, flow sensing, executable cache invalidation, Authenticode status/HRESULT mapping, embedded and catalog signatures, tampered and missing files, firewall path/hash guards, risk/policy/baseline, SQLite schema/persistence/locking, graceful service cancellation, automatic-rule persistence rollback and rollback-failure logging, PowerShell pre-cancellation, owned process-tree cancellation/timeout cleanup, exact-rule reconciliation, complete firewall-filter matching and mismatch rejection, concurrent duplicate creation, framing/oversize/disconnect, event ordering/gap/overflow/slow client, flow add/update/remove, the protected Named Pipe ACL and a real service Named Pipe reconnect/event subscription. The ACL regression combines every explicit allow rule for the `INTERACTIVE` SID and requires exactly `ReadWrite | Synchronize`, rejecting any additional ownership, permission-changing, deletion, instance-creation or system-security rights.
+The 44-test default suite retains all 35 prior regressions and adds file-correlation coverage for exact process identity/window matching, PID reuse, out-of-order delivery, dedupe, multiple files/flows, evidence caps, bounded overflow/drop counters, retention, self-storage exclusion, disabled/AccessDenied lifecycle safety, SQLite schema v3/Clear history, and bounded backward-compatible IPC. The ACL regression still combines every explicit allow rule for the `INTERACTIVE` SID and requires exactly `ReadWrite | Synchronize`, rejecting any additional ownership, permission-changing, deletion, instance-creation or system-security rights.
+
+The real ETW integration command is opt-in and requires Administrator. It creates and reads only a synthetic temporary file, verifies that the process-owned ETW session reports it, then performs bounded session/file cleanup. Default CI uses fake sensors and never changes system auditing or policy.
 
 The real-service IPC test assigns a unique Named Pipe name to each service process through `EGRESSGUARD_PIPE_NAME`, passes that name explicitly to both clients, and waits for the server's subscription acknowledgement before creating the controlled TCP flow. This prevents an installed service from competing for a shared pipe and removes the fixed-delay readiness race. The default production pipe remains `EgressGuard.Service.v1` when no override is supplied.
 

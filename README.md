@@ -4,13 +4,14 @@
 
 EgressGuard is a Windows, local-first outbound connection monitor. It maps TCP/UDP endpoints to process identity, stores local history in SQLite, evaluates explainable risk, and manages only Windows Firewall rules carrying the EgressGuard ownership marker.
 
-EgressGuard does **not** claim to prevent 100% of data exfiltration. The current prototype has no ETW file correlation, packet payload capture, TLS interception, driver, cloud telemetry, process killing, or malware execution. See the [threat model](docs/threat-model.md) and [acceptance report](docs/acceptance-report.md) before evaluating its security properties.
+EgressGuard does **not** claim to prevent 100% of data exfiltration. Phase 4 adds optional, observe-only ETW file-to-network temporal correlation; it does not prove upload and does not capture file or packet contents. The prototype has no TLS interception, driver, cloud telemetry, process killing, or malware execution. See the [threat model](docs/threat-model.md), [Phase 4 report](docs/phase-4-report.md), and [acceptance report](docs/acceptance-report.md) before evaluating its security properties.
 
 ## Architecture
 
 ```text
 Windows IP Helper + process metadata
-  → Service sensor / risk / policy
+Windows kernel File I/O ETW (optional, observe-only)
+  → bounded service sensors / deterministic temporal correlation / risk / policy
   ├─→ SQLite persistence
   └─→ bounded sequenced Named Pipe events
        → WPF UI batched incremental updates
@@ -62,6 +63,12 @@ dotnet run --project tools\EgressGuard.Simulator\EgressGuard.Simulator.csproj -c
 
 Closing the UI does not stop the service. The Simulator generates bytes in memory and never reads user documents or credentials.
 
+File correlation is disabled by default. Set `EGRESSGUARD_ENABLE_FILE_CORRELATION=true` before service startup for an authorized development test. The ETW provider may require elevation; failure degrades only this optional sensor while network monitoring continues. The safe fixture reads a generated temporary file, opens a loopback connection without transmitting file bytes, and cleans up:
+
+```powershell
+dotnet run --project tools\EgressGuard.Simulator\EgressGuard.Simulator.csproj -c Release -- --file-correlation-test --port 5050 --hold-seconds 5
+```
+
 ## Administrator operations
 
 Service installation and real firewall acceptance are separate, opt-in Administrator tasks:
@@ -77,7 +84,7 @@ The soak harness creates an isolated run/database directory for every invocation
 
 ## Current limitations
 
-- Phases 1–3 have verified final SCM restart/reconnect, a 30-minute soak, exact-artifact reboot acceptance, DPI 100%/150% QA and direct tray interaction. Production signing/Application Control approval remains blocked, so this prototype is not a production release. Do not begin Phase 4/ETW until the acceptance PR is independently approved and merged.
+- Phases 1–3 have verified final SCM restart/reconnect, a 30-minute soak, exact-artifact reboot acceptance, DPI 100%/150% QA and direct tray interaction. Phase 4 is under review and real elevated ETW/UI/performance acceptance is not yet verified. Production signing/Application Control approval remains blocked, so this prototype is not a production release.
 - Windows Firewall enforcement is path-based; EgressGuard verifies SHA-256 before rule creation and in policy matching, but executable replacement requires identity refresh and rule recreation.
 - UDP owner tables do not expose a remote peer.
 - No release, installer, signing pipeline, or production support commitment exists yet.

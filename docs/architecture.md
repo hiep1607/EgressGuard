@@ -17,6 +17,9 @@ UI never opens SQLite or changes Windows Firewall directly. Mutations cross the 
 ```text
 IP Helper + process snapshot
   → WindowsFlowSensor
+Windows kernel File I/O ETW (optional)
+  → non-blocking bounded staging (4,096) → exact process identity
+  → FileCorrelationEngine (-30/+5 seconds; max 20 evidence rows)
   → FlowCoordinator / RiskEngine / PolicyEngine
   ├─→ bounded persistence queue (2,048) → SQLite
   └─→ ServiceState transitions
@@ -37,7 +40,13 @@ Event kinds are `FlowAdded`, `FlowUpdated`, `FlowRemoved`, `AlertRaised`, `Servi
 - TCP flow: process identity, protocol/IP version, local and remote endpoints.
 - UDP flow: process identity, protocol/IP version and local endpoint; Windows owner tables do not expose a remote peer.
 - Executable cache: normalized path, file size and last-write time; the cached record includes SHA-256.
-- SQLite schema version 2 adds `signature_status`. WAL, foreign keys, parameterized SQL, transactions, busy timeout and retention remain enabled.
+- SQLite schema version 3 adds selected, redacted `file_correlations`; raw ETW events are never persisted. WAL, foreign keys, parameterized SQL, transactions, busy timeout and retention remain enabled, and Clear history removes correlation evidence.
+
+## Phase 4 file correlation
+
+`IFileActivitySensor` is a Core boundary. `EtwFileActivitySensor` is the Windows implementation backed by Microsoft's TraceEvent library and kernel File I/O keywords. The callback performs only validation/exclusion and `TryWrite`; process start-time lookup occurs on the channel consumer. Session names are `EgressGuard.FileActivity.v1-{PID}` and the sensor stops only its own instance. Permission/provider/overflow failures become explicit states and do not stop network monitoring.
+
+The pure engine matches exact `(PID, ProcessStartTime)` and a configurable temporal window, handles out-of-order events, deduplicates short repeats, expires old events, and enforces hard buffer/evidence caps. Stored paths are salted SHA-256 identifiers with redacted display identifiers and extensions. Correlation is descriptive evidence only: it never changes risk, policy, or firewall state and does not prove file transmission.
 
 ## Authenticode
 

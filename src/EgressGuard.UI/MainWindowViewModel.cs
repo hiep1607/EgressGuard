@@ -34,6 +34,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     private int _refreshIntervalMilliseconds = 250;
     private int _retentionDays = 30;
     private string _databasePath = "Unavailable until connected";
+    private string _fileSensorStatus = "File correlation status unavailable";
+    private bool _fileCorrelationEnabled;
 
     public MainWindowViewModel()
     {
@@ -56,6 +58,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     public ObservableCollection<FlowRow> Flows { get; } = [];
     public ObservableCollection<FirewallRule> Rules { get; } = [];
     public ObservableCollection<SecurityAlert> Alerts { get; } = [];
+    public ObservableCollection<FileCorrelation> FileCorrelations { get; } = [];
     public ICollectionView FlowView { get; }
     public IReadOnlyList<string> ProtocolFilters { get; } = ["All protocols", "TCP", "UDP"];
     public IReadOnlyList<string> IpFilters { get; } = ["All IP versions", "IPv4", "IPv6"];
@@ -77,11 +80,26 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     public string ServiceStatus { get => _serviceStatus; private set => Set(ref _serviceStatus, value); }
     public string LastOperation { get => _lastOperation; private set => Set(ref _lastOperation, value); }
     public string DatabasePath { get => _databasePath; private set => Set(ref _databasePath, value); }
+    public string FileSensorStatus { get => _fileSensorStatus; private set => Set(ref _fileSensorStatus, value); }
+    public bool FileCorrelationEnabled { get => _fileCorrelationEnabled; private set => Set(ref _fileCorrelationEnabled, value); }
+    public string FileCorrelationEmptyState => FileCorrelations.Count == 0
+        ? FileCorrelationEnabled ? "No related file activity was observed for this connection." : "File correlation is disabled."
+        : string.Empty;
     public bool NotificationsEnabled { get; set; } = true;
     public int RetentionDays { get => _retentionDays; set => Set(ref _retentionDays, Math.Clamp(value, 1, 3650)); }
     public int RefreshIntervalMilliseconds { get => _refreshIntervalMilliseconds; set { if (Set(ref _refreshIntervalMilliseconds, Math.Clamp(value, 100, 1000))) _batchTimer.Interval = TimeSpan.FromMilliseconds(_refreshIntervalMilliseconds); } }
     public ProtectionMode ProtectionMode { get => _protectionMode; set => Set(ref _protectionMode, value); }
-    public FlowRow? SelectedFlow { get => _selectedFlow; set => Set(ref _selectedFlow, value); }
+    public FlowRow? SelectedFlow
+    {
+        get => _selectedFlow;
+        set
+        {
+            if (Set(ref _selectedFlow, value))
+            {
+                _ = RefreshFileCorrelationsAsync(value);
+            }
+        }
+    }
     public FirewallRule? SelectedRule { get => _selectedRule; set => Set(ref _selectedRule, value); }
     public SecurityAlert? SelectedAlert
     {
@@ -128,6 +146,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
             Interlocked.Exchange(ref _resyncRequested, 0);
             ProtectionMode = status.Mode;
             DatabasePath = status.DatabasePath;
+            UpdateFileSensor(status);
             ServiceStatus = $"Service online · {status.Mode} · dropped {status.DroppedEvents}";
             NotifyCounts();
         }
@@ -250,6 +269,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
                 ProtectionMode = streamEvent.Status.Mode;
                 DatabasePath = streamEvent.Status.DatabasePath;
                 ServiceStatus = $"Service online · {streamEvent.Status.Mode} · dropped {streamEvent.Status.DroppedEvents}";
+                UpdateFileSensor(streamEvent.Status);
                 break;
             case StreamEventKind.ResyncRequired:
                 Interlocked.Exchange(ref _resyncRequested, 1);
@@ -274,6 +294,47 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
             LastOperation = "Connected to EgressGuard Service.";
         }
     }
+
+    private async Task RefreshFileCorrelationsAsync(FlowRow? selected)
+    {
+        try
+        {
+            if (selected is null)
+            {
+                Replace(FileCorrelations, []);
+                OnPropertyChanged(nameof(FileCorrelationEmptyState));
+                return;
+            }
+
+            await EnsureConnectedAsync().ConfigureAwait(true);
+            var response = await _client.SendAsync(
+                MessageEnvelope.Create(MessageTypes.GetFileCorrelations, new GetFileCorrelationsMessage(selected.Flow.Id, 20)),
+                TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(true);
+            var payload = response.ReadPayload<FileCorrelationsMessage>();
+            if (SelectedFlow?.Flow.Id != selected.Flow.Id) return;
+            Replace(FileCorrelations, payload.Correlations);
+            FileSensorStatus = FormatFileSensor(payload.SensorStatus);
+            OnPropertyChanged(nameof(FileCorrelationEmptyState));
+        }
+        catch (Exception exception) when (exception is IOException or TimeoutException or OperationCanceledException or InvalidDataException)
+        {
+            Replace(FileCorrelations, []);
+            FileSensorStatus = "File correlation unavailable";
+            LastOperation = exception.Message;
+            OnPropertyChanged(nameof(FileCorrelationEmptyState));
+        }
+    }
+
+    private void UpdateFileSensor(ServiceStatusMessage status)
+    {
+        FileCorrelationEnabled = status.FileCorrelationEnabled;
+        FileSensorStatus = status.FileSensor is null ? "File correlation status unavailable" : FormatFileSensor(status.FileSensor);
+        OnPropertyChanged(nameof(FileCorrelationEmptyState));
+    }
+
+    private static string FormatFileSensor(FileSensorStatus status) => status.Detail is null
+        ? $"File sensor: {status.State} · dropped {status.DroppedEvents}"
+        : $"File sensor: {status.State} · dropped {status.DroppedEvents} · {status.Detail}";
 
     private async Task CreateRuleAsync(FirewallAction action)
     {
