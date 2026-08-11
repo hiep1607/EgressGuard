@@ -156,7 +156,7 @@ public sealed partial class PipeServer : BackgroundService
             case MessageTypes.GetStatus:
                 return MessageEnvelope.Create(
                     MessageTypes.ServiceStatusChanged,
-                    new ServiceStatusMessage(_state.Mode, true, _state.ActiveFlowCount, _state.DroppedEvents, _database.DatabasePath, DateTimeOffset.UtcNow),
+                    new ServiceStatusMessage(_state.Mode, true, _state.ActiveFlowCount, _state.DroppedEvents, _database.DatabasePath, DateTimeOffset.UtcNow, _state.FileSensorStatus, _state.FileCorrelationEnabled),
                     request.CorrelationId);
             case MessageTypes.GetActiveFlows:
                 return MessageEnvelope.Create(MessageTypes.GetActiveFlows, new ActiveFlowsMessage(_state.Snapshot(), _eventHub.CurrentSequence), request.CorrelationId);
@@ -164,6 +164,23 @@ public sealed partial class PipeServer : BackgroundService
                 return MessageEnvelope.Create(MessageTypes.GetRules, new RulesMessage(await _database.GetRulesAsync(cancellationToken).ConfigureAwait(false)), request.CorrelationId);
             case MessageTypes.GetAlerts:
                 return MessageEnvelope.Create(MessageTypes.GetAlerts, new AlertsMessage(await _database.GetRecentAlertsAsync(200, cancellationToken).ConfigureAwait(false)), request.CorrelationId);
+            case MessageTypes.GetFileCorrelations:
+                var correlationRequest = request.ReadPayload<GetFileCorrelationsMessage>();
+                if (correlationRequest.Limit is < 1 or > 100)
+                {
+                    throw new InvalidDataException("File correlation limit must be between 1 and 100.");
+                }
+
+                var correlations = _state.FileCorrelations(correlationRequest.FlowId);
+                if (correlations.Count == 0)
+                {
+                    correlations = await _database.GetFileCorrelationsAsync(correlationRequest.FlowId, correlationRequest.Limit, cancellationToken).ConfigureAwait(false);
+                }
+
+                return MessageEnvelope.Create(
+                    MessageTypes.GetFileCorrelations,
+                    new FileCorrelationsMessage(correlationRequest.FlowId, correlations.Take(correlationRequest.Limit).ToArray(), _state.FileSensorStatus),
+                    request.CorrelationId);
             case MessageTypes.CreateRule:
                 var rule = request.ReadPayload<CreateRuleMessage>().Rule;
                 var result = await _firewallRuleCreateCoordinator.ApplyAsync(rule, cancellationToken, failOpen: false).ConfigureAwait(false);

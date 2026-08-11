@@ -21,9 +21,13 @@ public sealed partial class FlowCoordinator : BackgroundService
     private readonly EventHub _eventHub;
     private readonly ILogger<FlowCoordinator> _logger;
     private readonly FirewallRuleCreateCoordinator _firewallRuleCreateCoordinator;
-    private readonly Channel<NetworkFlow> _persistenceQueue;
+    private readonly Channel<PersistenceItem> _persistenceQueue;
+    private readonly IFileActivitySensor _fileSensor;
+    private readonly FileCorrelationEngine _fileCorrelationEngine;
     private readonly ConcurrentDictionary<string, byte> _seenExecutables = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _seenDestinations = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<int, ProcessIdentity> _fileProcessInterests = [];
+    private readonly object _fileProcessInterestSync = new();
 
     public FlowCoordinator(
         INetworkFlowSensor sensor,
@@ -33,7 +37,9 @@ public sealed partial class FlowCoordinator : BackgroundService
         IFirewallRuleManager firewall,
         ServiceState state,
         EventHub eventHub,
-        ILogger<FlowCoordinator> logger)
+        ILogger<FlowCoordinator> logger,
+        IFileActivitySensor? fileSensor = null,
+        FileCorrelationEngine? fileCorrelationEngine = null)
     {
         _sensor = sensor;
         _database = database;
@@ -43,12 +49,15 @@ public sealed partial class FlowCoordinator : BackgroundService
         _state = state;
         _eventHub = eventHub;
         _logger = logger;
+        _fileSensor = fileSensor ?? new DisabledFileActivitySensor();
+        _fileCorrelationEngine = fileCorrelationEngine ?? new FileCorrelationEngine();
+        _fileSensor.StatusChanged += OnFileSensorStatusChanged;
         _firewallRuleCreateCoordinator = new FirewallRuleCreateCoordinator(
             _firewall,
             _database.SaveRuleAsync,
             logger,
             _database.GetRulesAsync);
-        _persistenceQueue = Channel.CreateBounded<NetworkFlow>(new BoundedChannelOptions(2048)
+        _persistenceQueue = Channel.CreateBounded<PersistenceItem>(new BoundedChannelOptions(2048)
         {
             FullMode = BoundedChannelFullMode.Wait,
             SingleReader = true,
@@ -86,6 +95,21 @@ public sealed partial class FlowCoordinator : BackgroundService
             return;
         }
 
+        var enabledSetting = await _database.GetSettingAsync("enable_file_correlation", stoppingToken).ConfigureAwait(false);
+        var configured = enabledSetting ?? Environment.GetEnvironmentVariable("EGRESSGUARD_ENABLE_FILE_CORRELATION") ?? "false";
+        _state.FileCorrelationEnabled = bool.TryParse(configured, out var enabled) && enabled;
+        Task filePumpTask = Task.CompletedTask;
+        if (_state.FileCorrelationEnabled)
+        {
+            await _fileSensor.StartAsync(stoppingToken).ConfigureAwait(false);
+            _state.SetFileSensorStatus(_fileSensor.Status);
+            filePumpTask = PumpFileActivityAsync(stoppingToken);
+        }
+        else
+        {
+            _state.SetFileSensorStatus(new FileSensorStatus(FileSensorState.Disabled, 0, "File correlation is disabled by configuration.", DateTimeOffset.UtcNow));
+        }
+
         var persistenceTask = PersistAsync(stoppingToken);
         try
         {
@@ -103,6 +127,20 @@ public sealed partial class FlowCoordinator : BackgroundService
         {
             _persistenceQueue.Writer.TryComplete();
             await persistenceTask.ConfigureAwait(false);
+            if (_state.FileCorrelationEnabled)
+            {
+                using var stopTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                try
+                {
+                    await _fileSensor.StopAsync(stopTimeout.Token).ConfigureAwait(false);
+                }
+                catch (Exception exception) when (exception is OperationCanceledException or TimeoutException)
+                {
+                    LogFileSensorShutdownFailed(_logger, exception);
+                }
+            }
+
+            await filePumpTask.ConfigureAwait(false);
         }
     }
 
@@ -117,6 +155,48 @@ public sealed partial class FlowCoordinator : BackgroundService
         {
             LogSensorFailed(_logger, exception);
             return;
+        }
+
+        if (_state.FileCorrelationEnabled && _fileSensor is IFileActivityInterestSink interestSink)
+        {
+            var currentInterests = captured
+                .Where(flow => flow.ProcessIdentity is not null)
+                .Select(flow => new FileActivityProcessInterest(flow.ProcessIdentity!.Value, flow.ProcessName))
+                .GroupBy(item => item.Identity.ProcessId)
+                .Select(group => group.First())
+                .Take(4096)
+                .ToArray();
+            lock (_fileProcessInterestSync)
+            {
+                var currentByPid = currentInterests.ToDictionary(item => item.Identity.ProcessId, item => item.Identity);
+                foreach (var previous in _fileProcessInterests.ToArray())
+                {
+                    if (!currentByPid.TryGetValue(previous.Key, out var current) || current != previous.Value)
+                    {
+                        interestSink.ObserveProcessStop(previous.Value, DateTimeOffset.UtcNow);
+                        _fileProcessInterests.Remove(previous.Key);
+                    }
+                }
+
+                foreach (var interest in currentInterests)
+                {
+                    _fileProcessInterests[interest.Identity.ProcessId] = interest.Identity;
+                }
+
+                while (_fileProcessInterests.Count > 4096)
+                {
+                    var oldest = _fileProcessInterests.Keys.First();
+                    _fileProcessInterests.Remove(oldest);
+                }
+            }
+
+            var promoted = interestSink.UpdateProcessInterests(currentInterests);
+            // Pre-flow raw events are promoted synchronously from the sensor so
+            // Correlate below cannot race the asynchronous file pump.
+            foreach (var activity in promoted)
+            {
+                _ = _fileCorrelationEngine.Add(activity);
+            }
         }
 
         var rules = await SafeGetRulesAsync(cancellationToken).ConfigureAwait(false);
@@ -134,7 +214,11 @@ public sealed partial class FlowCoordinator : BackgroundService
                 _baseline.Observe(finalFlow, finalFlow.IsBlocked, clearlyDangerous: finalFlow.Risk?.Score >= 80);
             }
 
-            if (!_persistenceQueue.Writer.TryWrite(finalFlow))
+            var correlations = _state.FileCorrelationEnabled
+                ? _fileCorrelationEngine.Correlate(finalFlow)
+                : [];
+            _state.SetFileCorrelations(finalFlow.Id, correlations);
+            if (!_persistenceQueue.Writer.TryWrite(new PersistenceItem(finalFlow, correlations)))
             {
                 _state.RecordDroppedEvent();
             }
@@ -161,7 +245,9 @@ public sealed partial class FlowCoordinator : BackgroundService
             _state.ActiveFlowCount,
             _state.DroppedEvents,
             _database.DatabasePath,
-            DateTimeOffset.UtcNow));
+            DateTimeOffset.UtcNow,
+            _state.FileSensorStatus,
+            _state.FileCorrelationEnabled));
     }
 
     private NetworkFlow Assess(NetworkFlow flow, IReadOnlyList<FirewallRule> rules)
@@ -236,26 +322,28 @@ public sealed partial class FlowCoordinator : BackgroundService
 
     private async Task PersistAsync(CancellationToken cancellationToken)
     {
-        var batch = new List<NetworkFlow>(128);
+        var batch = new List<PersistenceItem>(128);
         try
         {
             while (await _persistenceQueue.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 batch.Clear();
-                while (batch.Count < 128 && _persistenceQueue.Reader.TryRead(out var flow))
+                while (batch.Count < 128 && _persistenceQueue.Reader.TryRead(out var item))
                 {
-                    batch.Add(flow);
+                    batch.Add(item);
                 }
 
                 if (batch.Count > 0)
                 {
                     try
                     {
-                        await _database.SaveFlowsAsync(batch, cancellationToken).ConfigureAwait(false);
-                        await _database.SaveAlertsAsync(batch, cancellationToken).ConfigureAwait(false);
+                        var flows = batch.Select(item => item.Flow).ToArray();
+                        await _database.SaveFlowsAsync(flows, cancellationToken).ConfigureAwait(false);
+                        await _database.SaveAlertsAsync(flows, cancellationToken).ConfigureAwait(false);
+                        await _database.SaveFileCorrelationsAsync(batch.SelectMany(item => item.Correlations), cancellationToken).ConfigureAwait(false);
                         if (_state.Mode == ProtectionMode.Learning)
                         {
-                            await _database.SaveBaselineObservationsAsync(batch, cancellationToken).ConfigureAwait(false);
+                            await _database.SaveBaselineObservationsAsync(flows, cancellationToken).ConfigureAwait(false);
                         }
                     }
                     catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -273,6 +361,27 @@ public sealed partial class FlowCoordinator : BackgroundService
         {
         }
     }
+
+    private async Task PumpFileActivityAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await foreach (var activity in _fileSensor.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            {
+                _ = _fileCorrelationEngine.Add(activity);
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            _state.SetFileSensorStatus(new FileSensorStatus(FileSensorState.Failed, _fileSensor.Status.DroppedEvents, "File activity processing failed.", DateTimeOffset.UtcNow));
+            LogFileSensorFailed(_logger, exception);
+        }
+    }
+
+    private void OnFileSensorStatusChanged(object? sender, FileSensorStatus status) => _state.SetFileSensorStatus(status);
 
     private static bool IsSystemProtected(NetworkFlow flow) =>
         flow.Executable is not null && OwnedFirewallRuleManager.IsProtectedSystemExecutable(flow.Executable.Path);
@@ -304,4 +413,12 @@ public sealed partial class FlowCoordinator : BackgroundService
 
     [LoggerMessage(Level = LogLevel.Error, Message = "Flow persistence batch failed; sensor remains active.")]
     private static partial void LogPersistenceFailed(ILogger logger, Exception exception);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "File activity sensor failed; network monitoring remains active.")]
+    private static partial void LogFileSensorFailed(ILogger logger, Exception exception);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "File activity sensor did not stop within its bounded shutdown.")]
+    private static partial void LogFileSensorShutdownFailed(ILogger logger, Exception exception);
+
+    private sealed record PersistenceItem(NetworkFlow Flow, IReadOnlyList<FileCorrelation> Correlations);
 }

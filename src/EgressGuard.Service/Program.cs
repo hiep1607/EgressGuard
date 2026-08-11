@@ -18,6 +18,8 @@ if (string.IsNullOrWhiteSpace(dataRoot))
 
 builder.Services.AddSingleton(new EgressGuardDatabase(Path.Combine(dataRoot, "egressguard.db")));
 builder.Services.AddSingleton<INetworkFlowSensor, WindowsFlowSensor>();
+builder.Services.AddSingleton<IFileActivitySensor>(_ => new EtwFileActivitySensor([dataRoot]));
+builder.Services.AddSingleton(_ => new FileCorrelationEngine(excludedRoots: [dataRoot]));
 builder.Services.AddSingleton<IFirewallRuleManager, OwnedFirewallRuleManager>();
 builder.Services.AddSingleton<RiskEngine>();
 builder.Services.AddSingleton<BaselineTracker>();

@@ -22,6 +22,12 @@ internal static class Program
             Console.WriteLine("Payload bytes are generated in memory. No user files or credentials are read.");
             Console.WriteLine($"Target: {options.Address}:{options.Port} via {options.Protocol}; mode={options.Mode}; connect-only={options.ConnectOnly}.");
 
+            if (options.FileCorrelationTest)
+            {
+                await RunFileCorrelationTestAsync(options, cancellation.Token).ConfigureAwait(false);
+                return 0;
+            }
+
             if (options.Protocol == SimulatorProtocol.Tcp)
             {
                 for (var connection = 1; connection <= options.Connections; connection++)
@@ -81,6 +87,29 @@ internal static class Program
             cancellationToken).ConfigureAwait(false);
         await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
         await HoldForObservationAsync(options.HoldSeconds, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task RunFileCorrelationTestAsync(SimulatorOptions options, CancellationToken cancellationToken)
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"EgressGuard-FileCorrelation-{Guid.NewGuid():N}.egfixture");
+        try
+        {
+            await File.WriteAllTextAsync(path, "Synthetic EgressGuard file-correlation fixture. No user data.", cancellationToken).ConfigureAwait(false);
+            _ = await File.ReadAllTextAsync(path, cancellationToken).ConfigureAwait(false);
+            Console.WriteLine($"Opened and read synthetic fixture: {Path.GetFileName(path)}");
+            Console.WriteLine("Opening loopback connection without transmitting file contents.");
+            using var client = new TcpClient(AddressFamily.InterNetwork);
+            await client.ConnectAsync(IPAddress.Loopback, options.Port, cancellationToken).ConfigureAwait(false);
+            Console.WriteLine($"Connected from {client.Client.LocalEndPoint} to {client.Client.RemoteEndPoint}.");
+            await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
+            _ = await File.ReadAllTextAsync(path, cancellationToken).ConfigureAwait(false);
+            Console.WriteLine("Re-read synthetic fixture after the loopback flow became observable; no bytes were sent.");
+            await HoldForObservationAsync(options.HoldSeconds, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
     }
 
     private static async Task RunUdpAsync(SimulatorOptions options, CancellationToken cancellationToken)
@@ -157,7 +186,8 @@ internal static class Program
         int HoldSeconds,
         int Connections,
         int ConnectionIntervalMilliseconds,
-        bool ConnectOnly)
+        bool ConnectOnly,
+        bool FileCorrelationTest)
     {
         internal static SimulatorOptions Parse(string[] args)
         {
@@ -171,6 +201,7 @@ internal static class Program
             var connections = 1;
             var connectionIntervalMilliseconds = 1000;
             var connectOnly = false;
+            var fileCorrelationTest = false;
 
             for (var index = 0; index < args.Length; index++)
             {
@@ -218,6 +249,9 @@ internal static class Program
                     case "--connect-only":
                         connectOnly = true;
                         break;
+                    case "--file-correlation-test":
+                        fileCorrelationTest = true;
+                        break;
                     default:
                         throw new ArgumentException($"Unknown or incomplete argument: {args[index]}");
                 }
@@ -228,7 +262,7 @@ internal static class Program
                 throw new ArgumentException("--connect-only is supported only for TCP.");
             }
 
-            return new SimulatorOptions(address, port, protocol, mode, totalBytes, delayMilliseconds, holdSeconds, connections, connectionIntervalMilliseconds, connectOnly);
+            return new SimulatorOptions(address, port, protocol, mode, totalBytes, delayMilliseconds, holdSeconds, connections, connectionIntervalMilliseconds, connectOnly, fileCorrelationTest);
         }
 
         private static int ParseRange(string value, string option, int minimum, int maximum)

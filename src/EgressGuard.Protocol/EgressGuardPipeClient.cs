@@ -10,7 +10,7 @@ public sealed class EgressGuardPipeClient : IAsyncDisposable
 
     public EgressGuardPipeClient(string? pipeName = null)
     {
-        _pipeName = string.IsNullOrWhiteSpace(pipeName) ? ProtocolConstants.PipeName : pipeName;
+        _pipeName = string.IsNullOrWhiteSpace(pipeName) ? ProtocolConstants.ResolvePipeName() : pipeName;
     }
 
     public bool IsConnected => _pipe?.IsConnected == true;

@@ -1,5 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
+    <InternalsVisibleTo Include="EgressGuard.Tests" />
+  </ItemGroup>
+  <ItemGroup>
     <!-- Legacy Stage 0 source files are compiled by EgressGuard.Windows so Core stays platform-neutral. -->
     <Compile Remove="ConnectionSnapshotService.cs" />
     <Compile Remove="ExecutableMetadataProvider.cs" />

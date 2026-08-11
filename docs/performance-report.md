@@ -1,6 +1,41 @@
 # Performance report
 
-Date: 2026-08-09. Tool: one-second `Process.TotalProcessorTime` deltas normalized by logical processor count; WorkingSet64; Release build. Each row is a 12–15 second sample.
+Status: runtime CPU/RAM is `Verified` for reviewed baseline `9ed380f856e780e48492ea51b96881ef9918b1cd`; the current local technical-finding changes are structurally tested but did not rerun the service/UI smoke. The final smoke below remains baseline evidence and is not relabeled as current-head evidence. Tool: one-second `Process.TotalProcessorTime` deltas normalized by 12 logical processors; `WorkingSet64`; Release build.
+
+## Final technical-finding structural diagnostics (2026-08-11)
+
+Deterministic default-suite regressions exercise production promotion and correlation structures without CI timing thresholds. With 64 exact process identities and 256 pending promoted events, the former linked-list drain would inspect `64 × 256 = 16,384` nodes; the exact-identity/global dual index inspected exactly 256 matching nodes, retained per-identity insertion order, returned no event across a PID-generation boundary, stayed within the 4,096 hard bound, and left zero index entries after global eviction and drain.
+
+The focused promoted-load diagnostic installs network interests, promotes 4,096 synthetic file events, adds them to a near-capacity `FileCorrelationEngine`, and correlates an exact-identity flow. The former `CleanupCore()` structure would inspect `0 + 1 + … + 4,095 = 8,386,560` event nodes while filling the buffer. The insertion-order list plus timestamp-sorted bounded index inspected exactly 4,095 oldest candidates, returned the expected 20-item evidence cap, then removed all 4,096 expired events with event, timestamp-index and dedupe counts all zero. This is structural work evidence, not a replacement service CPU measurement.
+
+The existing raw-buffer microbenchmark was also rerun on the final local source: 100,000 synthetic events completed in 42.485 ms (2,353,783 events/s), with exact global/per-PID peaks of 4,096/128 for the distributed case; the hot-PID case completed in 9.412 ms and stayed at the 256 per-PID bound. These results guard the earlier raw-buffer improvement but do not measure service/UI CPU.
+
+The final documentation/acceptance checkpoint reran the same no-threshold diagnostic after rebuilding: 45.407 ms (2,202,328 events/s) for 100,000 events and 10.242 ms for the hot-PID case, with the same 4,096/128 and 256 structural peaks. The small timing variation is retained rather than selecting one run; the deterministic bounds/counters are the acceptance evidence.
+
+## Final warm steady-state smoke (2026-08-11)
+
+Each phase used the same final artifact, an isolated pipe/database, a 25-second warm-up that excluded startup inventory, then 45 seconds of sampling. The installed artifact service was paused and restored. The UI had to report `Service online` before and after sampling; it produced zero not-responding samples. The disabled baseline was below the 2% noisy-run threshold, so no baseline retry was permitted or needed.
+
+| Phase | Service CPU avg/peak | Delta vs baseline | UI CPU avg/peak | Service RAM start/end/peak | UI RAM start/end/peak | Result |
+|---|---:|---:|---:|---:|---:|---|
+| Feature-disabled baseline | 0.833% / 1.432% | — | 0.104% / 0.521% | 78.0 / 76.6 / 80.1 MB | 156.8 / 157.1 / 160.4 MB | Valid baseline |
+| Feature-enabled idle | 0.894% / 1.693% | +0.061 pp | 0.104% / 0.521% | 87.8 / 82.9 / 90.5 MB | 158.4 / 156.2 / 158.7 MB | Pass |
+| Normal traffic with pre-flow fixture | 1.100% / 2.214% | +0.267 pp | 0.098% / 0.521% | 88.5 / 86.2 / 93.0 MB | 157.9 / 158.3 / 159.4 MB | Pass (`<3%`) |
+| Stress/churn (20 connect-only processes) | 0.833% / 1.823% | +0.000 pp | 0.087% / 0.781% | 81.7 / 86.8 / 91.8 MB | 158.1 / 157.2 / 158.9 MB | Bounded |
+
+Every phase ended with zero test ETW session and zero ownership marker without recovery. RAM did not grow continuously. The separate real service integration on the same source verified the pre-flow `.egfixture`, negative delta, exact identity, zero transmitted bytes, redacted persistence, final dropped count behavior, and self-cleanup.
+
+## Confirmed bottleneck and microbenchmark
+
+Temporary instrumentation confirmed that the old buffer called a full-list expiration scan for nearly every raw event and linearly searched the global list for per-PID eviction. With 100,000 synthetic raw events it took 1,395.128 ms (71,678 events/s), visited 442,177,536 cleanup nodes, and spent 1,497.470 ms inside cleanup including warm-up. A hot-PID scenario took 502.188 ms, with 75,046,944 eviction-node visits and 239.400 ms in the linear search. The observed global peak briefly reached 4,097 before eviction.
+
+The replacement links each entry into a global list and a PID-specific list. Global and per-PID eviction/removal are O(1), promotion visits only the target PID, and out-of-order-safe expiration scans the bounded global list at most once per second or immediately before promotion. Under the same instrumented workload, elapsed time fell to 43.279 ms (2,310,595 events/s), cleanup visits to 8,192/0.182 ms, and the hot-PID scenario to 10.125 ms with one indexed node per eviction (19,744 evictions/0.972 ms). Final no-instrumentation repeats took 40.505 and 46.127 ms (2.17–2.47 million events/s); global/per-PID peaks were exactly 4,096/256.
+
+Allocation increased from about 21.0 MB to 29.6 MB per 100,000 synthetic events because the dual index stores two linked-list nodes. Retained state remains hard-bounded, and the final service RAM/CPU run showed no continuous growth. Temporary counters and machine-specific harnesses were removed before commit.
+
+An instrumentation-only four-phase run recorded raw peaks of 1,042 idle, 1,671 normal and 1,550 stress; per-PID peak 256; process-identity-cache peaks 34/36/55; correlation buffer peaks 242/633/797; and dedupe peaks 205/478/691. Final dropped totals were 237,336/239,174/237,099 with 86/84/73 coalesced status publications over roughly 85 seconds per enabled phase. A harness double-dispose error occurred only after all four phase results and per-phase zero-session/zero-marker checks had printed; the installed service was restored manually. Those values are structural diagnostics, not the CPU acceptance table.
+
+The earlier 3.938% disabled/3.166% normal table is a noisy startup/background run and is invalid for acceptance because its disabled baseline exceeded 2%. A later clean-source run before the pipe-client fix is also not acceptance evidence because the UI was not connected to the isolated pipe. Neither run was selected or hidden; the final table fixes both conditions.
 
 | State | Process | CPU average | CPU peak | RAM average/observed | Traffic |
 |---|---|---:|---:|---:|---|

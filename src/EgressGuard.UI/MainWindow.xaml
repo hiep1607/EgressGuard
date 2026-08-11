@@ -74,6 +74,32 @@
                     <TextBlock Text="{Binding Parent}" Margin="0,4" />
                     <TextBlock Text="{Binding Destination}" Margin="0,4" />
                     <TextBlock Text="{Binding Reasons}" TextWrapping="Wrap" Margin="0,12" />
+                    <Separator Margin="0,12" />
+                    <TextBlock Text="Related file activity" FontSize="19" FontWeight="SemiBold" Margin="0,4" />
+                    <TextBlock Text="{Binding DataContext.FileSensorStatus, RelativeSource={RelativeSource AncestorType=Window}}" Foreground="#B9C9D8" TextWrapping="Wrap" Margin="0,2,0,8" />
+                    <TextBlock Text="{Binding DataContext.FileCorrelationEmptyState, RelativeSource={RelativeSource AncestorType=Window}}" Foreground="#B9C9D8" TextWrapping="Wrap" Margin="0,4" />
+                    <ListBox ItemsSource="{Binding DataContext.FileCorrelations, RelativeSource={RelativeSource AncestorType=Window}}"
+                             MaxHeight="240" Background="#111A23" BorderBrush="#35485A"
+                             ScrollViewer.CanContentScroll="True" VirtualizingPanel.IsVirtualizing="True"
+                             VirtualizingPanel.VirtualizationMode="Recycling">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <Border BorderBrush="#35485A" BorderThickness="0,0,0,1" Padding="8" ToolTip="{Binding ProtectedFileIdentifier}">
+                                    <StackPanel>
+                                        <TextBlock TextWrapping="Wrap">
+                                            <Run Text="{Binding Operation}" FontWeight="SemiBold"/><Run Text=" · "/><Run Text="{Binding DisplayPath}"/>
+                                        </TextBlock>
+                                        <TextBlock Foreground="#B9C9D8" TextWrapping="Wrap">
+                                            <Run Text="{Binding ActivityTimestampUtc}"/><Run Text=" · delta "/><Run Text="{Binding TimeDeltaSeconds, StringFormat={}{0:0.###} s}"/><Run Text=" · "/><Run Text="{Binding Confidence}"/>
+                                        </TextBlock>
+                                        <TextBlock Text="{Binding Reason}" Foreground="#B9C9D8" TextWrapping="Wrap" ToolTip="{Binding Reason}" />
+                                    </StackPanel>
+                                </Border>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                    <TextBlock Text="Related activity does not prove that file contents were transmitted."
+                               Foreground="#FFD166" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,10,0,4" />
                 </StackPanel></ScrollViewer>
             </TabItem>
 
