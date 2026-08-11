@@ -44,6 +44,7 @@ Access-denied Authenticode is not automated because a reliable fixture requires 
 - Phase 3.5.1 real cancellation integration created a uniquely named owned test rule, cancelled while its PowerShell was delayed after creation, reconciled and removed that exact rule, left an unrelated PowerShell running, and finished with zero owned child processes or firewall rules.
 - IPv6 was not verifiable because the workstation had no IPv6 route.
 - UI Automation at the host's real 125% scale selected and rendered Dashboard, Live Connections, Connection Detail, Alerts, Rules and Settings. Multi-row and IPv6 data, empty Rules, a selected connection, a 215-character database path, minimize and maximize were exercised. ComboBox and Alerts DataGrid contrast defects found during Phase 3.5 QA were fixed and visually rechecked.
+- Focused Phase 4 visual QA used isolated development service/UI instances at real 100% (96 DPI) and 150% (144 DPI), then restored the host to 125% (120 DPI). The service stayed `Running` with `FileSensor=Running` and `dropped 0`; protected/redacted correlation items rendered, the full protected-file hash tooltip was observed at both test scales, the 100% window resized to 900×560 with vertical-only scrolling, and the 150% layout remained readable. The loopback fixture test server recorded zero transmitted bytes. No installed service or registry setting was changed.
 - True subscription was exercised over the real service pipe and preserved sequence order.
 - The bounded soak ran 2 minutes/40 cycles with normal, burst, beacon, UI open/close and IPC checks: 0 failures; service RAM 56.2–78.0 MB.
 - The fresh Phase 3.5 soak ran 30 minutes/585 cycles with 0 failures, 117 service restarts, 195 UI opens/closes and 585 IPC checks. Service RAM remained within 55.5–86.4 MB and UI RAM within 134.5–196.3 MB across deliberately restarted process instances. The database lock was released; both cleanup inspections succeeded and found zero process or owned firewall rule.
@@ -52,9 +53,9 @@ Access-denied Authenticode is not automated because a reliable fixture requires 
 
 ## Phase 3.5 limitations
 
-- DPI 100% and 150% were not verified because the active display was 125% and no disruptive display-scale change was authorized.
-- Direct tray icon/context-menu interaction was not verified; the real `NotifyIcon` lifecycle did execute during UI open/close testing.
-- No reboot was performed.
+- DPI 100% and 150% are now verified by the focused Phase 4 acceptance; the host was restored to 125% afterward without reboot.
+- Direct tray icon/context-menu interaction was verified in the final-artifact acceptance; the real `NotifyIcon` lifecycle also executed during UI open/close testing.
+- No additional reboot was performed for this focused Phase 4 visual check; the prior reboot acceptance remains recorded separately as verified.
 - The 30-minute soak checked IPC reconnect and database lock release. Database contention and event sequence/gap/overflow/resync remain covered by the automated suite rather than by forced fault injection during the soak.
 - Every soak run now uses its own timestamp/GUID run directory and database. Cleanup reports process/firewall inspection success separately; a failed inspection is a failed soak and is never represented as a zero-leftover result.
 
