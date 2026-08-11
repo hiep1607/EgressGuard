@@ -155,6 +155,13 @@ public sealed partial class FlowCoordinator : BackgroundService
             return;
         }
 
+        if (_state.FileCorrelationEnabled && _fileSensor is IFileActivityInterestSink interestSink)
+        {
+            interestSink.UpdateProcessInterests(captured
+                .Where(flow => flow.ProcessIdentity is not null)
+                .Select(flow => new FileActivityProcessInterest(flow.ProcessIdentity!.Value, flow.ProcessName)));
+        }
+
         var rules = await SafeGetRulesAsync(cancellationToken).ConfigureAwait(false);
         var assessed = new List<NetworkFlow>(captured.Count);
         foreach (var flow in captured)

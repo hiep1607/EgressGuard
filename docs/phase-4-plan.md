@@ -13,7 +13,7 @@ Phase 4 is observe-only. Related file activity is evidence that the same process
 
 - ETW callbacks use `TryWrite` into a bounded channel and never wait. Overflow atomically increments the exact dropped-event counter and exposes `OverflowDegraded`; a separate capacity-one status channel coalesces notifications, so drops cannot create a task or notification storm.
 - Normalize paths, reject incomplete operations, exclude the EgressGuard data/log/artifact roots early, and deduplicate identical process/path/operation events in a short window.
-- Keep a short bounded staging window because ETW cannot reliably filter by only processes that will soon create a flow. Cleanup and capacity eviction remove the matching dedupe entry only when it still represents that event. Both event and dedupe state therefore have the same hard maximum.
+- Stage only PIDs carrying an exact `(PID, ProcessStartTime)` interest from the current/recent network snapshot. Interests use a hard-bounded 4,096-entry LRU with a one-minute sliding TTL, so system-wide File I/O never performs per-event process lookup. Cleanup and capacity eviction remove the matching dedupe entry only when it still represents that event. Interest, event, and dedupe state therefore all have hard maxima.
 - Sensor projection resolves `(PID, ProcessStartTime)` and drops an event timestamped before the resolved process start, or whenever identity cannot be verified. This prevents a delayed raw event from being assigned to a reused PID.
 - The deterministic Core engine matches exact `(PID, ProcessStartTime)` from 30 seconds before through 5 seconds after flow first-seen, tolerates out-of-order delivery, and returns at most 20 evidence items per flow.
 - Confidence is rule-based (`High` for Read/Open/Create close to the flow, otherwise `Medium`/`Low`) and every reason states the operation and signed time delta.
@@ -50,7 +50,7 @@ Default CI uses fakes and requires neither Administrator nor policy changes. The
 ## Known limitations
 
 - Temporal correlation does not prove upload or identify bytes on the wire.
-- Events may be missed on overflow, provider differences, late process identity resolution, or insufficient permission.
+- Events may be missed on overflow, provider differences, insufficient permission, or before a process first appears in a network snapshot. The safe Simulator re-reads its synthetic fixture after the loopback flow becomes observable.
 - File paths are sensitive; redaction reduces but cannot eliminate metadata sensitivity.
 - Protected marker integrity assumes the service identity, `SYSTEM`, and local Administrators are trusted. An Administrator can still tamper with ETW state and is outside this local ownership boundary.
-- The 2026-08-11 smoke exceeded the initial service CPU budget with the optional kernel File I/O sensor enabled. Performance acceptance remains failed until that overhead is reduced and remeasured.
+- The final 2026-08-11 focused smoke met the budget: enabled idle added 0.211 percentage points over disabled baseline, normal traffic added 0.124, and normal service CPU was 0.952%.

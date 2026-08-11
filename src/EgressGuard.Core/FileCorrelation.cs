@@ -73,6 +73,13 @@ public interface IFileActivitySensor : IAsyncDisposable
     Task StopAsync(CancellationToken cancellationToken);
 }
 
+public sealed record FileActivityProcessInterest(ProcessIdentity Identity, string ProcessName);
+
+public interface IFileActivityInterestSink
+{
+    void UpdateProcessInterests(IEnumerable<FileActivityProcessInterest> processes);
+}
+
 public sealed class DisabledFileActivitySensor : IFileActivitySensor
 {
     public FileSensorStatus Status { get; } = new(FileSensorState.Disabled, 0, "File correlation is disabled by configuration.", DateTimeOffset.UtcNow);

@@ -169,7 +169,7 @@ internal static class Program
         if (request.Type == MessageTypes.GetStatus)
         {
             var status = response.ReadPayload<ServiceStatusMessage>();
-            Console.WriteLine($"Running={status.IsRunning} Mode={status.Mode} Active={status.ActiveFlowCount} Dropped={status.DroppedEvents} Database={status.DatabasePath}");
+            Console.WriteLine($"Running={status.IsRunning} Mode={status.Mode} Active={status.ActiveFlowCount} Dropped={status.DroppedEvents} FileSensor={status.FileSensor?.State} FileDropped={status.FileSensor?.DroppedEvents ?? 0} Database={status.DatabasePath}");
         }
         else if (request.Type == MessageTypes.GetActiveFlows)
         {

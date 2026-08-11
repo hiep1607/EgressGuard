@@ -65,7 +65,9 @@ internal static class Program
             ("File correlation eviction preserves newer dedupe entries", TestFileCorrelationDedupeEvictionAsync),
             ("File correlation excludes EgressGuard-owned storage", TestFileCorrelationExclusionAsync),
             ("Disabled and degraded file sensors remain bounded", TestFileSensorStatesAsync),
+            ("File sensor publishes coalesced final dropped count", TestFileSensorDroppedCountNotificationsAsync),
             ("File sensor rejects events older than resolved process identity", TestFileSensorPidReuseProjectionAsync),
+            ("Process identity cache is bounded, expires, and rejects PID reuse", TestProcessIdentityCacheAsync),
             ("ETW ownership reclaims only an exact verified orphan", TestEtwOwnershipAsync),
             ("AccessDenied file sensor does not crash network service", TestFileSensorDegradedServiceAsync),
             ("Native port conversion", TestPortConversionAsync),
@@ -307,6 +309,85 @@ internal static class Program
         return Task.CompletedTask;
     }
 
+    private static async Task TestFileSensorDroppedCountNotificationsAsync()
+    {
+        var start = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var resolver = new FixedProcessIdentityResolver(new ProcessIdentity(Environment.ProcessId, start), "test");
+        var identities = new ProcessIdentityCache(4, TimeSpan.FromMinutes(1));
+        await using var sensor = new EtwFileActivitySensor(
+            resolver,
+            capacity: 1,
+            processIdentities: identities,
+            statusPublishInterval: TimeSpan.FromMilliseconds(25));
+        var notifications = new List<FileSensorStatus>();
+        sensor.StatusChanged += (_, status) =>
+        {
+            lock (notifications) notifications.Add(status);
+        };
+        var path = Path.Combine(Path.GetTempPath(), "EgressGuard-Synthetic", "coalesced.txt");
+
+        for (var index = 0; index < 1_000; index++)
+        {
+            sensor.StageForTest(Environment.ProcessId, "test", path + index, FileActivityOperation.Read, DateTime.UtcNow);
+        }
+
+        await Task.Delay(75).ConfigureAwait(false);
+        for (var index = 0; index < 1_000; index++)
+        {
+            sensor.StageForTest(Environment.ProcessId, "test", path + (index + 1_000), FileActivityOperation.Read, DateTime.UtcNow);
+        }
+
+        using var stopTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        await sensor.StopAsync(stopTimeout.Token).ConfigureAwait(false);
+        FileSensorStatus[] published;
+        lock (notifications) published = [.. notifications];
+        AssertEqual(1_999L, sensor.Status.DroppedEvents);
+        AssertTrue(published.Any(item => item.State == FileSensorState.OverflowDegraded), "OverflowDegraded was never published.");
+        AssertEqual(1_999L, published[^1].DroppedEvents);
+        AssertEqual(FileSensorState.Stopped, published[^1].State);
+        AssertTrue(published.Select(item => item.DroppedEvents).Distinct().Count() >= 2, "Dropped count did not advance after initial degradation.");
+        AssertTrue(published.Length <= 8, "Dropped notifications were not coalesced.");
+    }
+
+    private static Task TestProcessIdentityCacheAsync()
+    {
+        var now = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var resolver = new MutableProcessIdentityResolver();
+        var cache = new ProcessIdentityCache(8, TimeSpan.FromMilliseconds(100));
+        for (var processId = 1; processId <= 10_000; processId++)
+        {
+            cache.ObserveProcessStart(
+                new ResolvedProcessIdentity(new ProcessIdentity(processId, now.AddSeconds(-1)), "process-" + processId),
+                now);
+        }
+
+        AssertEqual(8, cache.Count);
+
+        var oldIdentity = new ResolvedProcessIdentity(new ProcessIdentity(77, now), "same-name");
+        cache.ObserveProcessStart(oldIdentity, now);
+        resolver.Values[77] = oldIdentity;
+        AssertEqual(oldIdentity, cache.Resolve(77, "same-name", now.AddMilliseconds(10), now.AddMilliseconds(10), resolver));
+        AssertEqual(0, resolver.ResolveCalls);
+
+        var newIdentity = new ResolvedProcessIdentity(new ProcessIdentity(77, now.AddSeconds(1)), "same-name");
+        resolver.Values[77] = newIdentity;
+        cache.ObserveProcessStart(newIdentity, now.AddSeconds(1));
+        cache.ObserveProcessStop(77, now.AddMilliseconds(900));
+        AssertEqual(null, cache.Resolve(77, "same-name", now.AddMilliseconds(950), now.AddSeconds(1), resolver));
+        AssertEqual(newIdentity, cache.Resolve(77, "same-name", now.AddSeconds(1.1), now.AddSeconds(1.01), resolver));
+        AssertEqual(0, resolver.ResolveCalls);
+
+        resolver.Values[88] = new ResolvedProcessIdentity(new ProcessIdentity(88, now), "expires");
+        AssertEqual(resolver.Values[88], cache.Resolve(88, "expires", now.AddSeconds(2), now.AddSeconds(2), resolver));
+        AssertEqual(1, resolver.ResolveCalls);
+        AssertEqual(resolver.Values[88], cache.Resolve(88, "expires", now.AddSeconds(2.05), now.AddSeconds(2.05), resolver));
+        AssertEqual(1, resolver.ResolveCalls);
+        AssertEqual(resolver.Values[88], cache.Resolve(88, "expires", now.AddSeconds(2.2), now.AddSeconds(2.2), resolver));
+        AssertEqual(2, resolver.ResolveCalls);
+        AssertTrue(cache.Count <= 8, "Process identity cache exceeded its hard bound.");
+        return Task.CompletedTask;
+    }
+
     private static async Task TestEtwOwnershipAsync()
     {
         var directory = Path.Combine(Path.GetTempPath(), "EgressGuard-Ownership-" + Guid.NewGuid().ToString("N"));
@@ -380,6 +461,14 @@ internal static class Program
         {
             await sensor.StartAsync(CancellationToken.None).ConfigureAwait(false);
             AssertEqual(FileSensorState.Running, sensor.Status.State);
+            using (var process = Process.GetCurrentProcess())
+            {
+                sensor.UpdateProcessInterests([
+                    new FileActivityProcessInterest(
+                        new ProcessIdentity(process.Id, process.StartTime.ToUniversalTime()),
+                        process.ProcessName)
+                ]);
+            }
             await File.WriteAllTextAsync(path, "synthetic non-sensitive fixture").ConfigureAwait(false);
             _ = await File.ReadAllTextAsync(path).ConfigureAwait(false);
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -1080,14 +1169,16 @@ internal static class Program
             _ = engine.Add(FileEvent(flow, index, -index, FileActivityOperation.Read, $"C:\\Synthetic\\protocol-{index}.txt"));
         }
 
-        var status = new FileSensorStatus(FileSensorState.Running, 0, null, DateTimeOffset.UtcNow);
+        var status = new FileSensorStatus(FileSensorState.OverflowDegraded, 1_999, "Controlled overflow.", DateTimeOffset.UtcNow);
         var message = MessageEnvelope.Create(MessageTypes.GetFileCorrelations, new FileCorrelationsMessage(flow.Id, engine.Correlate(flow), status));
         await using var stream = new MemoryStream();
         await MessageFraming.WriteAsync(stream, message, CancellationToken.None).ConfigureAwait(false);
         AssertTrue(stream.Length < ProtocolConstants.MaximumMessageBytes, "Bounded correlation response exceeded protocol framing limit.");
         stream.Position = 0;
         var result = await MessageFraming.ReadAsync(stream, CancellationToken.None).ConfigureAwait(false);
-        AssertEqual(20, result!.ReadPayload<FileCorrelationsMessage>().Correlations.Count);
+        var payload = result!.ReadPayload<FileCorrelationsMessage>();
+        AssertEqual(20, payload.Correlations.Count);
+        AssertEqual(1_999L, payload.SensorStatus.DroppedEvents);
 
         var legacyJson = """{"mode":1,"isRunning":true,"activeFlowCount":0,"droppedEvents":0,"databasePath":"test.db","timestamp":"2026-01-01T00:00:00Z"}""";
         var legacyStatus = System.Text.Json.JsonSerializer.Deserialize<ServiceStatusMessage>(legacyJson, JsonDefaults.Options);
@@ -2008,6 +2099,17 @@ internal static class Program
     {
         public ResolvedProcessIdentity Value { get; } = new(identity, processName);
         public ResolvedProcessIdentity? Resolve(int processId) => processId == Value.Identity.ProcessId ? Value : null;
+    }
+
+    private sealed class MutableProcessIdentityResolver : IProcessIdentityResolver
+    {
+        public Dictionary<int, ResolvedProcessIdentity> Values { get; } = [];
+        public int ResolveCalls { get; private set; }
+        public ResolvedProcessIdentity? Resolve(int processId)
+        {
+            ResolveCalls++;
+            return Values.GetValueOrDefault(processId);
+        }
     }
 
     private sealed class FakeEtwSessionRegistry : IEtwSessionRegistry

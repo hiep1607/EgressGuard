@@ -7,15 +7,20 @@ using Microsoft.Diagnostics.Tracing.Session;
 
 namespace EgressGuard.Windows;
 
-public sealed class EtwFileActivitySensor : IFileActivitySensor
+public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityInterestSink
 {
     public const int DefaultCapacity = 4096;
+    internal const int DefaultProcessIdentityCapacity = 4096;
+    internal static readonly TimeSpan DefaultProcessIdentityTtl = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan DefaultStatusPublishInterval = TimeSpan.FromSeconds(1);
     private readonly Channel<RawFileEvent> _staging;
     private readonly Channel<FileActivity> _output;
-    private readonly Channel<FileSensorStatus> _statusNotifications;
+    private readonly Channel<byte> _statusSignals;
     private readonly string[] _excludedRoots;
     private readonly IProcessIdentityResolver _processResolver;
+    private readonly ProcessIdentityCache _processIdentities;
     private readonly EtwSessionOwnershipManager _ownershipManager;
+    private readonly TimeSpan _statusPublishInterval;
     private readonly object _sync = new();
     private TraceEventSession? _session;
     private Task? _traceTask;
@@ -32,7 +37,9 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor
             new RuntimeProcessIdentityResolver(),
             excludedRoots,
             capacity,
-            new EtwSessionOwnershipManager(ResolveOwnershipDirectory(excludedRoots, ownershipDirectory)))
+            new EtwSessionOwnershipManager(ResolveOwnershipDirectory(excludedRoots, ownershipDirectory)),
+            new ProcessIdentityCache(DefaultProcessIdentityCapacity, DefaultProcessIdentityTtl),
+            DefaultStatusPublishInterval)
     {
     }
 
@@ -40,11 +47,16 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor
         IProcessIdentityResolver processResolver,
         IEnumerable<string>? excludedRoots = null,
         int capacity = DefaultCapacity,
-        EtwSessionOwnershipManager? ownershipManager = null)
+        EtwSessionOwnershipManager? ownershipManager = null,
+        ProcessIdentityCache? processIdentities = null,
+        TimeSpan? statusPublishInterval = null)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(capacity, 1);
         _processResolver = processResolver;
+        _processIdentities = processIdentities ?? new ProcessIdentityCache(DefaultProcessIdentityCapacity, DefaultProcessIdentityTtl);
         _ownershipManager = ownershipManager ?? new EtwSessionOwnershipManager(ResolveOwnershipDirectory(excludedRoots, null));
+        _statusPublishInterval = statusPublishInterval ?? DefaultStatusPublishInterval;
+        if (_statusPublishInterval < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(statusPublishInterval));
         _excludedRoots = (excludedRoots ?? []).Where(value => !string.IsNullOrWhiteSpace(value)).Select(Path.GetFullPath).ToArray();
         _staging = Channel.CreateBounded<RawFileEvent>(new BoundedChannelOptions(capacity)
         {
@@ -58,7 +70,7 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor
             SingleReader = false,
             SingleWriter = true
         });
-        _statusNotifications = Channel.CreateBounded<FileSensorStatus>(new BoundedChannelOptions(1)
+        _statusSignals = Channel.CreateBounded<byte>(new BoundedChannelOptions(1)
         {
             FullMode = BoundedChannelFullMode.DropOldest,
             SingleReader = true,
@@ -152,7 +164,7 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor
         }
 
         SetStatus(FileSensorState.Stopped, null);
-        _statusNotifications.Writer.TryComplete();
+        _statusSignals.Writer.TryComplete();
         if (_statusPublisherTask is not null)
         {
             await _statusPublisherTask.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
@@ -161,6 +173,18 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor
 
     public IAsyncEnumerable<FileActivity> ReadAllAsync(CancellationToken cancellationToken) =>
         _output.Reader.ReadAllAsync(cancellationToken);
+
+    public void UpdateProcessInterests(IEnumerable<FileActivityProcessInterest> processes)
+    {
+        ArgumentNullException.ThrowIfNull(processes);
+        var observedAt = DateTimeOffset.UtcNow;
+        foreach (var process in processes)
+        {
+            _processIdentities.ObserveProcessStart(
+                new ResolvedProcessIdentity(process.Identity, process.ProcessName),
+                observedAt);
+        }
+    }
 
     public async ValueTask DisposeAsync()
     {
@@ -186,27 +210,48 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor
 
     private void Stage(int processId, string processName, string? path, FileActivityOperation operation, DateTime timestamp)
     {
-        if (processId <= 0 || string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path) || IsExcluded(path))
+        var timestampUtc = new DateTimeOffset(timestamp.ToUniversalTime());
+        if (processId <= 0
+            || !_processIdentities.TryGet(processId, processName, timestampUtc, DateTimeOffset.UtcNow, out var process)
+            || process is null
+            || string.IsNullOrWhiteSpace(path)
+            || !Path.IsPathFullyQualified(path)
+            || IsExcluded(path))
         {
             return;
         }
 
-        var item = new RawFileEvent(processId, processName, path, operation, timestamp.ToUniversalTime());
+        var item = new RawFileEvent(process!, path, operation, timestampUtc);
         if (!_staging.Writer.TryWrite(item))
         {
-            Interlocked.Increment(ref _dropped);
-            SetStatus(FileSensorState.OverflowDegraded, "Bounded ETW staging buffer overflowed; events were dropped.");
+            RecordDrop("Bounded ETW staging buffer overflowed; events were dropped.");
         }
     }
 
     internal void StageForTest(int processId, string processName, string path, FileActivityOperation operation, DateTime timestamp)
     {
         EnsureStatusPublisher();
+        if (!_processIdentities.TryGet(processId, processName, timestamp.ToUniversalTime(), DateTimeOffset.UtcNow, out var known)
+            || known is null)
+        {
+            var resolved = _processResolver.Resolve(processId);
+            if (resolved is not null)
+            {
+                _processIdentities.ObserveProcessStart(
+                    new ResolvedProcessIdentity(resolved.Identity, processName),
+                    DateTimeOffset.UtcNow);
+            }
+        }
         Stage(processId, processName, path, operation, timestamp);
     }
 
-    internal FileActivity? ProjectForTest(int processId, string processName, string path, FileActivityOperation operation, DateTimeOffset timestampUtc) =>
-        Resolve(new RawFileEvent(processId, processName, path, operation, timestampUtc));
+    internal FileActivity? ProjectForTest(int processId, string processName, string path, FileActivityOperation operation, DateTimeOffset timestampUtc)
+    {
+        var resolved = _processIdentities.Resolve(processId, processName, timestampUtc, DateTimeOffset.UtcNow, _processResolver);
+        return resolved is null ? null : Resolve(new RawFileEvent(resolved, path, operation, timestampUtc));
+    }
+
+    internal int ProcessIdentityCacheCount => _processIdentities.Count;
 
     internal string? SessionName => _sessionLease?.SessionName;
 
@@ -219,8 +264,7 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor
                 var activity = Resolve(item);
                 if (activity is not null && !_output.Writer.TryWrite(activity))
                 {
-                    Interlocked.Increment(ref _dropped);
-                    SetStatus(FileSensorState.OverflowDegraded, "Bounded file activity output overflowed; events were dropped.");
+                    RecordDrop("Bounded file activity output overflowed; events were dropped.");
                 }
             }
         }
@@ -233,16 +277,10 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor
     {
         try
         {
-            var resolved = _processResolver.Resolve(item.ProcessId);
-            if (resolved is null || item.TimestampUtc < resolved.Identity.StartTime)
-            {
-                return null;
-            }
-
             return new FileActivity(
                 Interlocked.Increment(ref _sequence), item.TimestampUtc,
-                resolved.Identity,
-                string.IsNullOrWhiteSpace(item.ProcessName) ? resolved.ProcessName : item.ProcessName,
+                item.Process.Identity,
+                item.Process.ProcessName,
                 item.Operation, Path.GetFullPath(item.Path), Path.GetExtension(item.Path).ToLowerInvariant(),
                 "Windows Kernel File I/O ETW", true);
         }
@@ -271,6 +309,13 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor
         path.StartsWith(root.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
         || string.Equals(path, root, StringComparison.OrdinalIgnoreCase));
 
+    private void RecordDrop(string detail)
+    {
+        Interlocked.Increment(ref _dropped);
+        SetStatus(FileSensorState.OverflowDegraded, detail);
+        _statusSignals.Writer.TryWrite(0);
+    }
+
     private void CleanupFailedStart()
     {
         _session?.Dispose();
@@ -294,21 +339,43 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor
 
     private async Task PublishStatusesAsync()
     {
-        await foreach (var status in _statusNotifications.Reader.ReadAllAsync().ConfigureAwait(false))
+        var lastPublished = new FileSensorStatus(FileSensorState.Stopped, -1, null, DateTimeOffset.MinValue);
+        var lastPublishedAt = DateTimeOffset.MinValue;
+        await foreach (var signal in _statusSignals.Reader.ReadAllAsync().ConfigureAwait(false))
         {
-            var subscribers = StatusChanged;
-            if (subscribers is null) continue;
-            foreach (EventHandler<FileSensorStatus> subscriber in subscribers.GetInvocationList())
+            _ = signal;
+            while (_statusSignals.Reader.TryRead(out _)) { }
+            var delay = lastPublishedAt == DateTimeOffset.MinValue
+                ? TimeSpan.Zero
+                : _statusPublishInterval - (DateTimeOffset.UtcNow - lastPublishedAt);
+            if (delay > TimeSpan.Zero) await Task.Delay(delay).ConfigureAwait(false);
+
+            var status = Status;
+            if (status.State == lastPublished.State
+                && status.DroppedEvents == lastPublished.DroppedEvents
+                && string.Equals(status.Detail, lastPublished.Detail, StringComparison.Ordinal))
             {
-                try
+                continue;
+            }
+
+            var subscribers = StatusChanged;
+            if (subscribers is not null)
+            {
+                foreach (EventHandler<FileSensorStatus> subscriber in subscribers.GetInvocationList())
                 {
-                    subscriber(this, status with { DroppedEvents = Interlocked.Read(ref _dropped) });
-                }
-                catch
-                {
-                    // Subscriber failures must never affect the ETW callback or sensor lifetime.
+                    try
+                    {
+                        subscriber(this, status);
+                    }
+                    catch
+                    {
+                        // Subscriber failures must never affect the ETW callback or sensor lifetime.
+                    }
                 }
             }
+
+            lastPublished = status;
+            lastPublishedAt = DateTimeOffset.UtcNow;
         }
     }
 
@@ -326,13 +393,13 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor
             var status = new FileSensorStatus(state, Interlocked.Read(ref _dropped), detail, DateTimeOffset.UtcNow);
             if (ReferenceEquals(Interlocked.CompareExchange(ref _status, status, previous), previous))
             {
-                _statusNotifications.Writer.TryWrite(status);
+                _statusSignals.Writer.TryWrite(0);
                 return;
             }
         }
     }
 
-    private sealed record RawFileEvent(int ProcessId, string ProcessName, string Path, FileActivityOperation Operation, DateTimeOffset TimestampUtc);
+    private sealed record RawFileEvent(ResolvedProcessIdentity Process, string Path, FileActivityOperation Operation, DateTimeOffset TimestampUtc);
 
     private static string ResolveOwnershipDirectory(IEnumerable<string>? excludedRoots, string? configured)
     {
@@ -348,6 +415,126 @@ internal sealed record ResolvedProcessIdentity(ProcessIdentity Identity, string 
 internal interface IProcessIdentityResolver
 {
     ResolvedProcessIdentity? Resolve(int processId);
+}
+
+internal sealed class ProcessIdentityCache
+{
+    private readonly int _capacity;
+    private readonly TimeSpan _ttl;
+    private readonly Dictionary<int, CacheEntry> _entries = [];
+    private readonly LinkedList<int> _lru = [];
+    private readonly object _sync = new();
+
+    public ProcessIdentityCache(int capacity, TimeSpan ttl)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(capacity, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(ttl, TimeSpan.Zero);
+        _capacity = capacity;
+        _ttl = ttl;
+    }
+
+    internal int Count { get { lock (_sync) return _entries.Count; } }
+
+    public ResolvedProcessIdentity? Resolve(
+        int processId,
+        string processName,
+        DateTimeOffset eventTimestampUtc,
+        DateTimeOffset observedAtUtc,
+        IProcessIdentityResolver resolver)
+    {
+        if (TryGet(processId, processName, eventTimestampUtc, observedAtUtc, out var cached)) return cached;
+
+        var resolved = resolver.Resolve(processId);
+        if (resolved is null || eventTimestampUtc < resolved.Identity.StartTime) return null;
+        ObserveProcessStart(resolved, observedAtUtc);
+        return resolved;
+    }
+
+    public bool TryGet(
+        int processId,
+        string processName,
+        DateTimeOffset eventTimestampUtc,
+        DateTimeOffset observedAtUtc,
+        out ResolvedProcessIdentity? process)
+    {
+        lock (_sync)
+        {
+            CleanupExpired(observedAtUtc);
+            if (_entries.TryGetValue(processId, out var cached))
+            {
+                if (!string.IsNullOrWhiteSpace(processName)
+                    && !string.Equals(processName, cached.Value.ProcessName, StringComparison.OrdinalIgnoreCase))
+                {
+                    Remove(cached);
+                }
+                else
+                {
+                    Touch(cached, observedAtUtc);
+                    process = eventTimestampUtc < cached.Value.Identity.StartTime ? null : cached.Value;
+                    return true;
+                }
+            }
+        }
+
+        process = null;
+        return false;
+    }
+
+    public void ObserveProcessStart(ResolvedProcessIdentity process, DateTimeOffset observedAtUtc)
+    {
+        lock (_sync)
+        {
+            CleanupExpired(observedAtUtc);
+            if (_entries.TryGetValue(process.Identity.ProcessId, out var existing)) Remove(existing);
+            var node = _lru.AddLast(process.Identity.ProcessId);
+            _entries[process.Identity.ProcessId] = new CacheEntry(process, observedAtUtc + _ttl, node);
+            while (_entries.Count > _capacity)
+            {
+                Remove(_entries[_lru.First!.Value]);
+            }
+        }
+    }
+
+    public void ObserveProcessStop(int processId, DateTimeOffset stoppedAtUtc)
+    {
+        lock (_sync)
+        {
+            if (_entries.TryGetValue(processId, out var existing)
+                && existing.Value.Identity.StartTime <= stoppedAtUtc)
+            {
+                Remove(existing);
+            }
+        }
+    }
+
+    private void CleanupExpired(DateTimeOffset observedAtUtc)
+    {
+        while (_lru.First is { } node
+            && _entries[node.Value].ExpiresAtUtc <= observedAtUtc)
+        {
+            Remove(_entries[node.Value]);
+        }
+    }
+
+    private void Touch(CacheEntry entry, DateTimeOffset observedAtUtc)
+    {
+        entry.ExpiresAtUtc = observedAtUtc + _ttl;
+        _lru.Remove(entry.Node);
+        _lru.AddLast(entry.Node);
+    }
+
+    private void Remove(CacheEntry entry)
+    {
+        _entries.Remove(entry.Value.Identity.ProcessId);
+        _lru.Remove(entry.Node);
+    }
+
+    private sealed class CacheEntry(ResolvedProcessIdentity value, DateTimeOffset expiresAtUtc, LinkedListNode<int> node)
+    {
+        public ResolvedProcessIdentity Value { get; } = value;
+        public DateTimeOffset ExpiresAtUtc { get; set; } = expiresAtUtc;
+        public LinkedListNode<int> Node { get; } = node;
+    }
 }
 
 internal sealed class RuntimeProcessIdentityResolver : IProcessIdentityResolver

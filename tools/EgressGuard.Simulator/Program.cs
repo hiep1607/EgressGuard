@@ -98,13 +98,13 @@ internal static class Program
             _ = await File.ReadAllTextAsync(path, cancellationToken).ConfigureAwait(false);
             Console.WriteLine($"Opened and read synthetic fixture: {Path.GetFileName(path)}");
             Console.WriteLine("Opening loopback connection without transmitting file contents.");
-            await RunTcpAsync(options with
-            {
-                Address = IPAddress.Loopback,
-                Protocol = SimulatorProtocol.Tcp,
-                ConnectOnly = true,
-                Connections = 1
-            }, cancellationToken).ConfigureAwait(false);
+            using var client = new TcpClient(AddressFamily.InterNetwork);
+            await client.ConnectAsync(IPAddress.Loopback, options.Port, cancellationToken).ConfigureAwait(false);
+            Console.WriteLine($"Connected from {client.Client.LocalEndPoint} to {client.Client.RemoteEndPoint}.");
+            await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
+            _ = await File.ReadAllTextAsync(path, cancellationToken).ConfigureAwait(false);
+            Console.WriteLine("Re-read synthetic fixture after the loopback flow became observable; no bytes were sent.");
+            await HoldForObservationAsync(options.HoldSeconds, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
