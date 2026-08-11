@@ -7,13 +7,22 @@ using Microsoft.Diagnostics.Tracing.Session;
 
 namespace EgressGuard.Windows;
 
+/// <summary>
+/// Observe-only ETW file sensor.  The ETW callback does only cheap validation and
+/// writes a bounded raw event.  Process identity resolution and promotion happen
+/// after the network snapshot supplies an exact (PID, start time) identity.
+/// </summary>
 public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityInterestSink
 {
     public const int DefaultCapacity = 4096;
     internal const int DefaultProcessIdentityCapacity = 4096;
+    internal const int DefaultRecentRawCapacity = 4096;
+    internal const int DefaultRecentRawPerProcessCapacity = 256;
     internal static readonly TimeSpan DefaultProcessIdentityTtl = TimeSpan.FromMinutes(1);
+    internal static readonly TimeSpan DefaultRecentRawRetention = TimeSpan.FromSeconds(35);
     private static readonly TimeSpan DefaultStatusPublishInterval = TimeSpan.FromSeconds(1);
-    private readonly Channel<RawFileEvent> _staging;
+
+    private readonly Channel<RawFileActivity> _staging;
     private readonly Channel<FileActivity> _output;
     private readonly Channel<byte> _statusSignals;
     private readonly string[] _excludedRoots;
@@ -21,15 +30,25 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
     private readonly ProcessIdentityCache _processIdentities;
     private readonly EtwSessionOwnershipManager _ownershipManager;
     private readonly TimeSpan _statusPublishInterval;
+    private readonly int _recentRawCapacity;
+    private readonly int _recentRawPerProcessCapacity;
+    private readonly TimeSpan _recentRawRetention;
     private readonly object _sync = new();
+    private readonly object _correlationSync = new();
+    private readonly LinkedList<RawFileActivity> _recentRaw = [];
+    private readonly LinkedList<FileActivity> _pendingPromoted = [];
+    private readonly Dictionary<int, int> _recentRawByProcess = [];
+    private readonly Dictionary<int, ResolvedProcessIdentity> _processInterests = [];
     private TraceEventSession? _session;
     private Task? _traceTask;
     private Task? _projectionTask;
     private Task? _statusPublisherTask;
+    private Task? _stopTask;
     private CancellationTokenSource? _lifetime;
     private EtwSessionLease? _sessionLease;
     private long _sequence;
     private long _dropped;
+    private int _recentRawPeak;
     private FileSensorStatus _status = new(FileSensorState.Stopped, 0, null, DateTimeOffset.UtcNow);
 
     public EtwFileActivitySensor(IEnumerable<string>? excludedRoots = null, int capacity = DefaultCapacity, string? ownershipDirectory = null)
@@ -39,7 +58,10 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
             capacity,
             new EtwSessionOwnershipManager(ResolveOwnershipDirectory(excludedRoots, ownershipDirectory)),
             new ProcessIdentityCache(DefaultProcessIdentityCapacity, DefaultProcessIdentityTtl),
-            DefaultStatusPublishInterval)
+            DefaultStatusPublishInterval,
+            DefaultRecentRawCapacity,
+            DefaultRecentRawPerProcessCapacity,
+            DefaultRecentRawRetention)
     {
     }
 
@@ -49,16 +71,32 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
         int capacity = DefaultCapacity,
         EtwSessionOwnershipManager? ownershipManager = null,
         ProcessIdentityCache? processIdentities = null,
-        TimeSpan? statusPublishInterval = null)
+        TimeSpan? statusPublishInterval = null,
+        int recentRawCapacity = DefaultRecentRawCapacity,
+        int recentRawPerProcessCapacity = DefaultRecentRawPerProcessCapacity,
+        TimeSpan? recentRawRetention = null)
     {
+        ArgumentNullException.ThrowIfNull(processResolver);
         ArgumentOutOfRangeException.ThrowIfLessThan(capacity, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(recentRawCapacity, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(recentRawPerProcessCapacity, 1);
         _processResolver = processResolver;
         _processIdentities = processIdentities ?? new ProcessIdentityCache(DefaultProcessIdentityCapacity, DefaultProcessIdentityTtl);
         _ownershipManager = ownershipManager ?? new EtwSessionOwnershipManager(ResolveOwnershipDirectory(excludedRoots, null));
         _statusPublishInterval = statusPublishInterval ?? DefaultStatusPublishInterval;
-        if (_statusPublishInterval < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(statusPublishInterval));
-        _excludedRoots = (excludedRoots ?? []).Where(value => !string.IsNullOrWhiteSpace(value)).Select(Path.GetFullPath).ToArray();
-        _staging = Channel.CreateBounded<RawFileEvent>(new BoundedChannelOptions(capacity)
+        _recentRawCapacity = recentRawCapacity;
+        _recentRawPerProcessCapacity = recentRawPerProcessCapacity;
+        _recentRawRetention = recentRawRetention ?? DefaultRecentRawRetention;
+        if (_statusPublishInterval < TimeSpan.Zero || _recentRawRetention <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(statusPublishInterval));
+        }
+
+        _excludedRoots = (excludedRoots ?? [])
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(Path.GetFullPath)
+            .ToArray();
+        _staging = Channel.CreateBounded<RawFileActivity>(new BoundedChannelOptions(capacity)
         {
             FullMode = BoundedChannelFullMode.Wait,
             SingleReader = true,
@@ -80,16 +118,18 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
 
     public FileSensorStatus Status => Volatile.Read(ref _status) with { DroppedEvents = Interlocked.Read(ref _dropped) };
     public event EventHandler<FileSensorStatus>? StatusChanged;
+    internal int ProcessIdentityCacheCount => _processIdentities.Count;
+    internal int RecentRawEventCount { get { lock (_correlationSync) return _recentRaw.Count; } }
+    internal int RecentRawPeak => Volatile.Read(ref _recentRawPeak);
+    internal string? SessionName => _sessionLease?.SessionName;
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         lock (_sync)
         {
-            if (_lifetime is not null)
-            {
-                return Task.CompletedTask;
-            }
+            if (_lifetime is not null) return Task.CompletedTask;
+            if (_stopTask is not null) throw new InvalidOperationException("An ETW sensor instance cannot be restarted after StopAsync.");
 
             EnsureStatusPublisher();
             SetStatus(FileSensorState.Starting, null);
@@ -98,9 +138,7 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
             {
                 _sessionLease = _ownershipManager.Acquire();
                 _session = new TraceEventSession(_sessionLease.SessionName, null) { StopOnDispose = true };
-                _session.EnableKernelProvider(
-                    KernelTraceEventParser.Keywords.FileIOInit
-                    | KernelTraceEventParser.Keywords.FileIO);
+                _session.EnableKernelProvider(KernelTraceEventParser.Keywords.FileIOInit | KernelTraceEventParser.Keywords.FileIO);
                 RegisterCallbacks(_session);
                 _projectionTask = ProjectAsync(_lifetime.Token);
                 _traceTask = Task.Run(() => ProcessTrace(_session, _lifetime.Token), CancellationToken.None);
@@ -126,63 +164,66 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
         return Task.CompletedTask;
     }
 
-    public async Task StopAsync(CancellationToken cancellationToken)
+    public Task StopAsync(CancellationToken cancellationToken)
     {
-        TraceEventSession? session;
-        Task? traceTask;
-        Task? projectionTask;
+        Task stopTask;
+        Task? publisherTask = null;
         lock (_sync)
         {
-            session = _session;
-            traceTask = _traceTask;
-            projectionTask = _projectionTask;
-            _lifetime?.Cancel();
-            _staging.Writer.TryComplete();
-            session?.Stop();
-        }
-
-        var tasks = new[] { traceTask, projectionTask }.Where(task => task is not null).Cast<Task>().ToArray();
-        if (tasks.Length > 0)
-        {
-            await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
-        }
-
-        lock (_sync)
-        {
-            _session?.Dispose();
-            _session = null;
-            if (_sessionLease is not null)
+            if (_lifetime is null)
             {
-                _ownershipManager.Release(_sessionLease);
-                _sessionLease = null;
+                if (_stopTask is null) SetStatus(FileSensorState.Stopped, null);
+                _statusSignals.Writer.TryComplete();
+                publisherTask = _statusPublisherTask;
+                return publisherTask is null
+                    ? Task.CompletedTask
+                    : publisherTask.WaitAsync(TimeSpan.FromSeconds(8), cancellationToken);
             }
-            _lifetime?.Dispose();
-            _lifetime = null;
-            _traceTask = null;
-            _projectionTask = null;
-            _output.Writer.TryComplete();
+
+            stopTask = _stopTask ??= StopCoreAsync();
         }
 
-        SetStatus(FileSensorState.Stopped, null);
-        _statusSignals.Writer.TryComplete();
-        if (_statusPublisherTask is not null)
-        {
-            await _statusPublisherTask.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
-        }
+        return stopTask.WaitAsync(TimeSpan.FromSeconds(10), cancellationToken);
     }
 
     public IAsyncEnumerable<FileActivity> ReadAllAsync(CancellationToken cancellationToken) =>
         _output.Reader.ReadAllAsync(cancellationToken);
 
-    public void UpdateProcessInterests(IEnumerable<FileActivityProcessInterest> processes)
+    /// <summary>
+    /// Installs exact network identities and synchronously promotes buffered
+    /// pre-flow raw events.  The returned activities are consumed immediately by
+    /// FlowCoordinator so correlation cannot race the asynchronous ETW pump.
+    /// </summary>
+    public IReadOnlyList<FileActivity> UpdateProcessInterests(IEnumerable<FileActivityProcessInterest> processes)
     {
         ArgumentNullException.ThrowIfNull(processes);
         var observedAt = DateTimeOffset.UtcNow;
-        foreach (var process in processes)
+        var promoted = new List<FileActivity>();
+        lock (_correlationSync)
         {
-            _processIdentities.ObserveProcessStart(
-                new ResolvedProcessIdentity(process.Identity, process.ProcessName),
-                observedAt);
+            CleanupRecentRaw(observedAt);
+            foreach (var process in processes)
+            {
+                var resolved = new ResolvedProcessIdentity(process.Identity, process.ProcessName);
+                _processIdentities.ObserveProcessStart(resolved, observedAt);
+                _processInterests[process.Identity.ProcessId] = resolved;
+                PromoteForInterest(resolved, observedAt, promoted);
+                DrainPendingPromoted(resolved.Identity, promoted);
+            }
+        }
+
+        return promoted;
+    }
+
+    public void ObserveProcessStop(ProcessIdentity identity, DateTimeOffset stoppedAtUtc)
+    {
+        _processIdentities.ObserveProcessStop(identity, stoppedAtUtc);
+        lock (_correlationSync)
+        {
+            if (_processInterests.TryGetValue(identity.ProcessId, out var current) && current.Identity == identity)
+            {
+                _processInterests.Remove(identity.ProcessId);
+            }
         }
     }
 
@@ -190,12 +231,92 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
     {
         try
         {
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
             await StopAsync(timeout.Token).ConfigureAwait(false);
         }
         catch (Exception exception) when (exception is OperationCanceledException or TimeoutException)
         {
-            _session?.Dispose();
+            // Preserve the exact marker on a timeout; a subsequent start can
+            // reclaim only that exact verified orphan.
+            lock (_sync) _session?.Dispose();
+        }
+    }
+
+    private async Task StopCoreAsync()
+    {
+        TraceEventSession? session;
+        Task? traceTask;
+        Task? projectionTask;
+        CancellationTokenSource? lifetime;
+        EtwSessionLease? lease;
+        lock (_sync)
+        {
+            session = _session;
+            traceTask = _traceTask;
+            projectionTask = _projectionTask;
+            lifetime = _lifetime;
+            lease = _sessionLease;
+            lifetime?.Cancel();
+            _staging.Writer.TryComplete();
+        }
+
+        Exception? failure = null;
+        try
+        {
+            session?.Stop();
+            var tasks = new[] { traceTask, projectionTask }.Where(task => task is not null).Cast<Task>().ToArray();
+            if (tasks.Length > 0)
+            {
+                await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(8)).ConfigureAwait(false);
+            }
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+
+        try { session?.Dispose(); } catch (Exception exception) { failure ??= exception; }
+
+        var sessionStopped = lease is null || !_ownershipManager.IsActive(lease.SessionName);
+        if (!sessionStopped)
+        {
+            try
+            {
+                _ownershipManager.StopOwnedSession(lease!);
+                sessionStopped = !_ownershipManager.IsActive(lease!.SessionName);
+            }
+            catch (Exception exception)
+            {
+                failure ??= exception;
+            }
+        }
+
+        lock (_sync)
+        {
+            _session = null;
+            _traceTask = null;
+            _projectionTask = null;
+            _lifetime = null;
+            lifetime?.Dispose();
+            if (sessionStopped && lease is not null)
+            {
+                _ownershipManager.Release(lease);
+                _sessionLease = null;
+            }
+            _output.Writer.TryComplete(failure);
+        }
+
+        if (failure is not null || !sessionStopped)
+        {
+            SetStatus(FileSensorState.Failed, failure?.Message ?? "Exact owned ETW session remained active after bounded stop.");
+            throw failure ?? new InvalidOperationException("Exact owned ETW session remained active after bounded stop.");
+        }
+
+        SetStatus(FileSensorState.Stopped, null);
+        _statusSignals.Writer.TryComplete();
+        if (_statusPublisherTask is not null)
+        {
+            await _statusPublisherTask.WaitAsync(TimeSpan.FromSeconds(8)).ConfigureAwait(false);
         }
     }
 
@@ -212,16 +333,17 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
     {
         var timestampUtc = new DateTimeOffset(timestamp.ToUniversalTime());
         if (processId <= 0
-            || !_processIdentities.TryGet(processId, processName, timestampUtc, DateTimeOffset.UtcNow, out var process)
-            || process is null
             || string.IsNullOrWhiteSpace(path)
             || !Path.IsPathFullyQualified(path)
-            || IsExcluded(path))
+            || IsExcluded(path)
+            || IsLowValueSystemPath(path))
         {
             return;
         }
 
-        var item = new RawFileEvent(process!, path, operation, timestampUtc);
+        var item = new RawFileActivity(
+            Interlocked.Increment(ref _sequence), timestampUtc, processId,
+            processName ?? string.Empty, operation, path);
         if (!_staging.Writer.TryWrite(item))
         {
             RecordDrop("Bounded ETW staging buffer overflowed; events were dropped.");
@@ -231,29 +353,20 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
     internal void StageForTest(int processId, string processName, string path, FileActivityOperation operation, DateTime timestamp)
     {
         EnsureStatusPublisher();
-        if (!_processIdentities.TryGet(processId, processName, timestamp.ToUniversalTime(), DateTimeOffset.UtcNow, out var known)
-            || known is null)
-        {
-            var resolved = _processResolver.Resolve(processId);
-            if (resolved is not null)
-            {
-                _processIdentities.ObserveProcessStart(
-                    new ResolvedProcessIdentity(resolved.Identity, processName),
-                    DateTimeOffset.UtcNow);
-            }
-        }
         Stage(processId, processName, path, operation, timestamp);
     }
 
     internal FileActivity? ProjectForTest(int processId, string processName, string path, FileActivityOperation operation, DateTimeOffset timestampUtc)
     {
         var resolved = _processIdentities.Resolve(processId, processName, timestampUtc, DateTimeOffset.UtcNow, _processResolver);
-        return resolved is null ? null : Resolve(new RawFileEvent(resolved, path, operation, timestampUtc));
+        return resolved is null ? null : Resolve(new RawFileActivity(Interlocked.Increment(ref _sequence), timestampUtc, processId, processName, operation, path), resolved);
     }
 
-    internal int ProcessIdentityCacheCount => _processIdentities.Count;
-
-    internal string? SessionName => _sessionLease?.SessionName;
+    internal IReadOnlyList<FileActivity> PromoteRawForTest(IEnumerable<RawFileActivity> events, IEnumerable<FileActivityProcessInterest> interests)
+    {
+        foreach (var item in events) BufferRaw(item);
+        return UpdateProcessInterests(interests);
+    }
 
     private async Task ProjectAsync(CancellationToken cancellationToken)
     {
@@ -261,11 +374,7 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
         {
             await foreach (var item in _staging.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
             {
-                var activity = Resolve(item);
-                if (activity is not null && !_output.Writer.TryWrite(activity))
-                {
-                    RecordDrop("Bounded file activity output overflowed; events were dropped.");
-                }
+                BufferRaw(item);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -273,14 +382,134 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
         }
     }
 
-    private FileActivity? Resolve(RawFileEvent item)
+    private void BufferRaw(RawFileActivity item)
+    {
+        var promoted = default(FileActivity?);
+        lock (_correlationSync)
+        {
+            var now = DateTimeOffset.UtcNow;
+            CleanupRecentRaw(now);
+            if (_processInterests.TryGetValue(item.ProcessId, out var interest))
+            {
+                if (item.TimestampUtc >= interest.Identity.StartTime && item.TimestampUtc <= now.AddSeconds(5))
+                {
+                    promoted = Resolve(item, interest);
+                }
+                else if (item.TimestampUtc < interest.Identity.StartTime)
+                {
+                    return;
+                }
+            }
+
+            if (promoted is null)
+            {
+                AddRecentRaw(item);
+                return;
+            }
+        }
+
+        if (promoted is not null)
+        {
+            lock (_correlationSync)
+            {
+                _pendingPromoted.AddLast(promoted);
+                while (_pendingPromoted.Count > _recentRawCapacity)
+                {
+                    _pendingPromoted.RemoveFirst();
+                    RecordDrop("Promoted file activity handoff reached its hard bound; events were dropped.");
+                }
+            }
+        }
+        PublishOutput(promoted);
+    }
+
+    private void DrainPendingPromoted(ProcessIdentity identity, List<FileActivity> promoted)
+    {
+        var node = _pendingPromoted.First;
+        while (node is not null)
+        {
+            var next = node.Next;
+            if (node.Value.ProcessIdentity == identity)
+            {
+                promoted.Add(node.Value);
+                _pendingPromoted.Remove(node);
+            }
+
+            node = next;
+        }
+    }
+
+    private void PromoteForInterest(ResolvedProcessIdentity interest, DateTimeOffset observedAt, List<FileActivity> promoted)
+    {
+        var node = _recentRaw.First;
+        while (node is not null)
+        {
+            var next = node.Next;
+            var item = node.Value;
+            if (item.ProcessId == interest.Identity.ProcessId)
+            {
+                RemoveRecentRaw(node);
+                if (item.TimestampUtc >= interest.Identity.StartTime
+                    && item.TimestampUtc <= observedAt.AddSeconds(5))
+                {
+                    var activity = Resolve(item, interest);
+                    if (activity is not null) promoted.Add(activity);
+                }
+            }
+
+            node = next;
+        }
+    }
+
+    private void AddRecentRaw(RawFileActivity item)
+    {
+        var node = _recentRaw.AddLast(item);
+        _recentRawByProcess[item.ProcessId] = _recentRawByProcess.GetValueOrDefault(item.ProcessId) + 1;
+        _recentRawPeak = Math.Max(_recentRawPeak, _recentRaw.Count);
+        while (_recentRawByProcess[item.ProcessId] > _recentRawPerProcessCapacity)
+        {
+            var old = _recentRaw.FirstOrDefaultNode(value => value.ProcessId == item.ProcessId);
+            if (old is null) break;
+            RemoveRecentRaw(old);
+            RecordDrop("Per-process recent ETW buffer reached its hard bound; events were dropped.");
+        }
+
+        while (_recentRaw.Count > _recentRawCapacity)
+        {
+            RemoveRecentRaw(_recentRaw.First!);
+            RecordDrop("Global recent ETW buffer reached its hard bound; events were dropped.");
+        }
+    }
+
+    private void CleanupRecentRaw(DateTimeOffset now)
+    {
+        var cutoff = now - _recentRawRetention;
+        var node = _recentRaw.First;
+        while (node is not null)
+        {
+            var next = node.Next;
+            if (node.Value.TimestampUtc < cutoff) RemoveRecentRaw(node);
+            node = next;
+        }
+    }
+
+    private void RemoveRecentRaw(LinkedListNode<RawFileActivity> node)
+    {
+        var processId = node.Value.ProcessId;
+        _recentRaw.Remove(node);
+        if (_recentRawByProcess.TryGetValue(processId, out var count))
+        {
+            if (count <= 1) _recentRawByProcess.Remove(processId);
+            else _recentRawByProcess[processId] = count - 1;
+        }
+    }
+
+    private static FileActivity? Resolve(RawFileActivity item, ResolvedProcessIdentity process)
     {
         try
         {
             return new FileActivity(
-                Interlocked.Increment(ref _sequence), item.TimestampUtc,
-                item.Process.Identity,
-                item.Process.ProcessName,
+                item.Sequence, item.TimestampUtc, process.Identity, process.ProcessName,
                 item.Operation, Path.GetFullPath(item.Path), Path.GetExtension(item.Path).ToLowerInvariant(),
                 "Windows Kernel File I/O ETW", true);
         }
@@ -290,24 +519,35 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
         }
     }
 
+    private void PublishOutput(FileActivity? activity)
+    {
+        if (activity is not null && !_output.Writer.TryWrite(activity))
+        {
+            RecordDrop("Bounded file activity output overflowed; events were dropped.");
+        }
+    }
+
     private void ProcessTrace(TraceEventSession session, CancellationToken cancellationToken)
     {
-        try
-        {
-            session.Source.Process();
-        }
-        catch (Exception exception) when (cancellationToken.IsCancellationRequested && exception is (InvalidOperationException or ObjectDisposedException))
-        {
-        }
-        catch (Exception exception)
-        {
-            SetStatus(FileSensorState.Failed, $"ETW processing failed ({exception.GetType().Name}).");
-        }
+        try { session.Source.Process(); }
+        catch (Exception exception) when (cancellationToken.IsCancellationRequested && exception is InvalidOperationException or ObjectDisposedException) { }
+        catch (Exception exception) { SetStatus(FileSensorState.Failed, $"ETW processing failed ({exception.GetType().Name})."); }
     }
 
     private bool IsExcluded(string path) => _excludedRoots.Any(root =>
         path.StartsWith(root.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
         || string.Equals(path, root, StringComparison.OrdinalIgnoreCase));
+
+    // Kernel FileIO includes a very high-volume stream from the OS and shared
+    // installation trees.  These paths cannot provide useful user-file
+    // evidence and are rejected with cheap ordinal checks before entering the
+    // bounded raw buffer.  User profile, temp and application data files remain
+    // eligible, including the synthetic pre-flow fixture.
+    private static bool IsLowValueSystemPath(string path) =>
+        path.Contains("\\Windows\\", StringComparison.OrdinalIgnoreCase)
+        || path.Contains("\\Program Files\\", StringComparison.OrdinalIgnoreCase)
+        || path.Contains("\\Program Files (x86)\\", StringComparison.OrdinalIgnoreCase)
+        || path.Contains("\\Microsoft.NET\\", StringComparison.OrdinalIgnoreCase);
 
     private void RecordDrop(string detail)
     {
@@ -318,23 +558,27 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
 
     private void CleanupFailedStart()
     {
-        _session?.Dispose();
-        _session = null;
-        if (_sessionLease is not null)
+        try { _session?.Stop(); } catch { }
+        try { _session?.Dispose(); } catch { }
+        if (_sessionLease is { } lease)
         {
-            _ownershipManager.Release(_sessionLease);
-            _sessionLease = null;
+            try
+            {
+                if (_ownershipManager.IsActive(lease.SessionName)) _ownershipManager.StopOwnedSession(lease);
+                if (!_ownershipManager.IsActive(lease.SessionName)) _ownershipManager.Release(lease);
+            }
+            catch { }
         }
+
+        _session = null;
+        _sessionLease = null;
         _lifetime?.Dispose();
         _lifetime = null;
     }
 
     private void EnsureStatusPublisher()
     {
-        lock (_sync)
-        {
-            _statusPublisherTask ??= Task.Run(PublishStatusesAsync);
-        }
+        lock (_sync) _statusPublisherTask ??= Task.Run(PublishStatusesAsync);
     }
 
     private async Task PublishStatusesAsync()
@@ -349,28 +593,14 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
                 ? TimeSpan.Zero
                 : _statusPublishInterval - (DateTimeOffset.UtcNow - lastPublishedAt);
             if (delay > TimeSpan.Zero) await Task.Delay(delay).ConfigureAwait(false);
-
             var status = Status;
-            if (status.State == lastPublished.State
-                && status.DroppedEvents == lastPublished.DroppedEvents
-                && string.Equals(status.Detail, lastPublished.Detail, StringComparison.Ordinal))
-            {
-                continue;
-            }
-
+            if (status.State == lastPublished.State && status.DroppedEvents == lastPublished.DroppedEvents && string.Equals(status.Detail, lastPublished.Detail, StringComparison.Ordinal)) continue;
             var subscribers = StatusChanged;
             if (subscribers is not null)
             {
                 foreach (EventHandler<FileSensorStatus> subscriber in subscribers.GetInvocationList())
                 {
-                    try
-                    {
-                        subscriber(this, status);
-                    }
-                    catch
-                    {
-                        // Subscriber failures must never affect the ETW callback or sensor lifetime.
-                    }
+                    try { subscriber(this, status); } catch { }
                 }
             }
 
@@ -384,12 +614,7 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
         while (true)
         {
             var previous = Volatile.Read(ref _status);
-            var changed = previous.State != state || !string.Equals(previous.Detail, detail, StringComparison.Ordinal);
-            if (!changed)
-            {
-                return;
-            }
-
+            if (previous.State == state && string.Equals(previous.Detail, detail, StringComparison.Ordinal)) return;
             var status = new FileSensorStatus(state, Interlocked.Read(ref _dropped), detail, DateTimeOffset.UtcNow);
             if (ReferenceEquals(Interlocked.CompareExchange(ref _status, status, previous), previous))
             {
@@ -398,8 +623,6 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
             }
         }
     }
-
-    private sealed record RawFileEvent(ResolvedProcessIdentity Process, string Path, FileActivityOperation Operation, DateTimeOffset TimestampUtc);
 
     private static string ResolveOwnershipDirectory(IEnumerable<string>? excludedRoots, string? configured)
     {
@@ -435,35 +658,23 @@ internal sealed class ProcessIdentityCache
 
     internal int Count { get { lock (_sync) return _entries.Count; } }
 
-    public ResolvedProcessIdentity? Resolve(
-        int processId,
-        string processName,
-        DateTimeOffset eventTimestampUtc,
-        DateTimeOffset observedAtUtc,
-        IProcessIdentityResolver resolver)
+    public ResolvedProcessIdentity? Resolve(int processId, string processName, DateTimeOffset eventTimestampUtc, DateTimeOffset observedAtUtc, IProcessIdentityResolver resolver)
     {
         if (TryGet(processId, processName, eventTimestampUtc, observedAtUtc, out var cached)) return cached;
-
         var resolved = resolver.Resolve(processId);
         if (resolved is null || eventTimestampUtc < resolved.Identity.StartTime) return null;
         ObserveProcessStart(resolved, observedAtUtc);
         return resolved;
     }
 
-    public bool TryGet(
-        int processId,
-        string processName,
-        DateTimeOffset eventTimestampUtc,
-        DateTimeOffset observedAtUtc,
-        out ResolvedProcessIdentity? process)
+    public bool TryGet(int processId, string processName, DateTimeOffset eventTimestampUtc, DateTimeOffset observedAtUtc, out ResolvedProcessIdentity? process)
     {
         lock (_sync)
         {
             CleanupExpired(observedAtUtc);
             if (_entries.TryGetValue(processId, out var cached))
             {
-                if (!string.IsNullOrWhiteSpace(processName)
-                    && !string.Equals(processName, cached.Value.ProcessName, StringComparison.OrdinalIgnoreCase))
+                if (!string.IsNullOrWhiteSpace(processName) && !string.Equals(processName, cached.Value.ProcessName, StringComparison.OrdinalIgnoreCase))
                 {
                     Remove(cached);
                 }
@@ -488,18 +699,16 @@ internal sealed class ProcessIdentityCache
             if (_entries.TryGetValue(process.Identity.ProcessId, out var existing)) Remove(existing);
             var node = _lru.AddLast(process.Identity.ProcessId);
             _entries[process.Identity.ProcessId] = new CacheEntry(process, observedAtUtc + _ttl, node);
-            while (_entries.Count > _capacity)
-            {
-                Remove(_entries[_lru.First!.Value]);
-            }
+            while (_entries.Count > _capacity) Remove(_entries[_lru.First!.Value]);
         }
     }
 
-    public void ObserveProcessStop(int processId, DateTimeOffset stoppedAtUtc)
+    public void ObserveProcessStop(ProcessIdentity identity, DateTimeOffset stoppedAtUtc)
     {
         lock (_sync)
         {
-            if (_entries.TryGetValue(processId, out var existing)
+            if (_entries.TryGetValue(identity.ProcessId, out var existing)
+                && existing.Value.Identity == identity
                 && existing.Value.Identity.StartTime <= stoppedAtUtc)
             {
                 Remove(existing);
@@ -507,13 +716,19 @@ internal sealed class ProcessIdentityCache
         }
     }
 
+    // Compatibility for legacy callers that only know a PID.  Without the
+    // generation start time it is unsafe to remove anything: a delayed stop
+    // for an older process could otherwise delete a newer PID generation.
+    public void ObserveProcessStop(int processId, DateTimeOffset stoppedAtUtc)
+    {
+        _ = _capacity;
+        _ = processId;
+        _ = stoppedAtUtc;
+    }
+
     private void CleanupExpired(DateTimeOffset observedAtUtc)
     {
-        while (_lru.First is { } node
-            && _entries[node.Value].ExpiresAtUtc <= observedAtUtc)
-        {
-            Remove(_entries[node.Value]);
-        }
+        while (_lru.First is { } node && _entries[node.Value].ExpiresAtUtc <= observedAtUtc) Remove(_entries[node.Value]);
     }
 
     private void Touch(CacheEntry entry, DateTimeOffset observedAtUtc)
@@ -550,5 +765,18 @@ internal sealed class RuntimeProcessIdentityResolver : IProcessIdentityResolver
         {
             return null;
         }
+    }
+}
+
+internal static class LinkedListExtensions
+{
+    public static LinkedListNode<T>? FirstOrDefaultNode<T>(this LinkedList<T> list, Func<T, bool> predicate)
+    {
+        for (var node = list.First; node is not null; node = node.Next)
+        {
+            if (predicate(node.Value)) return node;
+        }
+
+        return null;
     }
 }

@@ -11,10 +11,10 @@ Phase 4 is observe-only. Related file activity is evidence that the same process
 
 ## Volume, correlation, and retention
 
-- ETW callbacks use `TryWrite` into a bounded channel and never wait. Overflow atomically increments the exact dropped-event counter and exposes `OverflowDegraded`; a separate capacity-one status channel coalesces notifications, so drops cannot create a task or notification storm.
+- ETW callbacks perform only cheap PID/path/operation checks and use `TryWrite` into a bounded channel; they never wait or resolve process identity. Overflow atomically increments the exact dropped-event counter and exposes `OverflowDegraded`; a separate capacity-one status channel coalesces notifications, so drops cannot create a task or notification storm and stop flushes the exact final count.
 - Normalize paths, reject incomplete operations, exclude the EgressGuard data/log/artifact roots early, and deduplicate identical process/path/operation events in a short window.
-- Stage only PIDs carrying an exact `(PID, ProcessStartTime)` interest from the current/recent network snapshot. Interests use a hard-bounded 4,096-entry LRU with a one-minute sliding TTL, so system-wide File I/O never performs per-event process lookup. Cleanup and capacity eviction remove the matching dedupe entry only when it still represents that event. Interest, event, and dedupe state therefore all have hard maxima.
-- Sensor projection resolves `(PID, ProcessStartTime)` and drops an event timestamped before the resolved process start, or whenever identity cannot be verified. This prevents a delayed raw event from being assigned to a reused PID.
+- Keep raw events before network interest in a recent bounded buffer (4,096 global, 256 per PID, 35-second retention). When the network snapshot supplies an exact `(PID, ProcessStartTime)` interest, promote matching raw events synchronously into `FileActivity`; this preserves the first flow's -30-second pre-flow window. Interests use a hard-bounded 4,096-entry LRU with a one-minute sliding TTL, so system-wide File I/O never performs per-event process lookup. Interest, raw, promoted-handoff, event, and dedupe state therefore all have hard maxima.
+- Promotion rejects an event timestamped before the exact process generation start. A new generation replaces the old PID entry, and a stop removes only the matching exact identity; process name is only a secondary check. This prevents a delayed raw event from being assigned to a reused PID.
 - The deterministic Core engine matches exact `(PID, ProcessStartTime)` from 30 seconds before through 5 seconds after flow first-seen, tolerates out-of-order delivery, and returns at most 20 evidence items per flow.
 - Confidence is rule-based (`High` for Read/Open/Create close to the flow, otherwise `Medium`/`Low`) and every reason states the operation and signed time delta.
 
@@ -29,7 +29,7 @@ Phase 4 is observe-only. Related file activity is evidence that the same process
 - SQLite schema v3 adds bounded `file_correlations` rows with parameterized writes, flow/time indexes, cascade cleanup, retention, and bounded reads. Persistence writes every item in the already-bounded batch; it does not truncate later flows with `Take(100)`.
 - Compatible IPC adds `GetFileCorrelations`; service status gains optional file-sensor fields with defaults so older payloads remain readable. Correlation replies are capped and stay under the 1 MiB framing limit.
 - Connection Detail adds a bounded, wrapping `Related file activity` list with empty/degraded states, tooltips, sensor status, and the explicit non-transmission warning. `FlowUpdated` triggers a capacity-one, at-most-once-per-second refresh for the selected flow; selection changes cancel stale work and only one IPC request can run.
-- Simulator `--file-correlation-test` creates and reads a synthetic temporary file, then connects only to loopback without sending file bytes, and removes the file in `finally`.
+- Simulator `--file-correlation-test` creates and reads a synthetic `.egfixture` temporary file before connecting only to loopback without sending file bytes, then removes the file in `finally`.
 
 ## Checkpoints and tests
 
@@ -53,4 +53,4 @@ Default CI uses fakes and requires neither Administrator nor policy changes. The
 - Events may be missed on overflow, provider differences, insufficient permission, or before a process first appears in a network snapshot. The safe Simulator re-reads its synthetic fixture after the loopback flow becomes observable.
 - File paths are sensitive; redaction reduces but cannot eliminate metadata sensitivity.
 - Protected marker integrity assumes the service identity, `SYSTEM`, and local Administrators are trusted. An Administrator can still tamper with ETW state and is outside this local ownership boundary.
-- The final 2026-08-11 focused smoke met the budget: enabled idle added 0.211 percentage points over disabled baseline, normal traffic added 0.124, and normal service CPU was 0.952%.
+- The fresh four-phase 45-second-per-phase smoke after the pre-flow redesign measured 3.166% normal and 6.152% stress service CPU, so the <3% normal budget is currently failed; prior measurements are historical and cannot be reused as current acceptance evidence.

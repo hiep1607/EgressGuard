@@ -18,8 +18,9 @@ UI never opens SQLite or changes Windows Firewall directly. Mutations cross the 
 IP Helper + process snapshot
   → WindowsFlowSensor
 Windows kernel File I/O ETW (optional)
-  → exact network-process interest cache (4,096; 1-minute TTL)
-  → non-blocking bounded staging (4,096) → PID/start-time validation
+  → non-blocking bounded raw staging (4,096; cheap path checks)
+  → recent raw buffer (4,096 global / 256 per PID / 35-second retention)
+  → exact PID/start-time promotion when a network flow appears
   → FileCorrelationEngine (-30/+5 seconds; max 20 evidence rows)
   → FlowCoordinator / RiskEngine / PolicyEngine
   ├─→ bounded persistence queue (2,048) → SQLite
@@ -46,7 +47,7 @@ Event kinds are `FlowAdded`, `FlowUpdated`, `FlowRemoved`, `AlertRaised`, `Servi
 
 ## Phase 4 file correlation
 
-`IFileActivitySensor` is a Core boundary. `EtwFileActivitySensor` is the Windows implementation backed by Microsoft's TraceEvent library and kernel File I/O keywords. `FlowCoordinator` supplies exact current network process identities through `IFileActivityInterestSink`; callbacks reject every other PID before path work or staging. The bounded LRU/TTL cache avoids system-wide per-event `Process.GetProcessById`, and a staged event retains the exact identity selected at callback time. A capacity-one status signal channel publishes changed dropped counts at most once per second and flushes the final total at stop. Session names are `EgressGuard.FileActivity.v2-{nonce}`. A protected exact-identity marker permits restart to reclaim only a dead EgressGuard controller's exact session; missing, invalid, live-owner, foreign and shared sessions are never stopped.
+`IFileActivitySensor` is a Core boundary. `EtwFileActivitySensor` is the Windows implementation backed by Microsoft's TraceEvent library and kernel File I/O keywords. ETW callbacks do only cheap PID/path/operation checks and `TryWrite` a raw event; they never call `Process.GetProcessById` or `Process.StartTime` for system-wide File I/O. A bounded recent raw buffer retains events that occur before a network flow. When `FlowCoordinator` supplies exact current network process identities through `IFileActivityInterestSink`, matching events at or after that generation's start time are synchronously promoted, so the -30/+5-second window works for the first flow as well as later flows. The recent buffer is capped globally and per PID with short retention; the exact interest cache is a separate bounded LRU/TTL structure. A capacity-one status signal channel publishes changed dropped counts at most once per second and flushes the final total at stop. Session names are `EgressGuard.FileActivity.v2-{nonce}`. A protected exact-identity marker permits restart to reclaim only a dead EgressGuard controller's exact session; missing, invalid, live-owner, foreign and shared sessions are never stopped.
 
 The pure engine matches exact `(PID, ProcessStartTime)` and a configurable temporal window, handles out-of-order events, deduplicates short repeats, expires old events, and gives event and dedupe state the same hard capacity. Eviction removes a dedupe key only when it still represents that exact timestamp. Stored paths are salted SHA-256 identifiers with redacted display identifiers and extensions. Correlation is descriptive evidence only: it never changes risk, policy, or firewall state and does not prove file transmission.
 

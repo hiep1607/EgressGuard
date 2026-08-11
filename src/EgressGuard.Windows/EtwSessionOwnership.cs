@@ -98,6 +98,27 @@ internal sealed class EtwSessionOwnershipManager
         }
     }
 
+    public bool IsActive(string sessionName) => _registry.IsActive(sessionName);
+
+    public void StopOwnedSession(EtwSessionLease lease)
+    {
+        var marker = ReadMarker();
+        if (marker is null
+            || marker.Nonce != lease.Nonce
+            || marker.OwnerProcessId != lease.OwnerProcessId
+            || marker.OwnerStartTimeUtc != lease.OwnerStartTimeUtc
+            || !string.Equals(marker.SessionName, lease.SessionName, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("The exact ETW ownership marker did not match the requested session.");
+        }
+
+        _registry.StopExact(lease.SessionName);
+        if (_registry.IsActive(lease.SessionName))
+        {
+            throw new InvalidOperationException("The exact owned ETW session did not stop.");
+        }
+    }
+
     private void EnsureProtectedDirectory()
     {
         var directory = Directory.CreateDirectory(_directory);

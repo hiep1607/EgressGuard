@@ -91,7 +91,7 @@ internal static class Program
 
     private static async Task RunFileCorrelationTestAsync(SimulatorOptions options, CancellationToken cancellationToken)
     {
-        var path = Path.Combine(Path.GetTempPath(), $"EgressGuard-FileCorrelation-{Guid.NewGuid():N}.txt");
+        var path = Path.Combine(Path.GetTempPath(), $"EgressGuard-FileCorrelation-{Guid.NewGuid():N}.egfixture");
         try
         {
             await File.WriteAllTextAsync(path, "Synthetic EgressGuard file-correlation fixture. No user data.", cancellationToken).ConfigureAwait(false);

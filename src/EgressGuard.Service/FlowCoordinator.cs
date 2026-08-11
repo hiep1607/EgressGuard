@@ -26,6 +26,8 @@ public sealed partial class FlowCoordinator : BackgroundService
     private readonly FileCorrelationEngine _fileCorrelationEngine;
     private readonly ConcurrentDictionary<string, byte> _seenExecutables = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _seenDestinations = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<int, ProcessIdentity> _fileProcessInterests = [];
+    private readonly object _fileProcessInterestSync = new();
 
     public FlowCoordinator(
         INetworkFlowSensor sensor,
@@ -157,9 +159,44 @@ public sealed partial class FlowCoordinator : BackgroundService
 
         if (_state.FileCorrelationEnabled && _fileSensor is IFileActivityInterestSink interestSink)
         {
-            interestSink.UpdateProcessInterests(captured
+            var currentInterests = captured
                 .Where(flow => flow.ProcessIdentity is not null)
-                .Select(flow => new FileActivityProcessInterest(flow.ProcessIdentity!.Value, flow.ProcessName)));
+                .Select(flow => new FileActivityProcessInterest(flow.ProcessIdentity!.Value, flow.ProcessName))
+                .GroupBy(item => item.Identity.ProcessId)
+                .Select(group => group.First())
+                .Take(4096)
+                .ToArray();
+            lock (_fileProcessInterestSync)
+            {
+                var currentByPid = currentInterests.ToDictionary(item => item.Identity.ProcessId, item => item.Identity);
+                foreach (var previous in _fileProcessInterests.ToArray())
+                {
+                    if (!currentByPid.TryGetValue(previous.Key, out var current) || current != previous.Value)
+                    {
+                        interestSink.ObserveProcessStop(previous.Value, DateTimeOffset.UtcNow);
+                        _fileProcessInterests.Remove(previous.Key);
+                    }
+                }
+
+                foreach (var interest in currentInterests)
+                {
+                    _fileProcessInterests[interest.Identity.ProcessId] = interest.Identity;
+                }
+
+                while (_fileProcessInterests.Count > 4096)
+                {
+                    var oldest = _fileProcessInterests.Keys.First();
+                    _fileProcessInterests.Remove(oldest);
+                }
+            }
+
+            var promoted = interestSink.UpdateProcessInterests(currentInterests);
+            // Pre-flow raw events are promoted synchronously from the sensor so
+            // Correlate below cannot race the asynchronous file pump.
+            foreach (var activity in promoted)
+            {
+                _ = _fileCorrelationEngine.Add(activity);
+            }
         }
 
         var rules = await SafeGetRulesAsync(cancellationToken).ConfigureAwait(false);

@@ -75,9 +75,23 @@ public interface IFileActivitySensor : IAsyncDisposable
 
 public sealed record FileActivityProcessInterest(ProcessIdentity Identity, string ProcessName);
 
+/// <summary>
+/// A privacy-preserving file event captured before a network flow is known.
+/// The path remains in-memory only and is promoted to <see cref="FileActivity"/>
+/// only after an exact process identity is supplied by the network sensor.
+/// </summary>
+public sealed record RawFileActivity(
+    long Sequence,
+    DateTimeOffset TimestampUtc,
+    int ProcessId,
+    string ProcessName,
+    FileActivityOperation Operation,
+    string Path);
+
 public interface IFileActivityInterestSink
 {
-    void UpdateProcessInterests(IEnumerable<FileActivityProcessInterest> processes);
+    IReadOnlyList<FileActivity> UpdateProcessInterests(IEnumerable<FileActivityProcessInterest> processes);
+    void ObserveProcessStop(ProcessIdentity identity, DateTimeOffset stoppedAtUtc);
 }
 
 public sealed class DisabledFileActivitySensor : IFileActivitySensor

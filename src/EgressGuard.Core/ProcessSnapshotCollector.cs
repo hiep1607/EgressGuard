@@ -40,7 +40,20 @@ public sealed class ProcessSnapshotCollector
             var name = TryRead(() => process.ProcessName) ?? $"pid-{process.Id}";
             var executablePath = TryRead(() => process.MainModule?.FileName);
             parentProcessIds.TryGetValue(process.Id, out var parentProcessId);
-            var metadata = executablePath is null ? null : _metadataProvider.GetMetadata(executablePath);
+            ExecutableMetadata? metadata = null;
+            if (executablePath is not null)
+            {
+                try
+                {
+                    metadata = _metadataProvider.GetMetadata(executablePath);
+                }
+                catch (Exception exception) when (IsExpectedProcessRace(exception))
+                {
+                    // Metadata is enrichment only. Preserve the exact PID +
+                    // start-time identity when hashing/signature inspection is
+                    // unavailable or races with process exit.
+                }
+            }
 
             snapshots[process.Id] = new ProcessSnapshot(
                 new ProcessIdentity(process.Id, startTime),
