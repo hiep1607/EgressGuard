@@ -133,11 +133,14 @@ public sealed class FileCorrelationEngine
 {
     private readonly FileCorrelationOptions _options;
     private readonly LinkedList<BufferedFileActivity> _events = [];
+    private readonly SortedSet<BufferedFileActivity> _eventsByTimestamp = new(BufferedFileActivityTimestampComparer.Instance);
     private readonly Dictionary<string, DateTimeOffset> _dedupe = new(StringComparer.OrdinalIgnoreCase);
     private readonly string[] _excludedRoots;
     private readonly byte[] _pathSalt;
     private readonly object _sync = new();
     private long _droppedEvents;
+    private long _nextOrdinal;
+    private long _cleanupNodesInspected;
 
     public FileCorrelationEngine(
         FileCorrelationOptions? options = null,
@@ -160,6 +163,8 @@ public sealed class FileCorrelationEngine
     public long DroppedEvents => Interlocked.Read(ref _droppedEvents);
     internal int BufferedEventCount { get { lock (_sync) return _events.Count; } }
     internal int DedupeEntryCount { get { lock (_sync) return _dedupe.Count; } }
+    internal int TimestampIndexCount { get { lock (_sync) return _eventsByTimestamp.Count; } }
+    internal long CleanupNodesInspected => Interlocked.Read(ref _cleanupNodesInspected);
 
     public bool Add(FileActivity activity)
     {
@@ -200,7 +205,9 @@ public sealed class FileCorrelationEngine
                 Interlocked.Increment(ref _droppedEvents);
             }
 
-            _events.AddLast(new BufferedFileActivity(normalized, key));
+            var buffered = new BufferedFileActivity(normalized, key, ++_nextOrdinal);
+            buffered.InsertionNode = _events.AddLast(buffered);
+            _eventsByTimestamp.Add(buffered);
             return true;
         }
     }
@@ -258,17 +265,13 @@ public sealed class FileCorrelationEngine
     {
         var cutoff = nowUtc - _options.Retention;
         var removed = 0;
-        var node = _events.First;
-        while (node is not null)
+        while (_eventsByTimestamp.Count > 0)
         {
-            var next = node.Next;
-            if (node.Value.Activity.TimestampUtc < cutoff)
-            {
-                RemoveNode(node);
-                removed++;
-            }
-
-            node = next;
+            Interlocked.Increment(ref _cleanupNodesInspected);
+            var oldest = _eventsByTimestamp.Min!;
+            if (oldest.Activity.TimestampUtc >= cutoff) break;
+            RemoveNode(oldest.InsertionNode!);
+            removed++;
         }
 
         return removed;
@@ -278,6 +281,7 @@ public sealed class FileCorrelationEngine
     {
         var item = node.Value;
         _events.Remove(node);
+        _eventsByTimestamp.Remove(item);
         if (_dedupe.TryGetValue(item.DedupeKey, out var timestamp) && timestamp == item.Activity.TimestampUtc)
         {
             _dedupe.Remove(item.DedupeKey);
@@ -305,5 +309,25 @@ public sealed class FileCorrelationEngine
         path.StartsWith(root, StringComparison.OrdinalIgnoreCase)
         || string.Equals(path.TrimEnd(Path.DirectorySeparatorChar), root.TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase);
 
-    private sealed record BufferedFileActivity(FileActivity Activity, string DedupeKey);
+    private sealed class BufferedFileActivity(FileActivity activity, string dedupeKey, long ordinal)
+    {
+        public FileActivity Activity { get; } = activity;
+        public string DedupeKey { get; } = dedupeKey;
+        public long Ordinal { get; } = ordinal;
+        public LinkedListNode<BufferedFileActivity>? InsertionNode { get; set; }
+    }
+
+    private sealed class BufferedFileActivityTimestampComparer : IComparer<BufferedFileActivity>
+    {
+        public static BufferedFileActivityTimestampComparer Instance { get; } = new();
+
+        public int Compare(BufferedFileActivity? left, BufferedFileActivity? right)
+        {
+            if (ReferenceEquals(left, right)) return 0;
+            if (left is null) return -1;
+            if (right is null) return 1;
+            var timestamp = left.Activity.TimestampUtc.CompareTo(right.Activity.TimestampUtc);
+            return timestamp != 0 ? timestamp : left.Ordinal.CompareTo(right.Ordinal);
+        }
+    }
 }

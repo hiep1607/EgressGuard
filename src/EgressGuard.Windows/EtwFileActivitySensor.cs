@@ -27,6 +27,7 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
     private readonly Channel<FileActivity> _output;
     private readonly Channel<byte> _statusSignals;
     private readonly string[] _excludedRoots;
+    private readonly string[] _lowValueSystemRoots;
     private readonly IProcessIdentityResolver _processResolver;
     private readonly ProcessIdentityCache _processIdentities;
     private readonly EtwSessionOwnershipManager _ownershipManager;
@@ -37,7 +38,8 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
     private readonly object _sync = new();
     private readonly object _correlationSync = new();
     private readonly LinkedList<BufferedRawFileActivity> _recentRaw = [];
-    private readonly LinkedList<FileActivity> _pendingPromoted = [];
+    private readonly LinkedList<BufferedPromotedFileActivity> _pendingPromoted = [];
+    private readonly Dictionary<ProcessIdentity, LinkedList<BufferedPromotedFileActivity>> _pendingPromotedByProcess = [];
     private readonly Dictionary<int, LinkedList<BufferedRawFileActivity>> _recentRawByProcess = [];
     private readonly Dictionary<int, ResolvedProcessIdentity> _processInterests = [];
     private TraceEventSession? _session;
@@ -51,6 +53,7 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
     private long _dropped;
     private int _recentRawPeak;
     private int _recentRawPerProcessPeak;
+    private long _pendingPromotionNodesVisited;
     private DateTimeOffset _nextRecentRawCleanupUtc = DateTimeOffset.MinValue;
     private FileSensorStatus _status = new(FileSensorState.Stopped, 0, null, DateTimeOffset.UtcNow);
 
@@ -77,7 +80,8 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
         TimeSpan? statusPublishInterval = null,
         int recentRawCapacity = DefaultRecentRawCapacity,
         int recentRawPerProcessCapacity = DefaultRecentRawPerProcessCapacity,
-        TimeSpan? recentRawRetention = null)
+        TimeSpan? recentRawRetention = null,
+        IEnumerable<string>? lowValueSystemRoots = null)
     {
         ArgumentNullException.ThrowIfNull(processResolver);
         ArgumentOutOfRangeException.ThrowIfLessThan(capacity, 1);
@@ -99,6 +103,7 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
             .Where(value => !string.IsNullOrWhiteSpace(value))
             .Select(Path.GetFullPath)
             .ToArray();
+        _lowValueSystemRoots = NormalizeRoots(lowValueSystemRoots ?? GetDefaultLowValueSystemRoots());
         _staging = Channel.CreateBounded<RawFileActivity>(new BoundedChannelOptions(capacity)
         {
             FullMode = BoundedChannelFullMode.Wait,
@@ -125,6 +130,10 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
     internal int RecentRawEventCount { get { lock (_correlationSync) return _recentRaw.Count; } }
     internal int RecentRawPeak => Volatile.Read(ref _recentRawPeak);
     internal int RecentRawPerProcessPeak => Volatile.Read(ref _recentRawPerProcessPeak);
+    internal int PendingPromotedCount { get { lock (_correlationSync) return _pendingPromoted.Count; } }
+    internal int PendingPromotedIdentityCount { get { lock (_correlationSync) return _pendingPromotedByProcess.Count; } }
+    internal long PendingPromotionNodesVisited => Interlocked.Read(ref _pendingPromotionNodesVisited);
+    internal int StagedEventCount => _staging.Reader.Count;
     internal string? SessionName => _sessionLease?.SessionName;
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -340,7 +349,7 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
             || string.IsNullOrWhiteSpace(path)
             || !Path.IsPathFullyQualified(path)
             || IsExcluded(path)
-            || IsLowValueSystemPath(path))
+            || IsLowValueSystemPathCore(path, _lowValueSystemRoots))
         {
             return;
         }
@@ -416,12 +425,7 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
         {
             lock (_correlationSync)
             {
-                _pendingPromoted.AddLast(promoted);
-                while (_pendingPromoted.Count > _recentRawCapacity)
-                {
-                    _pendingPromoted.RemoveFirst();
-                    RecordDrop("Promoted file activity handoff reached its hard bound; events were dropped.");
-                }
+                AddPendingPromoted(promoted);
             }
         }
         PublishOutput(promoted);
@@ -429,17 +433,44 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
 
     private void DrainPendingPromoted(ProcessIdentity identity, List<FileActivity> promoted)
     {
-        var node = _pendingPromoted.First;
+        if (!_pendingPromotedByProcess.TryGetValue(identity, out var processEvents)) return;
+        var node = processEvents.First;
         while (node is not null)
         {
             var next = node.Next;
-            if (node.Value.ProcessIdentity == identity)
-            {
-                promoted.Add(node.Value);
-                _pendingPromoted.Remove(node);
-            }
-
+            Interlocked.Increment(ref _pendingPromotionNodesVisited);
+            promoted.Add(node.Value.Activity);
+            RemovePendingPromoted(node.Value);
             node = next;
+        }
+    }
+
+    private void AddPendingPromoted(FileActivity activity)
+    {
+        if (!_pendingPromotedByProcess.TryGetValue(activity.ProcessIdentity, out var processEvents))
+        {
+            processEvents = [];
+            _pendingPromotedByProcess[activity.ProcessIdentity] = processEvents;
+        }
+
+        var buffered = new BufferedPromotedFileActivity(activity);
+        buffered.GlobalNode = _pendingPromoted.AddLast(buffered);
+        buffered.ProcessNode = processEvents.AddLast(buffered);
+        while (_pendingPromoted.Count > _recentRawCapacity)
+        {
+            RemovePendingPromoted(_pendingPromoted.First!.Value);
+            RecordDrop("Promoted file activity handoff reached its hard bound; events were dropped.");
+        }
+    }
+
+    private void RemovePendingPromoted(BufferedPromotedFileActivity buffered)
+    {
+        if (buffered.GlobalNode is { List: not null }) _pendingPromoted.Remove(buffered.GlobalNode);
+        if (_pendingPromotedByProcess.TryGetValue(buffered.Activity.ProcessIdentity, out var processEvents)
+            && buffered.ProcessNode is { List: not null })
+        {
+            processEvents.Remove(buffered.ProcessNode);
+            if (processEvents.Count == 0) _pendingPromotedByProcess.Remove(buffered.Activity.ProcessIdentity);
         }
     }
 
@@ -557,11 +588,44 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
     // evidence and are rejected with cheap ordinal checks before entering the
     // bounded raw buffer.  User profile, temp and application data files remain
     // eligible, including the synthetic pre-flow fixture.
-    private static bool IsLowValueSystemPath(string path) =>
-        path.Contains("\\Windows\\", StringComparison.OrdinalIgnoreCase)
-        || path.Contains("\\Program Files\\", StringComparison.OrdinalIgnoreCase)
-        || path.Contains("\\Program Files (x86)\\", StringComparison.OrdinalIgnoreCase)
-        || path.Contains("\\Microsoft.NET\\", StringComparison.OrdinalIgnoreCase);
+    internal static bool IsLowValueSystemPath(string path, IEnumerable<string> systemRoots)
+    {
+        ArgumentNullException.ThrowIfNull(systemRoots);
+        return IsLowValueSystemPathCore(path, NormalizeRoots(systemRoots));
+    }
+
+    private static bool IsLowValueSystemPathCore(string path, IReadOnlyList<string> normalizedSystemRoots)
+    {
+        string normalizedPath;
+        try { normalizedPath = Path.GetFullPath(path); }
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
+        }
+
+        return normalizedSystemRoots.Any(root => IsUnderNormalizedDirectoryRoot(normalizedPath, root));
+    }
+
+    private static string[] GetDefaultLowValueSystemRoots() => NormalizeRoots([
+        Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+        Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+        Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86)
+    ]);
+
+    private static string[] NormalizeRoots(IEnumerable<string> roots) => roots
+        .Where(root => !string.IsNullOrWhiteSpace(root))
+        .Select(Path.GetFullPath)
+        .Select(Path.TrimEndingDirectorySeparator)
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToArray();
+
+    private static bool IsUnderNormalizedDirectoryRoot(string path, string normalizedRoot)
+    {
+        return string.Equals(path, normalizedRoot, StringComparison.OrdinalIgnoreCase)
+            || path.StartsWith(normalizedRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+            || (Path.AltDirectorySeparatorChar != Path.DirectorySeparatorChar
+                && path.StartsWith(normalizedRoot + Path.AltDirectorySeparatorChar, StringComparison.OrdinalIgnoreCase));
+    }
 
     private void RecordDrop(string detail)
     {
@@ -787,4 +851,11 @@ internal sealed class BufferedRawFileActivity(RawFileActivity activity)
     public RawFileActivity Activity { get; } = activity;
     public LinkedListNode<BufferedRawFileActivity>? GlobalNode { get; set; }
     public LinkedListNode<BufferedRawFileActivity>? ProcessNode { get; set; }
+}
+
+internal sealed class BufferedPromotedFileActivity(FileActivity activity)
+{
+    public FileActivity Activity { get; } = activity;
+    public LinkedListNode<BufferedPromotedFileActivity>? GlobalNode { get; set; }
+    public LinkedListNode<BufferedPromotedFileActivity>? ProcessNode { get; set; }
 }

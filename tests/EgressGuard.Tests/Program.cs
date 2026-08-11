@@ -78,6 +78,7 @@ internal static class Program
             ("File correlation dedupe state has a hard bound", TestFileCorrelationDedupeBoundAsync),
             ("File correlation eviction preserves newer dedupe entries", TestFileCorrelationDedupeEvictionAsync),
             ("File correlation excludes EgressGuard-owned storage", TestFileCorrelationExclusionAsync),
+            ("System path filtering uses normalized directory boundaries", TestSystemPathFilteringAsync),
             ("Disabled and degraded file sensors remain bounded", TestFileSensorStatesAsync),
             ("File sensor publishes coalesced final dropped count", TestFileSensorDroppedCountNotificationsAsync),
             ("File sensor rejects events older than resolved process identity", TestFileSensorPidReuseProjectionAsync),
@@ -85,6 +86,8 @@ internal static class Program
             ("Pre-flow raw events promote through the production interest path", TestPreFlowRawPromotionAsync),
             ("Pre-flow raw buffer retention and per-process bounds are enforced", TestPreFlowRawBufferBoundsAsync),
             ("PID reuse promotes only the current process generation", TestPidReuseRawPromotionAsync),
+            ("Pending promotion is indexed by exact process identity", TestPendingPromotionIndexAsync),
+            ("Promoted correlation cleanup work is bounded", TestPromotedCorrelationCleanupAsync),
             ("ETW ownership reclaims only an exact verified orphan", TestEtwOwnershipAsync),
             ("AccessDenied file sensor does not crash network service", TestFileSensorDegradedServiceAsync),
             ("Native port conversion", TestPortConversionAsync),
@@ -281,6 +284,35 @@ internal static class Program
         AssertTrue(!engine.Add(FileEvent(flow, 1, -1, FileActivityOperation.Write, "C:\\ProgramData\\EgressGuard\\egressguard.db-wal")), "Owned database event was accepted.");
         AssertEqual(0, engine.Correlate(flow, flow.FirstSeen).Count);
         return Task.CompletedTask;
+    }
+
+    private static async Task TestSystemPathFilteringAsync()
+    {
+        string[] systemRoots = ["C:\\Windows", "C:\\Program Files", "C:\\Program Files (x86)"];
+        AssertTrue(EtwFileActivitySensor.IsLowValueSystemPath("C:\\Windows\\System32\\kernel32.dll", systemRoots), "A real Windows-root file was not filtered.");
+        AssertTrue(EtwFileActivitySensor.IsLowValueSystemPath("c:\\program files\\Vendor\\tool.dll", systemRoots), "A real Program Files file was not filtered case-insensitively.");
+        AssertTrue(EtwFileActivitySensor.IsLowValueSystemPath("C:\\Program Files (x86)\\Vendor\\tool.dll", systemRoots), "A real Program Files (x86) file was not filtered.");
+        AssertTrue(!EtwFileActivitySensor.IsLowValueSystemPath("C:\\Users\\Test\\Windows\\secret.txt", systemRoots), "A user directory named Windows was filtered.");
+        AssertTrue(!EtwFileActivitySensor.IsLowValueSystemPath("C:\\Users\\Test\\Program Files\\secret.txt", systemRoots), "A user directory named Program Files was filtered.");
+        AssertTrue(!EtwFileActivitySensor.IsLowValueSystemPath("C:\\WindowsBackup\\secret.txt", systemRoots), "A near-match Windows root was filtered.");
+        AssertTrue(!EtwFileActivitySensor.IsLowValueSystemPath("C:\\Users\\Test\\AppData\\Local\\Temp\\Windows\\secret.txt", systemRoots), "A Temp/AppData path was filtered by a component name.");
+
+        await using var sensor = new EtwFileActivitySensor(
+            new FixedProcessIdentityResolver(new ProcessIdentity(1, DateTimeOffset.UtcNow.AddMinutes(-1)), "filter"),
+            excludedRoots: ["C:\\ProgramData\\EgressGuard"],
+            capacity: 8,
+            lowValueSystemRoots: systemRoots);
+        var timestamp = DateTime.UtcNow;
+        sensor.StageForTest(1, "filter", "C:\\Windows\\System32\\kernel32.dll", FileActivityOperation.Read, timestamp);
+        sensor.StageForTest(1, "filter", "C:\\Program Files\\Vendor\\tool.dll", FileActivityOperation.Read, timestamp);
+        sensor.StageForTest(1, "filter", "C:\\Program Files (x86)\\Vendor\\tool.dll", FileActivityOperation.Read, timestamp);
+        sensor.StageForTest(1, "filter", "C:\\Users\\Test\\Windows\\secret.txt", FileActivityOperation.Read, timestamp);
+        sensor.StageForTest(1, "filter", "C:\\Users\\Test\\Program Files\\secret.txt", FileActivityOperation.Read, timestamp);
+        sensor.StageForTest(1, "filter", "C:\\WindowsBackup\\secret.txt", FileActivityOperation.Read, timestamp);
+        sensor.StageForTest(1, "filter", "C:\\Users\\Test\\AppData\\Local\\Temp\\Windows\\secret.txt", FileActivityOperation.Read, timestamp);
+        sensor.StageForTest(1, "filter", "C:\\ProgramData\\EgressGuard\\egressguard.db-wal", FileActivityOperation.Read, timestamp);
+        AssertEqual(4, sensor.StagedEventCount);
+        await sensor.StopAsync(CancellationToken.None).ConfigureAwait(false);
     }
 
     private static async Task TestFileSensorStatesAsync()
@@ -586,6 +618,152 @@ internal static class Program
         AssertEqual(identityB, current[0].ProcessIdentity);
         AssertTrue(current[0].Path.EndsWith("generation-b.egfixture", StringComparison.OrdinalIgnoreCase), "PID reuse promoted an event from the previous generation.");
         AssertEqual(0, promoted.Count);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestPendingPromotionIndexAsync()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var interests = Enumerable.Range(1, 64)
+            .Select(processId => new FileActivityProcessInterest(new ProcessIdentity(processId, now.AddMinutes(-1)), $"process-{processId}"))
+            .ToArray();
+        var sensor = new EtwFileActivitySensor(
+            new FixedProcessIdentityResolver(interests[0].Identity, interests[0].ProcessName),
+            capacity: 4096,
+            recentRawCapacity: 4096,
+            recentRawPerProcessCapacity: 256,
+            recentRawRetention: TimeSpan.FromMinutes(1));
+        AssertEqual(0, sensor.UpdateProcessInterests(interests).Count);
+        var events = Enumerable.Range(0, 256)
+            .Select(index =>
+            {
+                var interest = interests[index % interests.Length];
+                return new RawFileActivity(
+                    index,
+                    now.AddMilliseconds(index % 4),
+                    interest.Identity.ProcessId,
+                    interest.ProcessName,
+                    FileActivityOperation.Read,
+                    $"C:\\Synthetic\\pending-{index}.egfixture");
+            })
+            .ToArray();
+        AssertEqual(0, sensor.PromoteRawForTest(events, []).Count);
+        AssertEqual(events.Length, sensor.PendingPromotedCount);
+        AssertEqual(interests.Length, sensor.PendingPromotedIdentityCount);
+
+        var visitsBefore = sensor.PendingPromotionNodesVisited;
+        var promoted = sensor.UpdateProcessInterests(interests);
+        var visits = sensor.PendingPromotionNodesVisited - visitsBefore;
+        AssertEqual(events.Length, promoted.Count);
+        AssertEqual((long)events.Length, visits);
+        AssertTrue(visits < (long)interests.Length * events.Length, "Pending promotion still scanned the process-by-event product.");
+        AssertTrue(promoted.All(item => item.ProcessName == $"process-{item.ProcessIdentity.ProcessId}"), "An identity received another process's pending event.");
+        foreach (var group in promoted.GroupBy(item => item.ProcessIdentity))
+        {
+            AssertTrue(group.Select(item => item.Sequence).SequenceEqual(group.Select(item => item.Sequence).Order()), "Pending promotion changed deterministic per-identity event order.");
+        }
+        AssertEqual(0, sensor.PendingPromotedCount);
+        AssertEqual(0, sensor.PendingPromotedIdentityCount);
+        AssertEqual(0, sensor.UpdateProcessInterests(interests).Count);
+        AssertEqual(visitsBefore + visits, sensor.PendingPromotionNodesVisited);
+
+        var reusedSensor = new EtwFileActivitySensor(
+            new FixedProcessIdentityResolver(new ProcessIdentity(77, now), "same-name"),
+            capacity: 8,
+            recentRawCapacity: 4,
+            recentRawPerProcessCapacity: 4,
+            recentRawRetention: TimeSpan.FromMinutes(1));
+        var generationA = new FileActivityProcessInterest(new ProcessIdentity(77, now.AddMinutes(-1)), "same-name");
+        var generationB = new FileActivityProcessInterest(new ProcessIdentity(77, now), "same-name");
+        _ = reusedSensor.UpdateProcessInterests([generationA]);
+        _ = reusedSensor.PromoteRawForTest([
+            new RawFileActivity(1, now.AddSeconds(-1), 77, "same-name", FileActivityOperation.Read, "C:\\Synthetic\\generation-a-pending.egfixture")
+        ], []);
+        AssertEqual(0, reusedSensor.UpdateProcessInterests([generationB]).Count);
+        _ = reusedSensor.PromoteRawForTest([
+            new RawFileActivity(2, now.AddSeconds(1), 77, "same-name", FileActivityOperation.Read, "C:\\Synthetic\\generation-b-pending.egfixture")
+        ], []);
+        var current = reusedSensor.UpdateProcessInterests([generationB]);
+        AssertEqual(1, current.Count);
+        AssertEqual(generationB.Identity, current[0].ProcessIdentity);
+        AssertEqual(1, reusedSensor.PendingPromotedCount);
+
+        var evictionInterests = Enumerable.Range(100, 5)
+            .Select(processId => new FileActivityProcessInterest(new ProcessIdentity(processId, now.AddMinutes(-1)), $"evict-{processId}"))
+            .ToArray();
+        _ = reusedSensor.UpdateProcessInterests(evictionInterests);
+        _ = reusedSensor.PromoteRawForTest(evictionInterests.Select((interest, index) => new RawFileActivity(
+            10 + index,
+            now,
+            interest.Identity.ProcessId,
+            interest.ProcessName,
+            FileActivityOperation.Read,
+            $"C:\\Synthetic\\evict-{index}.egfixture")), []);
+        AssertEqual(4, reusedSensor.PendingPromotedCount);
+        AssertEqual(4, reusedSensor.PendingPromotedIdentityCount);
+        var retained = reusedSensor.UpdateProcessInterests(evictionInterests);
+        AssertEqual(4, retained.Count);
+        AssertEqual(0, reusedSensor.PendingPromotedCount);
+        AssertEqual(0, reusedSensor.PendingPromotedIdentityCount);
+        AssertEqual(2L, reusedSensor.Status.DroppedEvents);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestPromotedCorrelationCleanupAsync()
+    {
+        const int capacity = 4096;
+        var now = DateTimeOffset.UtcNow;
+        var interests = Enumerable.Range(1, 64)
+            .Select(processId => new FileActivityProcessInterest(new ProcessIdentity(processId, now.AddMinutes(-1)), $"correlate-{processId}"))
+            .ToArray();
+        var sensor = new EtwFileActivitySensor(
+            new FixedProcessIdentityResolver(interests[0].Identity, interests[0].ProcessName),
+            capacity: capacity,
+            recentRawCapacity: capacity,
+            recentRawPerProcessCapacity: 256,
+            recentRawRetention: TimeSpan.FromMinutes(2));
+        _ = sensor.UpdateProcessInterests(interests);
+        _ = sensor.PromoteRawForTest(Enumerable.Range(0, capacity).Select(index =>
+        {
+            var interest = interests[index % interests.Length];
+            return new RawFileActivity(
+                index,
+                now.AddSeconds(-(index % 25)),
+                interest.Identity.ProcessId,
+                interest.ProcessName,
+                FileActivityOperation.Read,
+                $"C:\\Synthetic\\promoted-{index}.egfixture");
+        }), []);
+        var promoted = sensor.UpdateProcessInterests(interests);
+        AssertEqual(capacity, promoted.Count);
+
+        var options = new FileCorrelationOptions(
+            TimeSpan.FromSeconds(30),
+            TimeSpan.FromSeconds(5),
+            TimeSpan.FromMinutes(2),
+            TimeSpan.FromMilliseconds(750),
+            capacity,
+            20);
+        var engine = new FileCorrelationEngine(options, pathSalt: [1, 2, 3, 4]);
+        var inspectionsBefore = engine.CleanupNodesInspected;
+        foreach (var activity in promoted) AssertTrue(engine.Add(activity), "A unique promoted event was rejected.");
+        var addInspections = engine.CleanupNodesInspected - inspectionsBefore;
+        AssertEqual(capacity, engine.BufferedEventCount);
+        AssertEqual(capacity, engine.TimestampIndexCount);
+        AssertEqual((long)capacity - 1, addInspections);
+
+        var sample = SampleFlow() with
+        {
+            ProcessIdentity = interests[0].Identity,
+            ProcessName = interests[0].ProcessName,
+            FirstSeen = now,
+            LastSeen = now.AddSeconds(1)
+        };
+        AssertEqual(20, engine.Correlate(sample, now).Count);
+        AssertEqual(capacity, engine.Cleanup(now.AddMinutes(3)));
+        AssertEqual(0, engine.BufferedEventCount);
+        AssertEqual(0, engine.TimestampIndexCount);
+        AssertEqual(0, engine.DedupeEntryCount);
         return Task.CompletedTask;
     }
 

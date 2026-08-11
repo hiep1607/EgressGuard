@@ -1,6 +1,14 @@
 # Performance report
 
-Status: `Verified` for the current dual-index raw-buffer source. The final smoke below is the only CPU/RAM acceptance evidence for this head; older tables remain historical. Tool: one-second `Process.TotalProcessorTime` deltas normalized by 12 logical processors; `WorkingSet64`; Release build.
+Status: runtime CPU/RAM is `Verified` for reviewed baseline `9ed380f856e780e48492ea51b96881ef9918b1cd`; the current local technical-finding changes are structurally tested but did not rerun the service/UI smoke. The final smoke below remains baseline evidence and is not relabeled as current-head evidence. Tool: one-second `Process.TotalProcessorTime` deltas normalized by 12 logical processors; `WorkingSet64`; Release build.
+
+## Final technical-finding structural diagnostics (2026-08-11)
+
+Deterministic default-suite regressions exercise production promotion and correlation structures without CI timing thresholds. With 64 exact process identities and 256 pending promoted events, the former linked-list drain would inspect `64 × 256 = 16,384` nodes; the exact-identity/global dual index inspected exactly 256 matching nodes, retained per-identity insertion order, returned no event across a PID-generation boundary, stayed within the 4,096 hard bound, and left zero index entries after global eviction and drain.
+
+The focused promoted-load diagnostic installs network interests, promotes 4,096 synthetic file events, adds them to a near-capacity `FileCorrelationEngine`, and correlates an exact-identity flow. The former `CleanupCore()` structure would inspect `0 + 1 + … + 4,095 = 8,386,560` event nodes while filling the buffer. The insertion-order list plus timestamp-sorted bounded index inspected exactly 4,095 oldest candidates, returned the expected 20-item evidence cap, then removed all 4,096 expired events with event, timestamp-index and dedupe counts all zero. This is structural work evidence, not a replacement service CPU measurement.
+
+The existing raw-buffer microbenchmark was also rerun on the final local source: 100,000 synthetic events completed in 42.485 ms (2,353,783 events/s), with exact global/per-PID peaks of 4,096/128 for the distributed case; the hot-PID case completed in 9.412 ms and stayed at the 256 per-PID bound. These results guard the earlier raw-buffer improvement but do not measure service/UI CPU.
 
 ## Final warm steady-state smoke (2026-08-11)
 
