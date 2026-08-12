@@ -10,7 +10,34 @@ public interface IOutboundGateNonceProvider
     Guid NextNonce();
 }
 
+public sealed record OutboundGateTrustedRuntimeState
+{
+    public Guid BootInstance { get; }
+    public Guid WfpGeneration { get; }
+    public Guid MinifilterGeneration { get; }
+
+    public OutboundGateTrustedRuntimeState(Guid bootInstance, Guid wfpGeneration, Guid minifilterGeneration)
+    {
+        OutboundGateLimits.GuidValue(bootInstance, nameof(bootInstance));
+        OutboundGateLimits.GuidValue(wfpGeneration, nameof(wfpGeneration));
+        OutboundGateLimits.GuidValue(minifilterGeneration, nameof(minifilterGeneration));
+        BootInstance = bootInstance;
+        WfpGeneration = wfpGeneration;
+        MinifilterGeneration = minifilterGeneration;
+    }
+}
+
 public sealed record GateStateMachineCounters(long FailedOpenCount, long OverflowCount, long ActiveIntentCount, long ActiveChallengeCount);
+
+public sealed record GateStateMachineStorageSnapshot(
+    int ActiveContextCount,
+    int TerminalHistoryCount,
+    int ChallengeMappingCount,
+    int CriticalAlertCount,
+    int ActiveContextCapacity,
+    int TerminalHistoryCapacity,
+    int ChallengeMappingCapacity,
+    int CriticalAlertCapacity);
 
 public sealed record GateTransitionResult
 {
@@ -44,33 +71,57 @@ public sealed class OutboundGateStateMachine
     private const int MaximumPendingGlobal = 64;
     private const int MaximumChallengesPerSubject = 4;
     private const int MaximumChallengesGlobal = 128;
+    private const int MaximumActiveContexts = 256;
+    private const int MaximumTerminalHistory = 256;
+    private const int MaximumCriticalAlerts = 256;
 
     private readonly IOutboundGateMonotonicClock _clock;
     private readonly IOutboundGateNonceProvider _nonces;
     private readonly OutboundGateMode _mode;
-    private readonly Dictionary<Guid, Context> _contexts = new();
+    private readonly Dictionary<Guid, Context> _activeContexts = new();
+    private readonly Dictionary<Guid, TerminalRecord> _terminalHistory = new();
+    private readonly Queue<Guid> _terminalOrder = new();
     private readonly Dictionary<Guid, Guid> _challengeToIntent = new();
-    private readonly List<CriticalAlert> _criticalAlerts = new();
+    private readonly Queue<CriticalAlert> _criticalAlerts = new();
+    private OutboundGateTrustedRuntimeState? _trustedRuntime;
     private long _failedOpenCount;
     private long _overflowCount;
     private long _sequence;
     private long _policyEpoch;
 
-    public OutboundGateStateMachine(IOutboundGateMonotonicClock clock, IOutboundGateNonceProvider nonces, OutboundGateMode mode = OutboundGateMode.Disabled, long initialPolicyEpoch = 0)
+    public OutboundGateStateMachine(
+        IOutboundGateMonotonicClock clock,
+        IOutboundGateNonceProvider nonces,
+        OutboundGateMode mode = OutboundGateMode.Disabled,
+        long initialPolicyEpoch = 0,
+        OutboundGateTrustedRuntimeState? trustedRuntime = null)
     {
         _clock = clock ?? throw new ArgumentNullException(nameof(clock));
         _nonces = nonces ?? throw new ArgumentNullException(nameof(nonces));
         if (!Enum.IsDefined(mode))
             throw new ArgumentOutOfRangeException(nameof(mode));
         ArgumentOutOfRangeException.ThrowIfNegative(initialPolicyEpoch);
+        if (mode == OutboundGateMode.Simulation && trustedRuntime is null)
+            throw new ArgumentNullException(nameof(trustedRuntime), "Simulation requires service-owned boot and endpoint generations.");
         _mode = mode;
         _policyEpoch = initialPolicyEpoch;
+        _trustedRuntime = trustedRuntime;
     }
 
     public OutboundGateMode Mode => _mode;
     public long PolicyEpoch => _policyEpoch;
-    public GateStateMachineCounters Counters => new(_failedOpenCount, _overflowCount, _contexts.Values.Count(context => !context.IsTerminal), ActiveChallengeCount());
+    public OutboundGateTrustedRuntimeState? TrustedRuntime => _trustedRuntime;
+    public GateStateMachineCounters Counters => new(_failedOpenCount, _overflowCount, _activeContexts.Count, _challengeToIntent.Count);
     public IReadOnlyList<CriticalAlert> CriticalAlerts => _criticalAlerts.ToArray();
+    public GateStateMachineStorageSnapshot Storage => new(
+        _activeContexts.Count,
+        _terminalHistory.Count,
+        _challengeToIntent.Count,
+        _criticalAlerts.Count,
+        MaximumActiveContexts,
+        MaximumTerminalHistory,
+        MaximumChallengesGlobal,
+        MaximumCriticalAlerts);
 
     public GateTransitionResult ReceiveIntent(FileReadIntent intent)
     {
@@ -78,54 +129,62 @@ public sealed class OutboundGateStateMachine
         if (_mode == OutboundGateMode.Disabled)
             return Unsupported(intent.Subject, intent.IntentId, "outbound-gate-disabled");
 
-        if (_contexts.TryGetValue(intent.IntentId, out var existing))
-        {
-            if (!existing.Intent.Equals(intent))
-                throw new InvalidOperationException("Duplicate intent ID has a different payload.");
-            return existing.Result with { IsDuplicate = true };
-        }
+        if (TryGetExistingIntent(intent, out var duplicate))
+            return duplicate!;
 
         var now = RequireClock(_clock.Now());
-        if (!now.ClockInstanceId.Equals(intent.ReadWindow.StartedAt.ClockInstanceId) || !intent.ReadWindow.Contains(now))
-            return FailOpenWithoutContext(intent.Subject, intent.IntentId, "intent-clock-or-deadline-invalid", now);
+        var runtime = RequireTrustedRuntime();
+        if (intent.BootInstance != runtime.BootInstance)
+            return FailOpenWithoutContext(intent, "intent-boot-instance-invalid", now);
+        if (!SameClock(now, intent.ReadWindow.Deadline)
+            || now.ElapsedMilliseconds < intent.ReadWindow.StartedAt.ElapsedMilliseconds
+            || DeadlineReached(now, intent.ReadWindow.Deadline))
+            return FailOpenWithoutContext(intent, "intent-clock-or-deadline-invalid", now);
 
-        if (PendingCountFor(intent.Subject) >= MaximumPendingPerSubject || PendingCount() >= MaximumPendingGlobal)
-            return FailOpenWithoutContext(intent.Subject, intent.IntentId, "pending-intent-capacity-exhausted", now, overflow: true);
+        if (_activeContexts.Count >= MaximumActiveContexts
+            || PendingCountFor(intent.Subject) >= MaximumPendingPerSubject
+            || PendingCount() >= MaximumPendingGlobal)
+            return FailOpenWithoutContext(intent, "pending-intent-capacity-exhausted", now, overflow: true);
 
-        var armWindow = NewWindow(now, OutboundGateLimits.MaximumGateArmReadDuration);
+        var armWindow = NewClampedWindow(now, OutboundGateLimits.MaximumGateArmReadDuration, intent.ReadWindow.Deadline);
+        if (armWindow is null)
+            return FailOpenWithoutContext(intent, "intent-deadline-exhausted", now);
+
         var request = new GateArmRequest(
             OutboundGateLimits.CurrentVersion,
             intent.IntentId,
             intent.Subject,
             RequiredCoverageFor(intent),
             _policyEpoch,
-            _nonces.NextNonce(),
+            runtime.WfpGeneration,
             _nonces.NextNonce(),
             intent.ObservedAtUtc,
             armWindow);
-        var status = Status(intent.Subject, intent.IntentId, GateRuntimeState.Idle, "intent-received", now, trafficFailedOpen: false);
+        var status = Status(intent.Subject, intent.IntentId, GateRuntimeState.Idle, "intent-received", now, trafficFailedOpen: false, request.RequiredCoverage);
         var result = new GateTransitionResult(status, armRequest: request);
-        _contexts.Add(intent.IntentId, new Context(intent, request, result));
+        _activeContexts.Add(intent.IntentId, new Context(intent, request, runtime, result));
         return result;
     }
 
     public GateTransitionResult ReceiveGateArmAck(GateArmAck ack)
     {
         ArgumentNullException.ThrowIfNull(ack);
-        if (!_contexts.TryGetValue(ack.IntentId, out var context))
-            throw new InvalidOperationException("Gate acknowledgement references an unknown intent.");
+        var context = RequireActiveContext(ack.IntentId, "Gate acknowledgement");
         if (context.Ack is not null)
         {
-            if (context.Ack.Equals(ack))
+            if (AckMatches(context.Ack, ack))
                 return context.Result with { IsDuplicate = true };
-            throw new InvalidOperationException("Duplicate gate acknowledgement ID or intent has a different payload.");
+            throw new InvalidOperationException("Duplicate gate acknowledgement has a different payload.");
         }
-        if (context.IsTerminal)
-            throw new InvalidOperationException("A terminal intent cannot accept a gate acknowledgement.");
+        RequirePhase(context, ContextPhase.AwaitingArmAcknowledgement, "Gate acknowledgement");
 
         var receipt = RequireClock(_clock.Now());
+        if (DeadlineReached(receipt, context.PhaseDeadline))
+            return FailOpen(context, "gate-ack-deadline-expired", receipt);
         try
         {
+            if (ack.DriverGeneration != context.ExpectedWfpGeneration)
+                throw new InvalidOperationException("Gate acknowledgement has an untrusted WFP generation.");
             ack.ValidateFor(context.Request, receipt);
         }
         catch (Exception exception) when (exception is InvalidOperationException or ArgumentException)
@@ -134,6 +193,7 @@ public sealed class OutboundGateStateMachine
         }
 
         context.Ack = ack;
+        context.Phase = ContextPhase.AwaitingDisposition;
         var status = Status(context.Intent.Subject, context.Intent.IntentId, GateRuntimeState.Armed, "gate-armed", receipt, false, context.Request.RequiredCoverage);
         context.Result = new GateTransitionResult(status, context.Request);
         return context.Result;
@@ -144,67 +204,82 @@ public sealed class OutboundGateStateMachine
 
     public GateTransitionResult ReleaseAfterGateArmed(Guid intentId)
     {
-        if (!_contexts.TryGetValue(intentId, out var context))
-            throw new InvalidOperationException("Release references an unknown intent.");
+        var context = RequireActiveContext(intentId, "Release");
         if (context.Disposition is not null)
             return context.Result with { IsDuplicate = true };
-        if (context.Ack is null)
-            throw new InvalidOperationException("A read cannot be released before a full-coverage gate acknowledgement.");
+        RequirePhase(context, ContextPhase.AwaitingDisposition, "Release");
+        if (context.Ack is null || context.Ack.DriverGeneration != context.ExpectedWfpGeneration)
+            throw new InvalidOperationException("A read cannot be released before a trusted full-coverage gate acknowledgement.");
         var now = RequireClock(_clock.Now());
+        if (DeadlineReached(now, context.PhaseDeadline))
+            return FailOpen(context, "disposition-deadline-expired", now);
+
         var disposition = new FileReadDisposition(1, context.Intent.IntentId, context.Intent.Subject.ProcessIdentity, context.Intent.File, FileReadDispositionKind.ReleaseAfterGateArmed, context.Ack.AckId, context.Request.ArmWindow, "gate-armed", ++_sequence);
         context.Disposition = disposition;
+        context.Phase = ContextPhase.AwaitingCompletion;
         context.Result = new GateTransitionResult(Status(context.Intent.Subject, context.Intent.IntentId, GateRuntimeState.Armed, "read-release-authorized", now, false, context.Request.RequiredCoverage), context.Request, disposition);
         return context.Result;
     }
 
-    public GateTransitionResult AcceptCompletion(FileReadCompletionAck completion) =>
-        AcceptCompletion(completion, completion?.MinifilterGeneration ?? Guid.Empty);
-
-    public GateTransitionResult AcceptCompletion(FileReadCompletionAck completion, Guid expectedMinifilterGeneration)
+    public GateTransitionResult AcceptCompletion(FileReadCompletionAck completion)
     {
         ArgumentNullException.ThrowIfNull(completion);
-        OutboundGateLimits.GuidValue(expectedMinifilterGeneration, nameof(expectedMinifilterGeneration));
-        if (!_contexts.TryGetValue(completion.IntentId, out var context))
-            throw new InvalidOperationException("Completion references an unknown intent.");
+        var context = RequireActiveContext(completion.IntentId, "Completion");
         if (context.Completion is not null)
         {
-            if (context.Completion.Equals(completion))
+            if (CompletionMatches(context.Completion, completion))
                 return context.Result with { IsDuplicate = true };
-            throw new InvalidOperationException("Duplicate completion ID has a different payload.");
+            throw new InvalidOperationException("Duplicate completion has a different payload.");
         }
-        if (completion.MinifilterGeneration != expectedMinifilterGeneration
-            || (context.AcceptedMinifilterGeneration is not null && context.AcceptedMinifilterGeneration != completion.MinifilterGeneration)
-            || context.Disposition is null
-            || !completion.IsBoundTo(context.Disposition, expectedMinifilterGeneration))
-            throw new InvalidOperationException("Completion is not bound to the exact accepted disposition.");
-        context.AcceptedMinifilterGeneration = completion.MinifilterGeneration;
+        RequirePhase(context, ContextPhase.AwaitingCompletion, "Completion");
+        var now = RequireClock(_clock.Now());
+        if (DeadlineReached(now, context.PhaseDeadline))
+            return FailOpen(context, "completion-deadline-expired", now);
+        if (context.Disposition is null
+            || completion.Result != FileReadCompletionResult.Released
+            || completion.MinifilterGeneration != context.ExpectedMinifilterGeneration
+            || !completion.IsBoundTo(context.Disposition, context.ExpectedMinifilterGeneration))
+            return FailOpen(context, "completion-binding-or-generation-invalid", now);
+
         context.Completion = completion;
-        context.Result = context.Result with { IsDuplicate = false };
+        context.Phase = ContextPhase.AwaitingChallenge;
+        context.PhaseDeadline = NewDeadline(now, OutboundGateLimits.MaximumDecisionHoldDuration);
+        context.Result = new GateTransitionResult(Status(context.Intent.Subject, context.Intent.IntentId, GateRuntimeState.Armed, "read-completion-accepted", now, false, context.Request.RequiredCoverage), context.Request, context.Disposition);
         return context.Result;
     }
 
     public GateTransitionResult ReceiveChallenge(NetworkGateChallenge challenge)
     {
         ArgumentNullException.ThrowIfNull(challenge);
-        if (!_contexts.TryGetValue(challenge.IntentId, out var context))
-            throw new InvalidOperationException("Challenge references an unknown intent.");
+        var context = RequireActiveContext(challenge.IntentId, "Challenge");
         if (context.Challenge is not null)
         {
-            if (context.Challenge.Equals(challenge))
+            if (ChallengeMatches(context.Challenge, challenge))
                 return context.Result with { IsDuplicate = true };
-            throw new InvalidOperationException("Duplicate challenge ID has a different payload.");
+            throw new InvalidOperationException("Duplicate challenge has a different payload.");
         }
-        if (context.Ack is null || context.Disposition is null || context.Completion is null)
-            throw new InvalidOperationException("A challenge requires an armed gate and completed read disposition.");
-        if (!context.Intent.Subject.Matches(challenge.Subject) || challenge.RequiredCoverage.Flags == GateCoverageFlags.None)
-            throw new InvalidOperationException("Challenge subject or coverage does not match the intent.");
-        if (ActiveChallengeCountFor(challenge.Subject) >= MaximumChallengesPerSubject || ActiveChallengeCount() >= MaximumChallengesGlobal)
-            return FailOpen(context, "active-challenge-capacity-exhausted", RequireClock(_clock.Now()), overflow: true);
-
+        RequirePhase(context, ContextPhase.AwaitingChallenge, "Challenge");
         var now = RequireClock(_clock.Now());
-        if (!challenge.DecisionWindow.Contains(now) || challenge.DecisionWindow.StartedAt.ClockInstanceId != now.ClockInstanceId)
+        if (DeadlineReached(now, context.PhaseDeadline))
+            return FailOpen(context, "challenge-arrival-deadline-expired", now);
+        if (!context.Intent.Subject.Matches(challenge.Subject)
+            || challenge.RequiredCoverage != context.Request.RequiredCoverage
+            || context.Ack is null
+            || !context.Ack.ArmedCoverage.Contains(context.Request.RequiredCoverage))
+            return FailOpen(context, "challenge-subject-or-coverage-invalid", now);
+        if (!SameClock(now, challenge.DecisionWindow.Deadline)
+            || !challenge.DecisionWindow.Contains(now)
+            || DeadlineReached(now, challenge.DecisionWindow.Deadline))
             return FailOpen(context, "challenge-clock-or-deadline-invalid", now);
+        if (ActiveChallengeCountFor(challenge.Subject) >= MaximumChallengesPerSubject || _challengeToIntent.Count >= MaximumChallengesGlobal)
+            return FailOpen(context, "active-challenge-capacity-exhausted", now, overflow: true);
+        if (_challengeToIntent.ContainsKey(challenge.ChallengeId)
+            || _activeContexts.Values.Any(candidate => candidate.Challenge?.ChallengeId == challenge.ChallengeId))
+            throw new InvalidOperationException("Challenge ID is already bound to another intent.");
+
         context.Challenge = challenge;
+        context.Phase = ContextPhase.AwaitingDecision;
+        context.PhaseDeadline = EarlierDeadline(NewDeadline(now, OutboundGateLimits.MaximumDecisionHoldDuration), challenge.DecisionWindow.Deadline);
         _challengeToIntent.Add(challenge.ChallengeId, challenge.IntentId);
         context.Result = new GateTransitionResult(Status(context.Intent.Subject, context.Intent.IntentId, GateRuntimeState.AwaitingDecision, "challenge-received", now, false, context.Request.RequiredCoverage), context.Request, context.Disposition, challenge: challenge);
         return context.Result;
@@ -213,26 +288,27 @@ public sealed class OutboundGateStateMachine
     public GateTransitionResult ReceiveDecision(UserDecision decision)
     {
         ArgumentNullException.ThrowIfNull(decision);
-        if (!_challengeToIntent.TryGetValue(decision.ChallengeId, out var intentId) || !_contexts.TryGetValue(intentId, out var context) || context.Challenge is null)
-            throw new InvalidOperationException("Decision references an unknown challenge.");
+        var context = FindActiveContextForChallenge(decision.ChallengeId);
         if (context.Decision is not null)
         {
-            if (context.Decision.Equals(decision))
+            if (context.Decision == decision)
                 return context.Result with { IsDuplicate = true };
-            throw new InvalidOperationException("Duplicate decision ID has a different payload.");
+            throw new InvalidOperationException("Duplicate decision has a different payload.");
         }
+        RequirePhase(context, ContextPhase.AwaitingDecision, "Decision");
         var now = RequireClock(_clock.Now());
-        if (!context.Challenge.DecisionWindow.Contains(now))
+        if (DeadlineReached(now, context.PhaseDeadline))
             return FailOpen(context, "decision-deadline-expired", now);
-        decision.ValidatePersistentScopeFor(context.Challenge, context.Intent.File);
+        decision.ValidatePersistentScopeFor(context.Challenge!, context.Intent.File);
         context.Decision = decision;
+        RemoveChallengeMapping(context);
         if (decision.Decision == UserDecisionKind.Block)
-        {
-            context.Result = new GateTransitionResult(Status(context.Intent.Subject, context.Intent.IntentId, GateRuntimeState.Blocked, "user-blocked-current-flow", now, false, context.Request.RequiredCoverage), context.Request, context.Disposition, context.Challenge);
-            return context.Result;
-        }
+            return CompleteBlocked(context, "user-blocked-current-flow", now);
+
         var ticket = IssueTicket(context, now);
         context.Ticket = ticket;
+        context.Phase = ContextPhase.TicketIssued;
+        context.PhaseDeadline = ticket.ValidityWindow.Deadline;
         context.Result = new GateTransitionResult(Status(context.Intent.Subject, context.Intent.IntentId, GateRuntimeState.AwaitingDecision, "ticket-issued-simulation", now, false, context.Request.RequiredCoverage), context.Request, context.Disposition, context.Challenge, ticket);
         return context.Result;
     }
@@ -240,22 +316,31 @@ public sealed class OutboundGateStateMachine
     public GateTransitionResult RedeemTicket(OneTimeTicket ticket)
     {
         ArgumentNullException.ThrowIfNull(ticket);
-        if (!_contexts.TryGetValue(ticket.IntentId, out var context) || context.Ticket is null)
-            throw new InvalidOperationException("Ticket references an unknown or unissued intent.");
-        if (context.Grant is not null)
+        var context = RequireActiveContext(ticket.IntentId, "Ticket");
+        var now = RequireClock(_clock.Now());
+        if (context.Phase == ContextPhase.Granted)
         {
-            if (context.Ticket.Equals(ticket))
-                return context.Result with { IsDuplicate = true, Grant = context.Grant };
+            if (DeadlineReached(now, context.PhaseDeadline))
+                return RevokeGrant(context, "grant-expired", now);
+            if (TicketMatches(context.Ticket!, ticket))
+                return context.Result with { IsDuplicate = true };
             throw new InvalidOperationException("A different ticket cannot redeem the same transition.");
         }
-        if (!context.Ticket.Equals(ticket))
+        RequirePhase(context, ContextPhase.TicketIssued, "Ticket redemption");
+        if (!TicketMatches(context.Ticket!, ticket))
             throw new InvalidOperationException("Ticket binding does not match the issued ticket.");
-        var now = RequireClock(_clock.Now());
-        if (!ticket.ValidityWindow.Contains(now) || ticket.ValidityWindow.StartedAt.ClockInstanceId != now.ClockInstanceId)
-            return FailOpen(context, "ticket-expired-or-clock-invalid", now);
+        var runtime = RequireTrustedRuntime();
+        if (DeadlineReached(now, context.PhaseDeadline)
+            || ticket.PolicyEpoch != _policyEpoch
+            || ticket.BootInstance != runtime.BootInstance
+            || !ticket.ValidityWindow.Contains(now))
+            return FailOpen(context, "ticket-expired-or-runtime-invalid", now);
+
         var grantWindow = NewWindow(now, OutboundGateLimits.MaximumGrantDuration);
         var grant = new EphemeralFlowGrant(1, _nonces.NextNonce(), ticket.TicketId, ticket.IntentId, ticket.Subject, ticket.Destination, ticket.FlowGeneration, ticket.PolicyEpoch, ticket.BootInstance, ticket.GrantMaxBytes, grantWindow);
         context.Grant = grant;
+        context.Phase = ContextPhase.Granted;
+        context.PhaseDeadline = grant.GrantWindow.Deadline;
         context.Result = new GateTransitionResult(Status(context.Intent.Subject, context.Intent.IntentId, GateRuntimeState.Granted, "ticket-redeemed-simulation", now, false, context.Request.RequiredCoverage), context.Request, context.Disposition, context.Challenge, ticket, grant);
         return context.Result;
     }
@@ -264,25 +349,35 @@ public sealed class OutboundGateStateMachine
     {
         var now = RequireClock(_clock.Now());
         var statuses = new List<GateStatus>();
-        foreach (var context in _contexts.Values.Where(context => !context.IsTerminal).ToArray())
+        foreach (var context in _activeContexts.Values.ToArray())
         {
-            if ((context.Ack is null && !context.Request.ArmWindow.Contains(now))
-                || (context.Challenge is not null && context.Decision is null && !context.Challenge.DecisionWindow.Contains(now))
-                || (context.Ticket is not null && context.Grant is null && !context.Ticket.ValidityWindow.Contains(now)))
-            {
-                statuses.Add(FailOpen(context, "monotonic-deadline-expired", now).Status);
-            }
+            if (!DeadlineReached(now, context.PhaseDeadline))
+                continue;
+            statuses.Add(context.Phase == ContextPhase.Granted
+                ? RevokeGrant(context, "grant-expired-or-clock-invalid", now).Status
+                : FailOpen(context, "monotonic-deadline-expired", now).Status);
         }
         return statuses;
     }
 
     public IReadOnlyList<GateStatus> HandleServiceRestart(Guid newBootInstance)
     {
-        OutboundGateLimits.GuidValue(newBootInstance, nameof(newBootInstance));
+        var runtime = RequireTrustedRuntime();
+        return HandleServiceRestart(new OutboundGateTrustedRuntimeState(newBootInstance, runtime.WfpGeneration, runtime.MinifilterGeneration));
+    }
+
+    public IReadOnlyList<GateStatus> HandleServiceRestart(OutboundGateTrustedRuntimeState newRuntime)
+    {
+        ArgumentNullException.ThrowIfNull(newRuntime);
         var now = RequireClock(_clock.Now());
+        _trustedRuntime = newRuntime;
         var statuses = new List<GateStatus>();
-        foreach (var context in _contexts.Values.Where(context => !context.IsTerminal).ToArray())
-            statuses.Add(FailOpen(context, "service-restart-invalidated-state", now).Status);
+        foreach (var context in _activeContexts.Values.ToArray())
+        {
+            statuses.Add(context.Phase == ContextPhase.Granted
+                ? RevokeGrant(context, "service-restart-revoked-grant", now).Status
+                : FailOpen(context, "service-restart-invalidated-state", now).Status);
+        }
         return statuses;
     }
 
@@ -291,12 +386,61 @@ public sealed class OutboundGateStateMachine
         ArgumentOutOfRangeException.ThrowIfNegative(policyEpoch);
         if (policyEpoch < _policyEpoch)
             throw new ArgumentOutOfRangeException(nameof(policyEpoch), "Policy epoch cannot move backwards.");
+        if (policyEpoch == _policyEpoch)
+            return Array.Empty<GateStatus>();
         _policyEpoch = policyEpoch;
         var now = RequireClock(_clock.Now());
         var statuses = new List<GateStatus>();
-        foreach (var context in _contexts.Values.Where(context => !context.IsTerminal && context.Request.PolicyEpoch != policyEpoch).ToArray())
-            statuses.Add(FailOpen(context, "policy-epoch-changed", now).Status);
+        foreach (var context in _activeContexts.Values.Where(context => context.Request.PolicyEpoch != policyEpoch).ToArray())
+        {
+            statuses.Add(context.Phase == ContextPhase.Granted
+                ? RevokeGrant(context, "policy-epoch-revoked-grant", now).Status
+                : FailOpen(context, "policy-epoch-changed", now).Status);
+        }
         return statuses;
+    }
+
+    private bool TryGetExistingIntent(FileReadIntent intent, out GateTransitionResult? result)
+    {
+        if (_activeContexts.TryGetValue(intent.IntentId, out var active))
+        {
+            if (!IntentMatches(active.Intent, intent))
+                throw new InvalidOperationException("Duplicate intent ID has a different payload.");
+            result = active.Result with { IsDuplicate = true };
+            return true;
+        }
+        if (_terminalHistory.TryGetValue(intent.IntentId, out var terminal))
+        {
+            if (!IntentMatches(terminal.Intent, intent))
+                throw new InvalidOperationException("Terminal intent ID has a different payload.");
+            result = terminal.Result with { IsDuplicate = true };
+            return true;
+        }
+        result = null;
+        return false;
+    }
+
+    private Context RequireActiveContext(Guid intentId, string operation)
+    {
+        if (_activeContexts.TryGetValue(intentId, out var context))
+            return context;
+        if (_terminalHistory.ContainsKey(intentId))
+            throw new InvalidOperationException($"{operation} cannot mutate a terminal intent.");
+        throw new InvalidOperationException($"{operation} references an unknown intent.");
+    }
+
+    private Context FindActiveContextForChallenge(Guid challengeId)
+    {
+        if (_challengeToIntent.TryGetValue(challengeId, out var intentId))
+            return RequireActiveContext(intentId, "Decision");
+        var context = _activeContexts.Values.SingleOrDefault(candidate => candidate.Challenge?.ChallengeId == challengeId);
+        return context ?? throw new InvalidOperationException("Decision references an unknown or terminal challenge.");
+    }
+
+    private static void RequirePhase(Context context, ContextPhase expected, string operation)
+    {
+        if (context.Phase != expected)
+            throw new InvalidOperationException($"{operation} is invalid while the intent is in phase {context.Phase}.");
     }
 
     private GateTransitionResult Unsupported(GateSubject subject, Guid intentId, string reason)
@@ -305,33 +449,82 @@ public sealed class OutboundGateStateMachine
         return new GateTransitionResult(Status(subject, intentId, GateRuntimeState.Unsupported, reason, now, false));
     }
 
-    private GateTransitionResult FailOpenWithoutContext(GateSubject subject, Guid intentId, string reason, ServiceMonotonicTimestamp now, bool overflow = false)
+    private GateTransitionResult FailOpenWithoutContext(FileReadIntent intent, string reason, ServiceMonotonicTimestamp now, bool overflow = false)
     {
         if (overflow)
             _overflowCount++;
         _failedOpenCount++;
-        var scope = new GateAffectedScope(1, GateAffectedScopeKind.Intent, intentId, subject);
-        var alert = Alert(reason, scope, now);
-        return new GateTransitionResult(Status(subject, intentId, GateRuntimeState.FailedOpen, reason, now, true), criticalAlert: alert);
+        var alert = Alert(reason, new GateAffectedScope(1, GateAffectedScopeKind.Intent, intent.IntentId, intent.Subject), now);
+        var result = new GateTransitionResult(Status(intent.Subject, intent.IntentId, GateRuntimeState.FailedOpen, reason, now, true), criticalAlert: alert);
+        RememberTerminal(intent, result);
+        return result;
     }
 
     private GateTransitionResult FailOpen(Context context, string reason, ServiceMonotonicTimestamp now, bool overflow = false)
     {
-        if (context.IsTerminal)
-            return context.Result;
         if (overflow)
             _overflowCount++;
         _failedOpenCount++;
-        var status = Status(context.Intent.Subject, context.Intent.IntentId, GateRuntimeState.FailedOpen, reason, now, true, context.Request.RequiredCoverage);
         var alert = Alert(reason, new GateAffectedScope(1, GateAffectedScopeKind.Intent, context.Intent.IntentId, context.Intent.Subject), now);
-        context.Result = new GateTransitionResult(status, context.Request, context.Disposition, context.Challenge, context.Ticket, context.Grant, alert);
-        return context.Result;
+        var result = new GateTransitionResult(Status(context.Intent.Subject, context.Intent.IntentId, GateRuntimeState.FailedOpen, reason, now, true, context.Request.RequiredCoverage), criticalAlert: alert);
+        CompleteTerminal(context, result);
+        return result;
+    }
+
+    private GateTransitionResult CompleteBlocked(Context context, string reason, ServiceMonotonicTimestamp now)
+    {
+        var result = new GateTransitionResult(Status(context.Intent.Subject, context.Intent.IntentId, GateRuntimeState.Blocked, reason, now, false, context.Request.RequiredCoverage));
+        CompleteTerminal(context, result);
+        return result;
+    }
+
+    private GateTransitionResult RevokeGrant(Context context, string reason, ServiceMonotonicTimestamp now)
+    {
+        var result = new GateTransitionResult(Status(context.Intent.Subject, context.Intent.IntentId, GateRuntimeState.Blocked, reason, now, false, context.Request.RequiredCoverage));
+        CompleteTerminal(context, result);
+        return result;
+    }
+
+    private void CompleteTerminal(Context context, GateTransitionResult result)
+    {
+        RemoveChallengeMapping(context);
+        _activeContexts.Remove(context.Intent.IntentId);
+        context.Ack = null;
+        context.Disposition = null;
+        context.Completion = null;
+        context.Challenge = null;
+        context.Decision = null;
+        context.Ticket = null;
+        context.Grant = null;
+        context.Result = result;
+        RememberTerminal(context.Intent, result);
+    }
+
+    private void RememberTerminal(FileReadIntent intent, GateTransitionResult result)
+    {
+        if (_terminalHistory.ContainsKey(intent.IntentId))
+            return;
+        _terminalHistory.Add(intent.IntentId, new TerminalRecord(intent, result));
+        _terminalOrder.Enqueue(intent.IntentId);
+        while (_terminalHistory.Count > MaximumTerminalHistory)
+        {
+            var oldest = _terminalOrder.Dequeue();
+            _terminalHistory.Remove(oldest);
+        }
+    }
+
+    private void RemoveChallengeMapping(Context context)
+    {
+        if (context.Challenge is not null)
+            _challengeToIntent.Remove(context.Challenge.ChallengeId);
     }
 
     private CriticalAlert Alert(string reason, GateAffectedScope scope, ServiceMonotonicTimestamp now)
     {
         var alert = new CriticalAlert(1, _nonces.NextNonce(), reason, scope, AuditUtc(now), now, _failedOpenCount, _overflowCount, true);
-        _criticalAlerts.Add(alert);
+        _criticalAlerts.Enqueue(alert);
+        while (_criticalAlerts.Count > MaximumCriticalAlerts)
+            _criticalAlerts.Dequeue();
         return alert;
     }
 
@@ -339,48 +532,164 @@ public sealed class OutboundGateStateMachine
     {
         var validity = NewWindow(now, OutboundGateLimits.MaximumTicketValidity);
         var auditIssued = AuditUtc(now);
-        return new OneTimeTicket(1, _nonces.NextNonce(), _nonces.NextNonce(), context.Intent.IntentId, context.Intent.Subject, context.Intent.File, context.Challenge!.Destination, context.Challenge.FlowGeneration, context.Request.PolicyEpoch, context.Intent.BootInstance, auditIssued, auditIssued.AddSeconds(5), validity, OutboundGateLimits.MaximumGrantBytes, (long)OutboundGateLimits.MaximumGrantDuration.TotalMilliseconds, [1]);
+        var runtime = RequireTrustedRuntime();
+        return new OneTimeTicket(1, _nonces.NextNonce(), _nonces.NextNonce(), context.Intent.IntentId, context.Intent.Subject, context.Intent.File, context.Challenge!.Destination, context.Challenge.FlowGeneration, _policyEpoch, runtime.BootInstance, auditIssued, auditIssued.Add(OutboundGateLimits.MaximumTicketValidity), validity, OutboundGateLimits.MaximumGrantBytes, (long)OutboundGateLimits.MaximumGrantDuration.TotalMilliseconds, [1]);
     }
 
     private GateStatus Status(GateSubject subject, Guid intentId, GateRuntimeState state, string reason, ServiceMonotonicTimestamp now, bool trafficFailedOpen, GateCoverage? coverage = null) =>
         new(1, _mode, state, coverage ?? new GateCoverage(1, GateCoverageFlags.NewTcp), reason, new GateAffectedScope(1, GateAffectedScopeKind.Intent, intentId, subject), AuditUtc(now), now, 0, _overflowCount, trafficFailedOpen);
 
+    private OutboundGateTrustedRuntimeState RequireTrustedRuntime() =>
+        _trustedRuntime ?? throw new InvalidOperationException("Trusted outbound-gate runtime state is unavailable.");
+
     private static ServiceMonotonicTimestamp RequireClock(ServiceMonotonicTimestamp timestamp) => timestamp ?? throw new InvalidOperationException("Clock returned null.");
 
+    private static bool SameClock(ServiceMonotonicTimestamp left, ServiceMonotonicTimestamp right) =>
+        left.Version == right.Version && left.ClockInstanceId == right.ClockInstanceId;
+
+    private static bool IntentMatches(FileReadIntent left, FileReadIntent right) =>
+        left.Version == right.Version
+        && left.IntentId == right.IntentId
+        && left.Subject.Matches(right.Subject)
+        && left.File == right.File
+        && left.Operation == right.Operation
+        && left.ObservedAtUtc == right.ObservedAtUtc
+        && left.ReadWindow == right.ReadWindow
+        && left.BootInstance == right.BootInstance
+        && left.Sequence == right.Sequence;
+
+    private static bool AckMatches(GateArmAck left, GateArmAck right) =>
+        left.Version == right.Version
+        && left.AckId == right.AckId
+        && left.IntentId == right.IntentId
+        && left.Subject.Matches(right.Subject)
+        && left.RequiredCoverage == right.RequiredCoverage
+        && left.ArmedCoverage == right.ArmedCoverage
+        && left.PolicyEpoch == right.PolicyEpoch
+        && left.DriverGeneration == right.DriverGeneration
+        && left.RequestNonce == right.RequestNonce
+        && left.AckNonce == right.AckNonce
+        && left.EndpointAcknowledgedAtUtc == right.EndpointAcknowledgedAtUtc
+        && left.ArmWindow == right.ArmWindow
+        && string.Equals(left.UnsupportedOrDegradedReason, right.UnsupportedOrDegradedReason, StringComparison.Ordinal);
+
+    private static bool CompletionMatches(FileReadCompletionAck left, FileReadCompletionAck right) =>
+        left.Version == right.Version
+        && left.CompletionId == right.CompletionId
+        && left.IntentId == right.IntentId
+        && left.ProcessIdentity == right.ProcessIdentity
+        && left.File == right.File
+        && left.DispositionSequence == right.DispositionSequence
+        && left.Disposition == right.Disposition
+        && left.GateAckId == right.GateAckId
+        && left.Result == right.Result
+        && string.Equals(left.ReasonCode, right.ReasonCode, StringComparison.Ordinal)
+        && left.MonotonicSequence == right.MonotonicSequence
+        && left.MinifilterGeneration == right.MinifilterGeneration;
+
+    private static bool ChallengeMatches(NetworkGateChallenge left, NetworkGateChallenge right) =>
+        left.Version == right.Version
+        && left.ChallengeId == right.ChallengeId
+        && left.IntentId == right.IntentId
+        && left.Subject.Matches(right.Subject)
+        && left.Destination == right.Destination
+        && left.FlowGeneration == right.FlowGeneration
+        && left.ExistingFlow == right.ExistingFlow
+        && left.RequiredCoverage == right.RequiredCoverage
+        && left.CreatedAtUtc == right.CreatedAtUtc
+        && left.DecisionWindow == right.DecisionWindow
+        && string.Equals(left.LimitationReason, right.LimitationReason, StringComparison.Ordinal);
+
+    private static bool TicketMatches(OneTimeTicket left, OneTimeTicket right) =>
+        left.Version == right.Version
+        && left.TicketId == right.TicketId
+        && left.Nonce == right.Nonce
+        && left.IntentId == right.IntentId
+        && left.Subject.Matches(right.Subject)
+        && left.File == right.File
+        && left.Destination == right.Destination
+        && left.FlowGeneration == right.FlowGeneration
+        && left.PolicyEpoch == right.PolicyEpoch
+        && left.BootInstance == right.BootInstance
+        && left.IssuedAtUtc == right.IssuedAtUtc
+        && left.ExpiresAtUtc == right.ExpiresAtUtc
+        && left.ValidityWindow == right.ValidityWindow
+        && left.GrantMaxBytes == right.GrantMaxBytes
+        && left.GrantMaxDurationMilliseconds == right.GrantMaxDurationMilliseconds
+        && left.AuthenticatorProof.SequenceEqual(right.AuthenticatorProof);
+
+    private static bool DeadlineReached(ServiceMonotonicTimestamp now, ServiceMonotonicTimestamp deadline) =>
+        !SameClock(now, deadline) || now.ElapsedMilliseconds >= deadline.ElapsedMilliseconds;
+
+    private static ServiceMonotonicTimestamp NewDeadline(ServiceMonotonicTimestamp start, TimeSpan duration) =>
+        new(1, start.ClockInstanceId, checked(start.ElapsedMilliseconds + (long)duration.TotalMilliseconds));
+
+    private static ServiceMonotonicTimestamp EarlierDeadline(ServiceMonotonicTimestamp first, ServiceMonotonicTimestamp second)
+    {
+        if (!SameClock(first, second))
+            throw new InvalidOperationException("Cannot compare deadlines from different clock instances.");
+        return first.ElapsedMilliseconds <= second.ElapsedMilliseconds ? first : second;
+    }
+
+    private static ServiceMonotonicTimeRange? NewClampedWindow(ServiceMonotonicTimestamp start, TimeSpan duration, ServiceMonotonicTimestamp outerDeadline)
+    {
+        if (!SameClock(start, outerDeadline))
+            return null;
+        var deadline = EarlierDeadline(NewDeadline(start, duration), outerDeadline);
+        return deadline.ElapsedMilliseconds <= start.ElapsedMilliseconds ? null : new ServiceMonotonicTimeRange(1, start, deadline);
+    }
+
     private static ServiceMonotonicTimeRange NewWindow(ServiceMonotonicTimestamp start, TimeSpan duration) =>
-        new(1, start, new ServiceMonotonicTimestamp(1, start.ClockInstanceId, checked(start.ElapsedMilliseconds + (long)duration.TotalMilliseconds)));
+        new(1, start, NewDeadline(start, duration));
 
     private static DateTimeOffset AuditUtc(ServiceMonotonicTimestamp timestamp) => DateTimeOffset.UnixEpoch.AddMilliseconds(timestamp.ElapsedMilliseconds);
 
-    private int PendingCount() => _contexts.Values.Count(context => !context.IsTerminal && context.Ack is null);
-    private int PendingCountFor(GateSubject subject) => _contexts.Values.Count(context => !context.IsTerminal && context.Ack is null && context.Intent.Subject.Matches(subject));
-    private int ActiveChallengeCount() => _contexts.Values.Count(context => !context.IsTerminal && context.Challenge is not null);
-    private int ActiveChallengeCountFor(GateSubject subject) => _contexts.Values.Count(context => !context.IsTerminal && context.Challenge is not null && context.Intent.Subject.Matches(subject));
-    private Context RequireSingleActiveContext() => _contexts.Values.SingleOrDefault(context => !context.IsTerminal) ?? throw new InvalidOperationException("Exactly one active intent is required for this operation.");
+    private int PendingCount() => _activeContexts.Values.Count(context => context.Phase == ContextPhase.AwaitingArmAcknowledgement);
+    private int PendingCountFor(GateSubject subject) => _activeContexts.Values.Count(context => context.Phase == ContextPhase.AwaitingArmAcknowledgement && context.Intent.Subject.Matches(subject));
+    private int ActiveChallengeCountFor(GateSubject subject) => _activeContexts.Values.Count(context => context.Phase == ContextPhase.AwaitingDecision && context.Intent.Subject.Matches(subject));
+    private Context RequireSingleActiveContext() => _activeContexts.Values.SingleOrDefault() ?? throw new InvalidOperationException("Exactly one active intent is required for this operation.");
 
     private static GateCoverage RequiredCoverageFor(FileReadIntent intent) =>
         new(1, GateCoverageFlags.NewTcp | GateCoverageFlags.NewUdp | GateCoverageFlags.ExistingTcpStream | GateCoverageFlags.ExistingUdpDatagram | GateCoverageFlags.ReconnectRequiredSimulation);
 
+    private enum ContextPhase
+    {
+        AwaitingArmAcknowledgement,
+        AwaitingDisposition,
+        AwaitingCompletion,
+        AwaitingChallenge,
+        AwaitingDecision,
+        TicketIssued,
+        Granted
+    }
+
     private sealed class Context
     {
-        public Context(FileReadIntent intent, GateArmRequest request, GateTransitionResult result)
+        public Context(FileReadIntent intent, GateArmRequest request, OutboundGateTrustedRuntimeState runtime, GateTransitionResult result)
         {
             Intent = intent;
             Request = request;
+            ExpectedWfpGeneration = runtime.WfpGeneration;
+            ExpectedMinifilterGeneration = runtime.MinifilterGeneration;
+            PhaseDeadline = request.ArmWindow.Deadline;
             Result = result;
         }
 
         public FileReadIntent Intent { get; }
         public GateArmRequest Request { get; }
+        public Guid ExpectedWfpGeneration { get; }
+        public Guid ExpectedMinifilterGeneration { get; }
+        public ContextPhase Phase { get; set; } = ContextPhase.AwaitingArmAcknowledgement;
+        public ServiceMonotonicTimestamp PhaseDeadline { get; set; }
         public GateArmAck? Ack { get; set; }
         public FileReadDisposition? Disposition { get; set; }
         public FileReadCompletionAck? Completion { get; set; }
-        public Guid? AcceptedMinifilterGeneration { get; set; }
         public NetworkGateChallenge? Challenge { get; set; }
         public UserDecision? Decision { get; set; }
         public OneTimeTicket? Ticket { get; set; }
         public EphemeralFlowGrant? Grant { get; set; }
         public GateTransitionResult Result { get; set; }
-        public bool IsTerminal => Result.Status.State is GateRuntimeState.Granted or GateRuntimeState.Blocked or GateRuntimeState.FailedOpen or GateRuntimeState.Unsupported;
     }
+
+    private sealed record TerminalRecord(FileReadIntent Intent, GateTransitionResult Result);
 }

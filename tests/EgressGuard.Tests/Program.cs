@@ -133,12 +133,17 @@ internal static class Program
             ("Phase 5B-01 contracts bind exact outbound network scope", TestOutboundGateNetworkScopeAsync),
             ("Phase 5B-01 contracts reject invalid versions bounds and status counters", TestOutboundGateContractValidationAsync),
             ("Phase 5B-01 contracts preserve compatibility and omit sensitive fields", TestOutboundGateContractCompatibilityAsync),
-            ("Phase 5B-02 state machine completes the simulation happy path", TestOutboundGateStateMachineHappyPathAsync),
-            ("Phase 5B-02 state machine blocks and fails open deterministically", TestOutboundGateStateMachineTerminalPathsAsync),
-            ("Phase 5B-02 state machine rejects stale and mismatched acknowledgements", TestOutboundGateStateMachineAckValidationAsync),
-            ("Phase 5B-02 state machine uses monotonic deadlines not UI time", TestOutboundGateStateMachineDeadlineAsync),
-            ("Phase 5B-02 state machine is idempotent and terminal", TestOutboundGateStateMachineIdempotencyAsync),
-            ("Phase 5B-02 state machine enforces policy restart and capacity bounds", TestOutboundGateStateMachineBoundsAsync),
+            ("Phase 5B-02 trusted endpoint generations bind the happy path", TestOutboundGateTrustedGenerationsAsync),
+            ("Phase 5B-02 completion cannot self-verify minifilter generation", TestOutboundGateCompletionGenerationAsync),
+            ("Phase 5B-02 terminal fail-open and block states cannot revive", TestOutboundGateTerminalInvariantAsync),
+            ("Phase 5B-02 restart applies the new boot and revokes tickets and grants", TestOutboundGateRestartInvalidationAsync),
+            ("Phase 5B-02 policy changes and grant expiry revoke old authority", TestOutboundGatePolicyAndGrantExpiryAsync),
+            ("Phase 5B-02 arm and read phases share the original bounded deadline", TestOutboundGateReadDeadlineAsync),
+            ("Phase 5B-02 every active phase expires on deadline or clock change", TestOutboundGateAllPhaseExpiryAsync),
+            ("Phase 5B-02 invalid and overflow intent replay is idempotent", TestOutboundGateIntentReplayAsync),
+            ("Phase 5B-02 active terminal challenge and alert storage is bounded", TestOutboundGateStorageBoundsAsync),
+            ("Phase 5B-02 challenge limits preserve live state", TestOutboundGateChallengeBoundsAsync),
+            ("Phase 5B-02 challenge coverage must equal trusted armed coverage", TestOutboundGateChallengeCoverageAsync),
             ("Default UI clients honor configured pipe name", TestConfiguredPipeNameAsync),
             ("File correlation IPC stays compatible and bounded", TestFileCorrelationProtocolAsync),
             ("UI correlation refresh coalesces updates and cancels stale selection", TestUiCorrelationRefreshAsync),
@@ -1819,14 +1824,15 @@ internal static class Program
         AssertThrows<ArgumentException>(() => _ = new FileReadCompletionAck(1, Guid.NewGuid(), sample.Intent.IntentId, sample.Process, sample.File, sample.Disposition.Sequence, sample.Disposition.Disposition, sample.Disposition.GateAckId, FileReadCompletionResult.Released, "read-released", 3, Guid.Empty));
         AssertTrue(sample.Completion.IsBoundTo(sample.Disposition, sample.MinifilterGeneration), "Completion did not retain exact disposition and minifilter-generation binding.");
         AssertTrue(!sample.Completion.IsBoundTo(sample.Disposition, Guid.NewGuid()), "Completion accepted the wrong minifilter generation.");
-        var completionMachine = new OutboundGateStateMachine(new TestMonotonicClock(sample.ReadWindow.StartedAt), new TestNonceProvider(), OutboundGateMode.Simulation, 7);
+        var completionMachine = CreateOutboundGateMachine(sample, new TestMonotonicClock(sample.ReadWindow.StartedAt), new TestNonceProvider());
         var completionNonces = new TestNonceProvider();
         var completionRequest = completionMachine.ReceiveIntent(sample.Intent).ArmRequest!;
         var completionAck = new GateArmAck(1, completionNonces.NextNonce(), sample.Intent.IntentId, sample.Subject, completionRequest.RequiredCoverage, completionRequest.RequiredCoverage, 7, completionRequest.DriverGeneration, completionRequest.RequestNonce, completionNonces.NextNonce(), sample.Start, completionRequest.ArmWindow, null);
         completionMachine.ReceiveGateArmAck(completionAck);
         var completionDisposition = completionMachine.ReleaseAfterGateArmed(sample.Intent.IntentId).Disposition!;
-        var completionValue = new FileReadCompletionAck(1, completionNonces.NextNonce(), sample.Intent.IntentId, sample.Process, sample.File, completionDisposition.Sequence, completionDisposition.Disposition, completionDisposition.GateAckId, FileReadCompletionResult.Released, "released", 1, sample.MinifilterGeneration);
-        AssertThrows<InvalidOperationException>(() => completionMachine.AcceptCompletion(completionValue, Guid.NewGuid()));
+        var completionValue = new FileReadCompletionAck(1, completionNonces.NextNonce(), sample.Intent.IntentId, sample.Process, sample.File, completionDisposition.Sequence, completionDisposition.Disposition, completionDisposition.GateAckId, FileReadCompletionResult.Released, "released", 1, Guid.NewGuid());
+        var rejectedCompletion = completionMachine.AcceptCompletion(completionValue);
+        AssertEqual(GateRuntimeState.FailedOpen, rejectedCompletion.Status.State);
         return Task.CompletedTask;
     }
 
@@ -1934,177 +1940,382 @@ internal static class Program
         return Task.CompletedTask;
     }
 
-    private static Task TestOutboundGateStateMachineHappyPathAsync()
+    private static Task TestOutboundGateTrustedGenerationsAsync()
     {
         var sample = OutboundGateSamples();
+        var forgedClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var forgedNonces = new TestNonceProvider();
+        var forgedMachine = CreateOutboundGateMachine(sample, forgedClock, forgedNonces);
+        var forgedRequest = forgedMachine.ReceiveIntent(sample.Intent).ArmRequest!;
+        AssertEqual(sample.DriverGeneration, forgedRequest.DriverGeneration);
+        var forgedAck = new GateArmAck(1, forgedNonces.NextNonce(), sample.Intent.IntentId, sample.Subject, forgedRequest.RequiredCoverage, forgedRequest.RequiredCoverage, 7, Guid.NewGuid(), forgedRequest.RequestNonce, forgedNonces.NextNonce(), sample.Start, forgedRequest.ArmWindow, null);
+        AssertEqual(GateRuntimeState.FailedOpen, forgedMachine.ReceiveGateArmAck(forgedAck).Status.State);
+
         var clock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
         var nonces = new TestNonceProvider();
-        var machine = new OutboundGateStateMachine(clock, nonces, OutboundGateMode.Simulation, 7);
-
-        var intentResult = machine.ReceiveIntent(sample.Intent);
-        AssertEqual(GateRuntimeState.Idle, intentResult.Status.State);
-        var request = intentResult.ArmRequest!;
-        var ack = new GateArmAck(1, nonces.NextNonce(), sample.Intent.IntentId, sample.Subject, request.RequiredCoverage, request.RequiredCoverage, 7, request.DriverGeneration, request.RequestNonce, nonces.NextNonce(), sample.Start, request.ArmWindow, null);
-        var armed = machine.ReceiveGateArmAck(ack);
-        AssertEqual(GateRuntimeState.Armed, armed.Status.State);
-        var disposition = machine.ReleaseAfterGateArmed(sample.Intent.IntentId).Disposition!;
-        var completion = new FileReadCompletionAck(1, nonces.NextNonce(), sample.Intent.IntentId, sample.Process, sample.File, disposition.Sequence, disposition.Disposition, disposition.GateAckId, FileReadCompletionResult.Released, "released", 1, sample.MinifilterGeneration);
-        machine.AcceptCompletion(completion);
-
-        var challengeWindow = ServiceRange(sample.Clock, clock.Now().ElapsedMilliseconds, 15_000);
-        var challenge = new NetworkGateChallenge(1, nonces.NextNonce(), sample.Intent.IntentId, sample.Subject, sample.Destination, 1, false, request.RequiredCoverage, sample.Start, challengeWindow, "Simulation");
-        var challenged = machine.ReceiveChallenge(challenge);
-        AssertEqual(GateRuntimeState.AwaitingDecision, challenged.Status.State);
-        var decision = new UserDecision(1, nonces.NextNonce(), challenge.ChallengeId, UserDecisionKind.AllowOnce, null, sample.Start.AddYears(20), "test");
-        var issued = machine.ReceiveDecision(decision);
-        AssertTrue(issued.Ticket is not null, "AllowOnce did not issue a simulation ticket.");
+        var machine = CreateOutboundGateMachine(sample, clock, nonces);
+        var prepared = PrepareToChallenge(machine, sample, clock, nonces);
+        var issued = machine.ReceiveDecision(new UserDecision(1, nonces.NextNonce(), prepared.Challenge.ChallengeId, UserDecisionKind.AllowOnce, null, sample.Start.AddYears(20), "test"));
         var redeemed = machine.RedeemTicket(issued.Ticket!);
         AssertEqual(GateRuntimeState.Granted, redeemed.Status.State);
-        AssertTrue(redeemed.Grant is not null, "Ticket did not produce an ephemeral grant.");
-        return Task.CompletedTask;
-    }
-
-    private static Task TestOutboundGateStateMachineTerminalPathsAsync()
-    {
-        var sample = OutboundGateSamples();
-        var clock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
-        var nonces = new TestNonceProvider();
-        var machine = new OutboundGateStateMachine(clock, nonces, OutboundGateMode.Simulation, 7);
-        var prepared = PrepareToChallenge(machine, sample, clock, nonces);
-        var blocked = machine.ReceiveDecision(new UserDecision(1, nonces.NextNonce(), prepared.Challenge.ChallengeId, UserDecisionKind.Block, null, sample.Start.AddYears(50), "test"));
-        AssertEqual(GateRuntimeState.Blocked, blocked.Status.State);
-        AssertTrue(!blocked.Status.TrafficFailedOpen, "User block must not be reported as fail-open.");
-        AssertThrows<InvalidOperationException>(() => machine.RedeemTicket(new OneTimeTicket(1, nonces.NextNonce(), nonces.NextNonce(), sample.Intent.IntentId, sample.Subject, sample.File, sample.Destination, 1, 7, sample.Boot, sample.Start, sample.Start.AddSeconds(5), ServiceRange(sample.Clock, 0, 5_000), 1, 1, [1])));
+        AssertTrue(redeemed.Grant is not null, "Trusted endpoint generations did not complete the happy path.");
 
         var disabled = new OutboundGateStateMachine(new TestMonotonicClock(sample.ReadWindow.StartedAt), new TestNonceProvider());
         AssertEqual(GateRuntimeState.Unsupported, disabled.ReceiveIntent(sample.Intent).Status.State);
+        AssertThrows<ArgumentNullException>(() => _ = new OutboundGateStateMachine(clock, nonces, OutboundGateMode.Simulation, 7));
         return Task.CompletedTask;
     }
 
-    private static Task TestOutboundGateStateMachineAckValidationAsync()
+    private static Task TestOutboundGateCompletionGenerationAsync()
     {
         var sample = OutboundGateSamples();
+        AssertEqual(1, typeof(OutboundGateStateMachine).GetMethods().Count(method => method.Name == nameof(OutboundGateStateMachine.AcceptCompletion)));
+
         var clock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
         var nonces = new TestNonceProvider();
-        var machine = new OutboundGateStateMachine(clock, nonces, OutboundGateMode.Simulation, 7);
-        var request = machine.ReceiveIntent(sample.Intent).ArmRequest!;
-        var bad = new GateArmAck(1, nonces.NextNonce(), sample.Intent.IntentId, sample.Subject, request.RequiredCoverage, new GateCoverage(1, GateCoverageFlags.NewTcp), 7, request.DriverGeneration, Guid.NewGuid(), nonces.NextNonce(), sample.Start, request.ArmWindow, "partial");
-        var failed = machine.ReceiveGateArmAck(bad);
+        var machine = CreateOutboundGateMachine(sample, clock, nonces);
+        var prepared = PrepareToDisposition(machine, sample, nonces);
+        var forged = CompletionFor(sample, prepared.Disposition, nonces, Guid.NewGuid());
+        var failed = machine.AcceptCompletion(forged);
         AssertEqual(GateRuntimeState.FailedOpen, failed.Status.State);
-        AssertTrue(failed.CriticalAlert is not null, "Invalid Ack did not produce a critical alert.");
+        AssertThrows<InvalidOperationException>(() => machine.AcceptCompletion(CompletionFor(sample, prepared.Disposition, nonces, sample.MinifilterGeneration)));
 
-        var secondMachine = new OutboundGateStateMachine(new TestMonotonicClock(sample.ReadWindow.StartedAt), new TestNonceProvider(), OutboundGateMode.Simulation, 7);
-        secondMachine.ReceiveIntent(sample.Intent);
-        AssertThrows<InvalidOperationException>(() => secondMachine.ReleaseAfterGateArmed(sample.Intent.IntentId));
+        var validClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var validNonces = new TestNonceProvider();
+        var validMachine = CreateOutboundGateMachine(sample, validClock, validNonces);
+        var validPrepared = PrepareToDisposition(validMachine, sample, validNonces);
+        AssertEqual(GateRuntimeState.Armed, validMachine.AcceptCompletion(CompletionFor(sample, validPrepared.Disposition, validNonces, sample.MinifilterGeneration)).Status.State);
         return Task.CompletedTask;
     }
 
-    private static Task TestOutboundGateStateMachineDeadlineAsync()
+    private static Task TestOutboundGateTerminalInvariantAsync()
     {
         var sample = OutboundGateSamples();
         var clock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
         var nonces = new TestNonceProvider();
-        var machine = new OutboundGateStateMachine(clock, nonces, OutboundGateMode.Simulation, 7);
+        var machine = CreateOutboundGateMachine(sample, clock, nonces);
         var request = machine.ReceiveIntent(sample.Intent).ArmRequest!;
-        clock.Set(new ServiceMonotonicTimestamp(1, request.ArmWindow.Deadline.ClockInstanceId, request.ArmWindow.Deadline.ElapsedMilliseconds + 1));
-        var expired = machine.ProcessExpired();
-        AssertEqual(1, expired.Count);
-        AssertEqual(GateRuntimeState.FailedOpen, expired[0].State);
+        var partial = new GateArmAck(1, nonces.NextNonce(), sample.Intent.IntentId, sample.Subject, request.RequiredCoverage, new GateCoverage(1, GateCoverageFlags.NewTcp), 7, request.DriverGeneration, request.RequestNonce, nonces.NextNonce(), sample.Start, request.ArmWindow, "partial");
+        var failed = machine.ReceiveGateArmAck(partial);
+        AssertEqual(GateRuntimeState.FailedOpen, failed.Status.State);
+        var counters = machine.Counters;
+        var alerts = machine.CriticalAlerts.Count;
+        AssertThrows<InvalidOperationException>(() => machine.ReleaseAfterGateArmed(sample.Intent.IntentId));
+        AssertThrows<InvalidOperationException>(() => machine.ReceiveChallenge(sample.Challenge));
+        var duplicate = machine.ReceiveIntent(CloneIntent(sample.Intent));
+        AssertTrue(duplicate.IsDuplicate, "Exact terminal intent replay was not idempotent.");
+        AssertEqual(GateRuntimeState.FailedOpen, duplicate.Status.State);
+        AssertTrue(duplicate.ArmRequest is null && duplicate.Challenge is null && duplicate.Ticket is null && duplicate.Grant is null, "Terminal replay exposed an active capability.");
+        AssertEqual(counters, machine.Counters);
+        AssertEqual(alerts, machine.CriticalAlerts.Count);
+        AssertThrows<InvalidOperationException>(() => machine.ReceiveIntent(IntentFor(sample, sample.Intent.IntentId, sample.Subject, 99)));
 
-        var secondClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
-        var secondMachine = new OutboundGateStateMachine(secondClock, new TestNonceProvider(), OutboundGateMode.Simulation, 7);
-        var prepared = PrepareToChallenge(secondMachine, sample, secondClock, new TestNonceProvider());
-        var staleUiDecision = new UserDecision(1, Guid.NewGuid(), prepared.Challenge.ChallengeId, UserDecisionKind.AllowOnce, null, sample.Start.AddYears(-50), "test");
-        secondClock.Set(new ServiceMonotonicTimestamp(1, prepared.Challenge.DecisionWindow.Deadline.ClockInstanceId, prepared.Challenge.DecisionWindow.Deadline.ElapsedMilliseconds + 1));
-        AssertEqual(GateRuntimeState.FailedOpen, secondMachine.ReceiveDecision(staleUiDecision).Status.State);
+        var blockClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var blockNonces = new TestNonceProvider();
+        var blockMachine = CreateOutboundGateMachine(sample, blockClock, blockNonces);
+        var challenged = PrepareToChallenge(blockMachine, sample, blockClock, blockNonces);
+        var decision = new UserDecision(1, blockNonces.NextNonce(), challenged.Challenge.ChallengeId, UserDecisionKind.Block, null, sample.Start, "test");
+        AssertEqual(GateRuntimeState.Blocked, blockMachine.ReceiveDecision(decision).Status.State);
+        AssertThrows<InvalidOperationException>(() => blockMachine.ReceiveDecision(decision));
+        AssertThrows<InvalidOperationException>(() => blockMachine.ReceiveChallenge(challenged.Challenge));
         return Task.CompletedTask;
     }
 
-    private static Task TestOutboundGateStateMachineIdempotencyAsync()
+    private static Task TestOutboundGateRestartInvalidationAsync()
     {
         var sample = OutboundGateSamples();
-        var clock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
-        var nonces = new TestNonceProvider();
-        var machine = new OutboundGateStateMachine(clock, nonces, OutboundGateMode.Simulation, 7);
-        var first = machine.ReceiveIntent(sample.Intent);
-        var duplicate = machine.ReceiveIntent(sample.Intent);
-        AssertTrue(duplicate.IsDuplicate, "Duplicate intent was not idempotent.");
-        var request = first.ArmRequest!;
-        var ack = new GateArmAck(1, nonces.NextNonce(), sample.Intent.IntentId, sample.Subject, request.RequiredCoverage, request.RequiredCoverage, 7, request.DriverGeneration, request.RequestNonce, nonces.NextNonce(), sample.Start, request.ArmWindow, null);
-        machine.ReceiveGateArmAck(ack);
-        var release = machine.ReleaseAfterGateArmed(sample.Intent.IntentId);
-        AssertTrue(machine.ReleaseAfterGateArmed(sample.Intent.IntentId).IsDuplicate, "Duplicate release was not idempotent.");
-        var completion = new FileReadCompletionAck(1, nonces.NextNonce(), sample.Intent.IntentId, sample.Process, sample.File, release.Disposition!.Sequence, release.Disposition.Disposition, release.Disposition.GateAckId, FileReadCompletionResult.Released, "released", 1, sample.MinifilterGeneration);
-        machine.AcceptCompletion(completion);
-        AssertTrue(machine.AcceptCompletion(completion).IsDuplicate, "Duplicate completion was not idempotent.");
-        AssertThrows<InvalidOperationException>(() => machine.ReceiveGateArmAck(new GateArmAck(1, nonces.NextNonce(), sample.Intent.IntentId, sample.Subject, request.RequiredCoverage, request.RequiredCoverage, 7, request.DriverGeneration, request.RequestNonce, nonces.NextNonce(), sample.Start, request.ArmWindow, null)));
+        var ticketClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var ticketNonces = new TestNonceProvider();
+        var ticketMachine = CreateOutboundGateMachine(sample, ticketClock, ticketNonces);
+        var challenged = PrepareToChallenge(ticketMachine, sample, ticketClock, ticketNonces);
+        var issued = ticketMachine.ReceiveDecision(new UserDecision(1, ticketNonces.NextNonce(), challenged.Challenge.ChallengeId, UserDecisionKind.AllowOnce, null, sample.Start, "test"));
+        var newBoot = Guid.NewGuid();
+        AssertEqual(GateRuntimeState.FailedOpen, ticketMachine.HandleServiceRestart(newBoot).Single().State);
+        AssertEqual(newBoot, ticketMachine.TrustedRuntime!.BootInstance);
+        AssertThrows<InvalidOperationException>(() => ticketMachine.RedeemTicket(issued.Ticket!));
+
+        var grantClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var grantNonces = new TestNonceProvider();
+        var grantMachine = CreateOutboundGateMachine(sample, grantClock, grantNonces);
+        var grantChallenge = PrepareToChallenge(grantMachine, sample, grantClock, grantNonces);
+        var grantTicket = grantMachine.ReceiveDecision(new UserDecision(1, grantNonces.NextNonce(), grantChallenge.Challenge.ChallengeId, UserDecisionKind.AllowOnce, null, sample.Start, "test")).Ticket!;
+        AssertEqual(GateRuntimeState.Granted, grantMachine.RedeemTicket(grantTicket).Status.State);
+        var restarted = grantMachine.HandleServiceRestart(new OutboundGateTrustedRuntimeState(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid()));
+        AssertEqual(GateRuntimeState.Blocked, restarted.Single().State);
+        AssertThrows<InvalidOperationException>(() => grantMachine.RedeemTicket(grantTicket));
+        AssertTrue(grantMachine.ReceiveIntent(sample.Intent).Grant is null, "Restarted terminal history retained a grant capability.");
         return Task.CompletedTask;
     }
 
-    private static Task TestOutboundGateStateMachineBoundsAsync()
+    private static Task TestOutboundGatePolicyAndGrantExpiryAsync()
+    {
+        var sample = OutboundGateSamples();
+        var ticketClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var ticketNonces = new TestNonceProvider();
+        var ticketMachine = CreateOutboundGateMachine(sample, ticketClock, ticketNonces);
+        var challenged = PrepareToChallenge(ticketMachine, sample, ticketClock, ticketNonces);
+        var ticket = ticketMachine.ReceiveDecision(new UserDecision(1, ticketNonces.NextNonce(), challenged.Challenge.ChallengeId, UserDecisionKind.AllowOnce, null, sample.Start, "test")).Ticket!;
+        AssertEqual(GateRuntimeState.FailedOpen, ticketMachine.ApplyPolicyEpoch(8).Single().State);
+        AssertThrows<InvalidOperationException>(() => ticketMachine.RedeemTicket(ticket));
+
+        var policyClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var policyNonces = new TestNonceProvider();
+        var policyMachine = CreateOutboundGateMachine(sample, policyClock, policyNonces);
+        var policyChallenge = PrepareToChallenge(policyMachine, sample, policyClock, policyNonces);
+        var policyTicket = policyMachine.ReceiveDecision(new UserDecision(1, policyNonces.NextNonce(), policyChallenge.Challenge.ChallengeId, UserDecisionKind.AllowOnce, null, sample.Start, "test")).Ticket!;
+        policyMachine.RedeemTicket(policyTicket);
+        AssertEqual(GateRuntimeState.Blocked, policyMachine.ApplyPolicyEpoch(8).Single().State);
+        AssertThrows<InvalidOperationException>(() => policyMachine.RedeemTicket(policyTicket));
+
+        var expiryClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var expiryNonces = new TestNonceProvider();
+        var expiryMachine = CreateOutboundGateMachine(sample, expiryClock, expiryNonces);
+        var expiryChallenge = PrepareToChallenge(expiryMachine, sample, expiryClock, expiryNonces);
+        var expiryTicket = expiryMachine.ReceiveDecision(new UserDecision(1, expiryNonces.NextNonce(), expiryChallenge.Challenge.ChallengeId, UserDecisionKind.AllowOnce, null, sample.Start, "test")).Ticket!;
+        var grant = expiryMachine.RedeemTicket(expiryTicket).Grant!;
+        expiryClock.Set(grant.GrantWindow.Deadline);
+        AssertEqual(GateRuntimeState.Blocked, expiryMachine.ProcessExpired().Single().State);
+        AssertThrows<InvalidOperationException>(() => expiryMachine.RedeemTicket(expiryTicket));
+        return Task.CompletedTask;
+    }
+
+    private static Task TestOutboundGateReadDeadlineAsync()
+    {
+        var sample = OutboundGateSamples();
+        var nearDeadline = new ServiceMonotonicTimestamp(1, sample.Clock, sample.ReadWindow.Deadline.ElapsedMilliseconds - 1);
+        var nearClock = new TestMonotonicClock(nearDeadline);
+        var nearMachine = CreateOutboundGateMachine(sample, nearClock, new TestNonceProvider());
+        var request = nearMachine.ReceiveIntent(sample.Intent).ArmRequest!;
+        AssertEqual(sample.ReadWindow.Deadline, request.ArmWindow.Deadline);
+
+        var exhaustedClock = new TestMonotonicClock(sample.ReadWindow.Deadline);
+        var exhaustedMachine = CreateOutboundGateMachine(sample, exhaustedClock, new TestNonceProvider());
+        AssertEqual(GateRuntimeState.FailedOpen, exhaustedMachine.ReceiveIntent(sample.Intent).Status.State);
+
+        var ackClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var ackNonces = new TestNonceProvider();
+        var ackMachine = CreateOutboundGateMachine(sample, ackClock, ackNonces);
+        var ackRequest = ackMachine.ReceiveIntent(sample.Intent).ArmRequest!;
+        ackMachine.ReceiveGateArmAck(AckFor(sample, ackRequest, ackNonces));
+        ackClock.Set(ackRequest.ArmWindow.Deadline);
+        AssertEqual(GateRuntimeState.FailedOpen, ackMachine.ProcessExpired().Single().State);
+
+        var dispositionClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var dispositionNonces = new TestNonceProvider();
+        var dispositionMachine = CreateOutboundGateMachine(sample, dispositionClock, dispositionNonces);
+        var disposition = PrepareToDisposition(dispositionMachine, sample, dispositionNonces);
+        dispositionClock.Set(disposition.Request.ArmWindow.Deadline);
+        AssertEqual(GateRuntimeState.FailedOpen, dispositionMachine.ProcessExpired().Single().State);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestOutboundGateAllPhaseExpiryAsync()
+    {
+        var sample = OutboundGateSamples();
+        var completionClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var completionNonces = new TestNonceProvider();
+        var completionMachine = CreateOutboundGateMachine(sample, completionClock, completionNonces);
+        var completionPrepared = PrepareToDisposition(completionMachine, sample, completionNonces);
+        completionMachine.AcceptCompletion(CompletionFor(sample, completionPrepared.Disposition, completionNonces, sample.MinifilterGeneration));
+        completionClock.Advance((long)OutboundGateLimits.MaximumDecisionHoldDuration.TotalMilliseconds);
+        AssertEqual(GateRuntimeState.FailedOpen, completionMachine.ProcessExpired().Single().State);
+
+        var decisionClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var decisionNonces = new TestNonceProvider();
+        var decisionMachine = CreateOutboundGateMachine(sample, decisionClock, decisionNonces);
+        PrepareToChallenge(decisionMachine, sample, decisionClock, decisionNonces);
+        decisionClock.Advance((long)OutboundGateLimits.MaximumDecisionHoldDuration.TotalMilliseconds);
+        AssertEqual(GateRuntimeState.FailedOpen, decisionMachine.ProcessExpired().Single().State);
+
+        var ticketClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var ticketNonces = new TestNonceProvider();
+        var ticketMachine = CreateOutboundGateMachine(sample, ticketClock, ticketNonces);
+        var ticketChallenge = PrepareToChallenge(ticketMachine, sample, ticketClock, ticketNonces);
+        ticketMachine.ReceiveDecision(new UserDecision(1, ticketNonces.NextNonce(), ticketChallenge.Challenge.ChallengeId, UserDecisionKind.AllowOnce, null, sample.Start.AddYears(-50), "test"));
+        ticketClock.Advance((long)OutboundGateLimits.MaximumTicketValidity.TotalMilliseconds);
+        AssertEqual(GateRuntimeState.FailedOpen, ticketMachine.ProcessExpired().Single().State);
+
+        var mismatchClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var mismatchMachine = CreateOutboundGateMachine(sample, mismatchClock, new TestNonceProvider());
+        mismatchMachine.ReceiveIntent(sample.Intent);
+        mismatchClock.Set(new ServiceMonotonicTimestamp(1, Guid.NewGuid(), mismatchClock.Now().ElapsedMilliseconds));
+        AssertEqual(GateRuntimeState.FailedOpen, mismatchMachine.ProcessExpired().Single().State);
+
+        var grantClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var grantNonces = new TestNonceProvider();
+        var grantMachine = CreateOutboundGateMachine(sample, grantClock, grantNonces);
+        var grantChallenge = PrepareToChallenge(grantMachine, sample, grantClock, grantNonces);
+        var grantTicket = grantMachine.ReceiveDecision(new UserDecision(1, grantNonces.NextNonce(), grantChallenge.Challenge.ChallengeId, UserDecisionKind.AllowOnce, null, sample.Start, "test")).Ticket!;
+        grantMachine.RedeemTicket(grantTicket);
+        grantClock.Set(new ServiceMonotonicTimestamp(1, Guid.NewGuid(), grantClock.Now().ElapsedMilliseconds));
+        AssertEqual(GateRuntimeState.Blocked, grantMachine.ProcessExpired().Single().State);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestOutboundGateIntentReplayAsync()
+    {
+        var sample = OutboundGateSamples();
+        var invalidClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var invalidMachine = CreateOutboundGateMachine(sample, invalidClock, new TestNonceProvider());
+        var invalidIntent = new FileReadIntent(1, Guid.NewGuid(), sample.Subject, sample.File, FileActivityOperation.Read, sample.Start, sample.ReadWindow, Guid.NewGuid(), 1);
+        var invalidFirst = invalidMachine.ReceiveIntent(invalidIntent);
+        var counters = invalidMachine.Counters;
+        var alertCount = invalidMachine.CriticalAlerts.Count;
+        var invalidDuplicate = invalidMachine.ReceiveIntent(CloneIntent(invalidIntent));
+        AssertTrue(invalidDuplicate.IsDuplicate, "Invalid intent replay was not recorded.");
+        AssertEqual(counters, invalidMachine.Counters);
+        AssertEqual(alertCount, invalidMachine.CriticalAlerts.Count);
+        AssertThrows<InvalidOperationException>(() => invalidMachine.ReceiveIntent(new FileReadIntent(1, invalidIntent.IntentId, invalidIntent.Subject, invalidIntent.File, invalidIntent.Operation, invalidIntent.ObservedAtUtc, invalidIntent.ReadWindow, invalidIntent.BootInstance, 2)));
+        AssertTrue(invalidFirst.ArmRequest is null && invalidFirst.Ticket is null, "Invalid intent created a capability.");
+
+        var overflowClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var overflowMachine = CreateOutboundGateMachine(sample, overflowClock, new TestNonceProvider());
+        for (var index = 0; index < 4; index++)
+            overflowMachine.ReceiveIntent(IntentFor(sample, Guid.NewGuid(), sample.Subject, index + 1));
+        var overflowIntent = IntentFor(sample, Guid.NewGuid(), sample.Subject, 5);
+        AssertEqual(GateRuntimeState.FailedOpen, overflowMachine.ReceiveIntent(overflowIntent).Status.State);
+        var overflowCounters = overflowMachine.Counters;
+        var overflowAlerts = overflowMachine.CriticalAlerts.Count;
+        AssertTrue(overflowMachine.ReceiveIntent(CloneIntent(overflowIntent)).IsDuplicate, "Overflow replay was not idempotent.");
+        AssertEqual(overflowCounters, overflowMachine.Counters);
+        AssertEqual(overflowAlerts, overflowMachine.CriticalAlerts.Count);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestOutboundGateStorageBoundsAsync()
     {
         var sample = OutboundGateSamples();
         var clock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
-        var nonces = new TestNonceProvider();
-        var machine = new OutboundGateStateMachine(clock, nonces, OutboundGateMode.Simulation, 7);
-        var results = new List<GateTransitionResult>();
-        for (var i = 0; i < 5; i++)
+        var machine = CreateOutboundGateMachine(sample, clock, new TestNonceProvider());
+        var liveIntent = machine.ReceiveIntent(sample.Intent);
+        AssertEqual(GateRuntimeState.Idle, liveIntent.Status.State);
+
+        FileReadIntent? oldest = null;
+        FileReadIntent? newest = null;
+        for (var index = 0; index < 300; index++)
         {
-            var intent = new FileReadIntent(1, Guid.NewGuid(), sample.Subject, sample.File, FileActivityOperation.Read, sample.Start, sample.ReadWindow, sample.Boot, i + 1);
-            results.Add(machine.ReceiveIntent(intent));
+            var intent = new FileReadIntent(1, Guid.NewGuid(), sample.Subject, sample.File, FileActivityOperation.Read, sample.Start, sample.ReadWindow, Guid.NewGuid(), index + 2);
+            oldest ??= intent;
+            newest = intent;
+            machine.ReceiveIntent(intent);
         }
-        AssertEqual(GateRuntimeState.FailedOpen, results[4].Status.State);
-        AssertEqual(1L, machine.Counters.FailedOpenCount);
-        AssertEqual(1, machine.CriticalAlerts.Count);
+        var storage = machine.Storage;
+        AssertEqual(1, storage.ActiveContextCount);
+        AssertEqual(storage.TerminalHistoryCapacity, storage.TerminalHistoryCount);
+        AssertEqual(storage.CriticalAlertCapacity, storage.CriticalAlertCount);
+        AssertEqual(0, storage.ChallengeMappingCount);
+        var beforeNewestReplay = machine.Counters;
+        AssertTrue(machine.ReceiveIntent(newest!).IsDuplicate, "Newest bounded terminal record was lost.");
+        AssertEqual(beforeNewestReplay, machine.Counters);
+        machine.ReceiveIntent(oldest!);
+        AssertEqual(beforeNewestReplay.FailedOpenCount + 1, machine.Counters.FailedOpenCount);
+        AssertEqual(1, machine.Storage.ActiveContextCount);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestOutboundGateChallengeBoundsAsync()
+    {
+        var sample = OutboundGateSamples();
+        var subjectClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var subjectNonces = new TestNonceProvider();
+        var subjectMachine = CreateOutboundGateMachine(sample, subjectClock, subjectNonces);
+        var subjectIntents = new List<FileReadIntent>();
+        for (var index = 0; index < 5; index++)
+        {
+            var intent = IntentFor(sample, Guid.NewGuid(), sample.Subject, index + 1);
+            subjectIntents.Add(intent);
+            var result = PrepareToChallenge(subjectMachine, sample, subjectClock, subjectNonces, intent);
+            if (index == 4)
+                AssertEqual(GateRuntimeState.FailedOpen, result.Result.Status.State);
+        }
+        AssertEqual(4, subjectMachine.Storage.ChallengeMappingCount);
+        AssertEqual(GateRuntimeState.AwaitingDecision, subjectMachine.ReceiveIntent(subjectIntents[0]).Status.State);
 
         var globalClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
-        var globalMachine = new OutboundGateStateMachine(globalClock, new TestNonceProvider(), OutboundGateMode.Simulation, 7);
-        for (var i = 0; i < 65; i++)
+        var globalNonces = new TestNonceProvider();
+        var globalMachine = CreateOutboundGateMachine(sample, globalClock, globalNonces);
+        FileReadIntent? firstLive = null;
+        for (var index = 0; index < 129; index++)
         {
-            var subjectIndex = i < 64 ? i / 4 : 16;
-            var process = new ProcessIdentity(1000 + subjectIndex, sample.Start);
-            var subject = new GateSubject(1, process, $"sha256:capacity-{subjectIndex}", null, [process]);
-            var intent = new FileReadIntent(1, Guid.Parse($"00000000-0000-0000-0000-{i + 1:000000000000}"), subject, sample.File, FileActivityOperation.Read, sample.Start, sample.ReadWindow, sample.Boot, i + 1);
-            var globalResult = globalMachine.ReceiveIntent(intent);
-            if (i == 64)
-                AssertEqual(GateRuntimeState.FailedOpen, globalResult.Status.State);
+            var process = new ProcessIdentity(10_000 + index, sample.Start);
+            var subject = new GateSubject(1, process, $"sha256:challenge-{index}", null, [process]);
+            var intent = IntentFor(sample, Guid.NewGuid(), subject, index + 1);
+            firstLive ??= intent;
+            var result = PrepareToChallenge(globalMachine, sample, globalClock, globalNonces, intent);
+            if (index == 128)
+                AssertEqual(GateRuntimeState.FailedOpen, result.Result.Status.State);
         }
-        AssertEqual(64L, globalMachine.Counters.ActiveIntentCount);
-        AssertEqual(1L, globalMachine.Counters.FailedOpenCount);
-
-        var epochClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
-        var epochMachine = new OutboundGateStateMachine(epochClock, new TestNonceProvider(), OutboundGateMode.Simulation, 7);
-        epochMachine.ReceiveIntent(sample.Intent);
-        AssertEqual(GateRuntimeState.FailedOpen, epochMachine.ApplyPolicyEpoch(8)[0].State);
-
-        var restartClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
-        var restartMachine = new OutboundGateStateMachine(restartClock, new TestNonceProvider(), OutboundGateMode.Simulation, 7);
-        restartMachine.ReceiveIntent(sample.Intent);
-        restartClock.Set(new ServiceMonotonicTimestamp(1, Guid.NewGuid(), restartClock.Now().ElapsedMilliseconds));
-        AssertEqual(GateRuntimeState.FailedOpen, restartMachine.ProcessExpired()[0].State);
-
-        var restartStatuses = machine.HandleServiceRestart(Guid.NewGuid());
-        AssertEqual(4, restartStatuses.Count);
-        AssertTrue(restartStatuses.All(status => status.State == GateRuntimeState.FailedOpen), "Service restart did not fail open every live intent.");
-        AssertThrows<ArgumentOutOfRangeException>(() => machine.ApplyPolicyEpoch(-1));
+        AssertEqual(128, globalMachine.Storage.ChallengeMappingCount);
+        AssertEqual(GateRuntimeState.AwaitingDecision, globalMachine.ReceiveIntent(firstLive!).Status.State);
         return Task.CompletedTask;
     }
 
-    private static PreparedChallenge PrepareToChallenge(OutboundGateStateMachine machine, OutboundGateSample sample, TestMonotonicClock clock, TestNonceProvider nonces)
+    private static Task TestOutboundGateChallengeCoverageAsync()
     {
-        var request = machine.ReceiveIntent(sample.Intent).ArmRequest!;
-        var ack = new GateArmAck(1, nonces.NextNonce(), sample.Intent.IntentId, sample.Subject, request.RequiredCoverage, request.RequiredCoverage, 7, request.DriverGeneration, request.RequestNonce, nonces.NextNonce(), sample.Start, request.ArmWindow, null);
-        machine.ReceiveGateArmAck(ack);
-        var disposition = machine.ReleaseAfterGateArmed(sample.Intent.IntentId).Disposition!;
-        var completion = new FileReadCompletionAck(1, nonces.NextNonce(), sample.Intent.IntentId, sample.Process, sample.File, disposition.Sequence, disposition.Disposition, disposition.GateAckId, FileReadCompletionResult.Released, "released", 1, sample.MinifilterGeneration);
-        machine.AcceptCompletion(completion);
-        var window = ServiceRange(sample.Clock, clock.Now().ElapsedMilliseconds, 15_000);
-        var challenge = new NetworkGateChallenge(1, nonces.NextNonce(), sample.Intent.IntentId, sample.Subject, sample.Destination, 1, false, request.RequiredCoverage, sample.Start, window, "Simulation");
-        machine.ReceiveChallenge(challenge);
-        return new PreparedChallenge(challenge);
+        var sample = OutboundGateSamples();
+        var clock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var nonces = new TestNonceProvider();
+        var machine = CreateOutboundGateMachine(sample, clock, nonces);
+        var prepared = PrepareToDisposition(machine, sample, nonces);
+        machine.AcceptCompletion(CompletionFor(sample, prepared.Disposition, nonces, sample.MinifilterGeneration));
+        var partialCoverage = new GateCoverage(1, GateCoverageFlags.NewTcp);
+        var partialChallenge = ChallengeFor(sample, prepared.Request, clock, nonces, sample.Intent, partialCoverage);
+        AssertEqual(GateRuntimeState.FailedOpen, machine.ReceiveChallenge(partialChallenge).Status.State);
+
+        var ackClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var ackNonces = new TestNonceProvider();
+        var ackMachine = CreateOutboundGateMachine(sample, ackClock, ackNonces);
+        var request = ackMachine.ReceiveIntent(sample.Intent).ArmRequest!;
+        var partialAck = new GateArmAck(1, ackNonces.NextNonce(), sample.Intent.IntentId, sample.Subject, request.RequiredCoverage, partialCoverage, 7, request.DriverGeneration, request.RequestNonce, ackNonces.NextNonce(), sample.Start, request.ArmWindow, "partial");
+        AssertEqual(GateRuntimeState.FailedOpen, ackMachine.ReceiveGateArmAck(partialAck).Status.State);
+        return Task.CompletedTask;
     }
 
-    private sealed record PreparedChallenge(NetworkGateChallenge Challenge);
+    private static OutboundGateStateMachine CreateOutboundGateMachine(OutboundGateSample sample, TestMonotonicClock clock, TestNonceProvider nonces, long policyEpoch = 7) =>
+        new(clock, nonces, OutboundGateMode.Simulation, policyEpoch, new OutboundGateTrustedRuntimeState(sample.Boot, sample.DriverGeneration, sample.MinifilterGeneration));
+
+    private static PreparedRead PrepareToDisposition(OutboundGateStateMachine machine, OutboundGateSample sample, TestNonceProvider nonces, FileReadIntent? intent = null)
+    {
+        intent ??= sample.Intent;
+        var request = machine.ReceiveIntent(intent).ArmRequest!;
+        machine.ReceiveGateArmAck(AckFor(sample, request, nonces, intent));
+        var disposition = machine.ReleaseAfterGateArmed(intent.IntentId).Disposition!;
+        return new PreparedRead(request, disposition);
+    }
+
+    private static PreparedChallenge PrepareToChallenge(OutboundGateStateMachine machine, OutboundGateSample sample, TestMonotonicClock clock, TestNonceProvider nonces, FileReadIntent? intent = null)
+    {
+        intent ??= sample.Intent;
+        var prepared = PrepareToDisposition(machine, sample, nonces, intent);
+        machine.AcceptCompletion(CompletionFor(sample, prepared.Disposition, nonces, sample.MinifilterGeneration, intent));
+        var challenge = ChallengeFor(sample, prepared.Request, clock, nonces, intent, prepared.Request.RequiredCoverage);
+        var result = machine.ReceiveChallenge(challenge);
+        return new PreparedChallenge(challenge, result);
+    }
+
+    private static GateArmAck AckFor(OutboundGateSample sample, GateArmRequest request, TestNonceProvider nonces, FileReadIntent? intent = null) =>
+        new(1, nonces.NextNonce(), request.IntentId, (intent ?? sample.Intent).Subject, request.RequiredCoverage, request.RequiredCoverage, 7, sample.DriverGeneration, request.RequestNonce, nonces.NextNonce(), sample.Start, request.ArmWindow, null);
+
+    private static FileReadCompletionAck CompletionFor(OutboundGateSample sample, FileReadDisposition disposition, TestNonceProvider nonces, Guid minifilterGeneration, FileReadIntent? intent = null)
+    {
+        intent ??= sample.Intent;
+        return new FileReadCompletionAck(1, nonces.NextNonce(), intent.IntentId, intent.Subject.ProcessIdentity, intent.File, disposition.Sequence, disposition.Disposition, disposition.GateAckId, FileReadCompletionResult.Released, "released", 1, minifilterGeneration);
+    }
+
+    private static NetworkGateChallenge ChallengeFor(OutboundGateSample sample, GateArmRequest request, TestMonotonicClock clock, TestNonceProvider nonces, FileReadIntent intent, GateCoverage coverage) =>
+        new(1, nonces.NextNonce(), intent.IntentId, intent.Subject, sample.Destination, 1, false, coverage, sample.Start, ServiceRange(clock.Now().ClockInstanceId, clock.Now().ElapsedMilliseconds, 15_000), "Simulation");
+
+    private static FileReadIntent IntentFor(OutboundGateSample sample, Guid intentId, GateSubject subject, long sequence) =>
+        new(1, intentId, subject, sample.File, FileActivityOperation.Read, sample.Start, sample.ReadWindow, sample.Boot, sequence);
+
+    private static FileReadIntent CloneIntent(FileReadIntent intent)
+    {
+        var subject = new GateSubject(1, intent.Subject.ProcessIdentity, intent.Subject.ApplicationIdentity, intent.Subject.ProcessGroupId, intent.Subject.GroupMembers.ToArray());
+        return new FileReadIntent(intent.Version, intent.IntentId, subject, intent.File, intent.Operation, intent.ObservedAtUtc, intent.ReadWindow, intent.BootInstance, intent.Sequence);
+    }
+
+    private sealed record PreparedRead(GateArmRequest Request, FileReadDisposition Disposition);
+    private sealed record PreparedChallenge(NetworkGateChallenge Challenge, GateTransitionResult Result);
 
     private sealed class TestMonotonicClock : IOutboundGateMonotonicClock
     {
