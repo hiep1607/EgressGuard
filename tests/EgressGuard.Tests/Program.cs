@@ -156,6 +156,7 @@ internal static class Program
             ("Phase 5B-03 restart and policy changes invalidate volatile authority", TestOneTimeTicketInvalidationAsync),
             ("Phase 5B-03 ticket identifiers cannot collide across authority reservations", TestOneTimeTicketIdentifierCollisionAsync),
             ("Phase 5B-03 authenticated ticket fields and grants remain distinct", TestOneTimeTicketAuthenticatedFieldsAsync),
+            ("Phase 5B-03 active grant reservations are bounded and expire monotonically", TestOneTimeTicketActiveGrantCapacityAsync),
             ("Phase 5B-03 policy and restart transitions serialize with redemption", TestOneTimeTicketAuthorityRaceAsync),
             ("Default UI clients honor configured pipe name", TestConfiguredPipeNameAsync),
             ("File correlation IPC stays compatible and bounded", TestFileCorrelationProtocolAsync),
@@ -2561,21 +2562,33 @@ internal static class Program
 
         var tombstoneClock = new TestMonotonicClock(new ServiceMonotonicTimestamp(1, sample.Clock, 10_000));
         using var tombstoneService = CreateTicketService(sample, tombstoneClock, new TestNonceProvider());
-        OneTimeTicket? firstConsumed = null;
+        OneTimeTicket? replayTicket = null;
+        var tombstonePolicyEpoch = 7L;
         for (var index = 0; index < OneTimeGateTicketService.MaximumReplayTombstonesGlobal; index++)
         {
-            var ticket = tombstoneService.TryIssue(TicketBinding(sample, intentId: Guid.NewGuid())).Ticket!;
-            firstConsumed ??= ticket;
-            AssertEqual(TicketServiceResultKind.Success, tombstoneService.TryRedeem(ticket, TicketBinding(sample, intentId: ticket.IntentId)).Kind);
+            var binding = TicketBinding(sample, intentId: Guid.NewGuid(), policyEpoch: tombstonePolicyEpoch);
+            var ticket = tombstoneService.TryIssue(binding).Ticket!;
+            replayTicket = ticket;
+            AssertEqual(TicketServiceResultKind.Success, tombstoneService.TryRedeem(ticket, binding).Kind);
+            if ((index + 1) % OneTimeGateTicketService.MaximumActiveGrantsGlobal == 0
+                && index + 1 < OneTimeGateTicketService.MaximumReplayTombstonesGlobal)
+            {
+                tombstonePolicyEpoch++;
+                tombstoneService.ApplyPolicyEpoch(tombstonePolicyEpoch);
+                AssertEqual(0, tombstoneService.Snapshot.ActiveGrantReservations);
+            }
         }
         AssertEqual(OneTimeGateTicketService.MaximumReplayTombstonesGlobal, tombstoneService.Snapshot.ReplayTombstones);
-        AssertEqual(TicketServiceResultKind.FailOpenCritical, tombstoneService.TryIssue(TicketBinding(sample, intentId: Guid.NewGuid())).Kind);
-        AssertEqual("ticket-replay", tombstoneService.TryRedeem(firstConsumed!, TicketBinding(sample, intentId: firstConsumed!.IntentId)).ReasonCode);
+        AssertEqual(TicketServiceResultKind.FailOpenCritical, tombstoneService.TryIssue(TicketBinding(sample, intentId: Guid.NewGuid(), policyEpoch: tombstonePolicyEpoch)).Kind);
+        AssertEqual("ticket-replay", tombstoneService.TryRedeem(replayTicket!, TicketBinding(sample, intentId: replayTicket!.IntentId, policyEpoch: tombstonePolicyEpoch)).ReasonCode);
+        tombstonePolicyEpoch++;
+        tombstoneService.ApplyPolicyEpoch(tombstonePolicyEpoch);
+        AssertEqual(0, tombstoneService.Snapshot.ActiveGrantReservations);
         tombstoneClock.Set(new ServiceMonotonicTimestamp(1, sample.Clock, 14_999));
         AssertEqual(0, tombstoneService.PruneExpired().TombstonesRemoved);
         tombstoneClock.Set(new ServiceMonotonicTimestamp(1, sample.Clock, 15_000));
         AssertEqual(OneTimeGateTicketService.MaximumReplayTombstonesGlobal, tombstoneService.PruneExpired().TombstonesRemoved);
-        AssertEqual(TicketServiceResultKind.Success, tombstoneService.TryIssue(TicketBinding(sample, intentId: Guid.NewGuid())).Kind);
+        AssertEqual(TicketServiceResultKind.Success, tombstoneService.TryIssue(TicketBinding(sample, intentId: Guid.NewGuid(), policyEpoch: tombstonePolicyEpoch)).Kind);
         return Task.CompletedTask;
     }
 
@@ -2605,13 +2618,30 @@ internal static class Program
         using var service = CreateTicketService(sample, clock, nonces);
         var binding = TicketBinding(sample);
         var ticket = service.TryIssue(binding).Ticket!;
+        AssertEqual(TicketServiceResultKind.Success, service.TryRedeem(ticket, binding).Kind);
+        AssertEqual(1, service.Snapshot.ActiveGrantReservations);
+        service.ApplyPolicyEpoch(7);
+        AssertEqual(1, service.Snapshot.ActiveGrantReservations);
         service.ApplyPolicyEpoch(8);
+        AssertEqual(0, service.Snapshot.ActiveGrantReservations);
         AssertEqual("ticket-policy-epoch-mismatch", service.TryRedeem(ticket, binding).ReasonCode);
 
+        var epochBinding = TicketBinding(sample, intentId: Guid.NewGuid(), policyEpoch: 8);
+        var epochTicket = service.TryIssue(epochBinding).Ticket!;
+        AssertEqual(TicketServiceResultKind.Success, service.TryRedeem(epochTicket, epochBinding).Kind);
+        AssertEqual(1, service.Snapshot.ActiveGrantReservations);
         var newBoot = Guid.NewGuid();
         service.ResetRuntime(newBoot, 9, new DeterministicTestTicketAuthenticator(newBoot));
+        AssertEqual(0, service.Snapshot.ActiveGrantReservations);
         AssertEqual("ticket-boot-instance-mismatch", service.TryRedeem(ticket, binding).ReasonCode);
         AssertEqual(0, service.Snapshot.OutstandingGlobal);
+
+        var resetBinding = TicketBinding(sample, intentId: Guid.NewGuid(), bootInstance: newBoot, policyEpoch: 9);
+        var resetTicket = service.TryIssue(resetBinding).Ticket!;
+        AssertEqual(TicketServiceResultKind.Success, service.TryRedeem(resetTicket, resetBinding).Kind);
+        AssertEqual(1, service.Snapshot.ActiveGrantReservations);
+        service.Dispose();
+        AssertEqual(0, service.Snapshot.ActiveGrantReservations);
         return Task.CompletedTask;
     }
 
@@ -2624,37 +2654,51 @@ internal static class Program
         var nextTicketId = Guid.Parse("e1000000-0000-0000-0000-000000000004");
         var nextNonce = Guid.Parse("e1000000-0000-0000-0000-000000000005");
 
-        var cases = new[]
+        var consumedCollisionCases = new[]
         {
-            new[] { ticketId, nonce, grantId, ticketId, nextNonce },
-            new[] { ticketId, nonce, grantId, nextTicketId, ticketId },
-            new[] { ticketId, nonce, grantId, nextTicketId, nonce },
-            new[] { ticketId, nonce, nextTicketId, ticketId }
+            (TicketId: ticketId, Nonce: nonce),
+            (TicketId: ticketId, Nonce: nextNonce),
+            (TicketId: nextTicketId, Nonce: ticketId),
+            (TicketId: nonce, Nonce: nextNonce),
+            (TicketId: nextTicketId, Nonce: nonce)
         };
-        foreach (var script in cases)
+        foreach (var candidate in consumedCollisionCases)
         {
             var clock = new TestMonotonicClock(new ServiceMonotonicTimestamp(1, sample.Clock, 10_000));
-            using var service = new OneTimeGateTicketService(clock, new TestAuditClock(sample.Start), new ScriptedNonceProvider(script), new DeterministicTestTicketAuthenticator(sample.Boot), 7);
+            using var service = new OneTimeGateTicketService(
+                clock,
+                new TestAuditClock(sample.Start),
+                new ScriptedNonceProvider(ticketId, nonce, grantId, candidate.TicketId, candidate.Nonce),
+                new DeterministicTestTicketAuthenticator(sample.Boot),
+                7);
             var binding = TicketBinding(sample);
-            var first = service.TryIssue(binding);
-            AssertEqual(TicketServiceResultKind.Success, first.Kind);
-            AssertTrue(first.Ticket is not null, "The scripted first ticket was not issued.");
-            if (script.Length == 4)
-            {
-                AssertEqual(TicketServiceResultKind.FailOpenCritical, service.TryIssue(TicketBinding(sample, intentId: Guid.NewGuid())).Kind);
-                continue;
-            }
-
-            var redeemed = service.TryRedeem(first.Ticket!, binding);
+            var first = service.TryIssue(binding).Ticket!;
+            var redeemed = service.TryRedeem(first, binding);
             AssertEqual(TicketServiceResultKind.Success, redeemed.Kind);
             AssertTrue(redeemed.Grant is not null, "The first ticket did not produce a grant before collision testing.");
             var collision = service.TryIssue(TicketBinding(sample, intentId: Guid.NewGuid()));
             AssertEqual(TicketServiceResultKind.FailOpenCritical, collision.Kind);
             AssertEqual("ticket-identifier-collision", collision.ReasonCode);
             AssertTrue(collision.CapacityFailure, "Identifier collision was not surfaced as a reservation failure.");
-            var replay = service.TryRedeem(first.Ticket!, binding);
+            AssertEqual(1, service.Snapshot.ReplayTombstones);
+            var replay = service.TryRedeem(first, binding);
             AssertEqual("ticket-replay", replay.ReasonCode);
             AssertTrue(replay.Grant is null, "A replay after identifier collision created a grant.");
+        }
+
+        var outstandingClock = new TestMonotonicClock(new ServiceMonotonicTimestamp(1, sample.Clock, 10_000));
+        using (var outstandingService = new OneTimeGateTicketService(
+            outstandingClock,
+            new TestAuditClock(sample.Start),
+            new ScriptedNonceProvider(ticketId, nonce, nonce, nextNonce),
+            new DeterministicTestTicketAuthenticator(sample.Boot),
+            7))
+        {
+            AssertEqual(TicketServiceResultKind.Success, outstandingService.TryIssue(TicketBinding(sample)).Kind);
+            var outstandingCollision = outstandingService.TryIssue(TicketBinding(sample, intentId: Guid.NewGuid()));
+            AssertEqual(TicketServiceResultKind.FailOpenCritical, outstandingCollision.Kind);
+            AssertEqual("ticket-identifier-collision", outstandingCollision.ReasonCode);
+            AssertEqual(1, outstandingService.Snapshot.OutstandingGlobal);
         }
 
         var stateClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
@@ -2729,6 +2773,58 @@ internal static class Program
         AssertEqual(TicketServiceResultKind.FailOpenCritical, collision.Kind);
         AssertEqual("ticket-grant-identifier-collision", collision.ReasonCode);
         AssertTrue(collision.Grant is null, "An active grant-ID collision created a second grant.");
+        AssertEqual(1, activeService.Snapshot.ActiveGrantReservations);
+        AssertEqual(OneTimeGateTicketService.MaximumActiveGrantsGlobal, activeService.Snapshot.ActiveGrantReservationCapacity);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestOneTimeTicketActiveGrantCapacityAsync()
+    {
+        var sample = OutboundGateSamples();
+        var clock = new TestMonotonicClock(new ServiceMonotonicTimestamp(1, sample.Clock, 10_000));
+        using var service = CreateTicketService(sample, clock, new TestNonceProvider());
+
+        for (var index = 0; index < OneTimeGateTicketService.MaximumActiveGrantsGlobal - 1; index++)
+        {
+            var binding = TicketBinding(sample, intentId: Guid.NewGuid());
+            var ticket = service.TryIssue(binding).Ticket!;
+            AssertEqual(TicketServiceResultKind.Success, service.TryRedeem(ticket, binding).Kind);
+        }
+        AssertEqual(OneTimeGateTicketService.MaximumActiveGrantsGlobal - 1, service.Snapshot.ActiveGrantReservations);
+
+        var capBinding = TicketBinding(sample, intentId: Guid.NewGuid());
+        var postCapBinding = TicketBinding(sample, intentId: Guid.NewGuid());
+        var capTicket = service.TryIssue(capBinding).Ticket!;
+        var postCapTicket = service.TryIssue(postCapBinding).Ticket!;
+        AssertEqual(TicketServiceResultKind.Success, service.TryRedeem(capTicket, capBinding).Kind);
+        AssertEqual(OneTimeGateTicketService.MaximumActiveGrantsGlobal, service.Snapshot.ActiveGrantReservations);
+
+        var consumedAtCapacity = service.TryRedeem(postCapTicket, postCapBinding);
+        AssertEqual(TicketServiceResultKind.FailOpenCritical, consumedAtCapacity.Kind);
+        AssertEqual("ticket-active-grant-capacity-exhausted", consumedAtCapacity.ReasonCode);
+        AssertTrue(consumedAtCapacity.TicketConsumed, "A ticket reaching active-grant capacity was not consumed.");
+        AssertTrue(consumedAtCapacity.Grant is null, "Active-grant capacity pressure created a grant.");
+        AssertEqual(OneTimeGateTicketService.MaximumActiveGrantsGlobal, service.Snapshot.ActiveGrantReservations);
+        AssertEqual("ticket-replay", service.TryRedeem(postCapTicket, postCapBinding).ReasonCode);
+
+        var issuanceAtCapacity = service.TryIssue(TicketBinding(sample, intentId: Guid.NewGuid()));
+        AssertEqual(TicketServiceResultKind.FailOpenCritical, issuanceAtCapacity.Kind);
+        AssertEqual("ticket-active-grant-capacity-exhausted", issuanceAtCapacity.ReasonCode);
+        AssertTrue(issuanceAtCapacity.CapacityFailure, "Active-grant issuance refusal was not marked as capacity pressure.");
+        AssertTrue(issuanceAtCapacity.Ticket is null, "Active-grant capacity pressure issued a ticket.");
+        AssertEqual(OneTimeGateTicketService.MaximumActiveGrantsGlobal, service.Snapshot.ActiveGrantReservations);
+
+        clock.Set(new ServiceMonotonicTimestamp(1, sample.Clock, 309_999));
+        service.PruneExpired();
+        AssertEqual(OneTimeGateTicketService.MaximumActiveGrantsGlobal, service.Snapshot.ActiveGrantReservations);
+        clock.Set(new ServiceMonotonicTimestamp(1, sample.Clock, 310_000));
+        service.PruneExpired();
+        AssertEqual(0, service.Snapshot.ActiveGrantReservations);
+
+        var afterExpiryBinding = TicketBinding(sample, intentId: Guid.NewGuid());
+        var afterExpiryTicket = service.TryIssue(afterExpiryBinding).Ticket!;
+        AssertEqual(TicketServiceResultKind.Success, service.TryRedeem(afterExpiryTicket, afterExpiryBinding).Kind);
+        AssertEqual(1, service.Snapshot.ActiveGrantReservations);
         return Task.CompletedTask;
     }
 

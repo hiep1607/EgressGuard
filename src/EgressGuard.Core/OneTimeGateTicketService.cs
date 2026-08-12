@@ -165,7 +165,9 @@ public sealed record TicketServiceSnapshot(
     int ReplayTombstones,
     int ReservedTombstones,
     int OutstandingGlobalCapacity,
-    int ReplayTombstoneCapacity);
+    int ReplayTombstoneCapacity,
+    int ActiveGrantReservations,
+    int ActiveGrantReservationCapacity);
 
 internal interface IEphemeralFlowGrantFactory
 {
@@ -214,6 +216,7 @@ public sealed class OneTimeGateTicketService : IDisposable
     public const int MaximumOutstandingPerSubject = 8;
     public const int MaximumOutstandingGlobal = 256;
     public const int MaximumReplayTombstonesGlobal = 2_048;
+    public const int MaximumActiveGrantsGlobal = 256;
 
     private readonly object _sync = new();
     private readonly IOutboundGateMonotonicClock _monotonicClock;
@@ -255,7 +258,15 @@ public sealed class OneTimeGateTicketService : IDisposable
         {
             lock (_sync)
             {
-                return new TicketServiceSnapshot(_outstanding.Count, _subjectCounts.Count, _tombstones.Count, _outstanding.Count, MaximumOutstandingGlobal, MaximumReplayTombstonesGlobal);
+                return new TicketServiceSnapshot(
+                    _outstanding.Count,
+                    _subjectCounts.Count,
+                    _tombstones.Count,
+                    _outstanding.Count,
+                    MaximumOutstandingGlobal,
+                    MaximumReplayTombstonesGlobal,
+                    _activeGrantIds.Count,
+                    MaximumActiveGrantsGlobal);
             }
         }
     }
@@ -278,6 +289,8 @@ public sealed class OneTimeGateTicketService : IDisposable
                 return new TicketIssueResult(TicketServiceResultKind.FailOpenCritical, "ticket-subject-capacity-exhausted", null, true);
             if (_tombstones.Count + _outstanding.Count >= MaximumReplayTombstonesGlobal)
                 return new TicketIssueResult(TicketServiceResultKind.FailOpenCritical, "ticket-tombstone-capacity-exhausted", null, true);
+            if (_activeGrantIds.Count >= MaximumActiveGrantsGlobal)
+                return new TicketIssueResult(TicketServiceResultKind.FailOpenCritical, "ticket-active-grant-capacity-exhausted", null, true);
 
             var ticketId = _nonceProvider.NextNonce();
             var nonce = _nonceProvider.NextNonce();
@@ -404,6 +417,8 @@ public sealed class OneTimeGateTicketService : IDisposable
                 return new TicketRedemptionResult(TicketServiceResultKind.FailOpenCritical, "ticket-reservation-invariant-failed", true, null);
             _tombstones[tombstoneKey] = new Tombstone(presentedTicket.TicketId, presentedTicket.Nonce, presentedTicket.ValidityWindow.Deadline);
 
+            if (_activeGrantIds.Count >= MaximumActiveGrantsGlobal)
+                return new TicketRedemptionResult(TicketServiceResultKind.FailOpenCritical, "ticket-active-grant-capacity-exhausted", true, null);
             var grantId = _nonceProvider.NextNonce();
             if (grantId == Guid.Empty || IdentifierInUse(grantId) || _activeGrantIds.ContainsKey(grantId))
                 return new TicketRedemptionResult(TicketServiceResultKind.FailOpenCritical, "ticket-grant-identifier-collision", true, null);
@@ -457,6 +472,8 @@ public sealed class OneTimeGateTicketService : IDisposable
         {
             EnsureNotDisposed();
             ArgumentOutOfRangeException.ThrowIfLessThan(newPolicyEpoch, _policyEpoch, nameof(newPolicyEpoch));
+            if (newPolicyEpoch == _policyEpoch)
+                return new TicketInvalidationResult(0, _tombstones.Count);
             _policyEpoch = newPolicyEpoch;
             var invalidated = 0;
             foreach (var entry in _outstanding.Values.Where(entry => entry.Ticket.PolicyEpoch != newPolicyEpoch).ToArray())
