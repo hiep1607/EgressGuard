@@ -130,6 +130,7 @@ internal static class Program
             ("Phase 5B-01 contracts serialize and preserve exact identity", TestOutboundGateContractRoundTripAsync),
             ("Phase 5B-01 contracts enforce monotonic deadlines and generations", TestOutboundGateMonotonicValidationAsync),
             ("Phase 5B-01 contracts enforce decision and disposition invariants", TestOutboundGateDecisionValidationAsync),
+            ("Phase 5B-01 contracts bind exact outbound network scope", TestOutboundGateNetworkScopeAsync),
             ("Phase 5B-01 contracts reject invalid versions bounds and status counters", TestOutboundGateContractValidationAsync),
             ("Phase 5B-01 contracts preserve compatibility and omit sensitive fields", TestOutboundGateContractCompatibilityAsync),
             ("Default UI clients honor configured pipe name", TestConfiguredPipeNameAsync),
@@ -1771,6 +1772,15 @@ internal static class Program
         AssertEqual(sample.Request.IntentId, payload.Request.IntentId);
         AssertEqual(sample.Request.Subject.ProcessIdentity, payload.Request.Subject.ProcessIdentity);
         AssertEqual(sample.Request.RequestNonce, payload.Request.RequestNonce);
+        var destinationJson = System.Text.Json.JsonSerializer.Serialize(sample.Destination, JsonDefaults.Options);
+        var destinationRoundTrip = System.Text.Json.JsonSerializer.Deserialize<DestinationBinding>(destinationJson, JsonDefaults.Options);
+        AssertEqual(sample.Destination, destinationRoundTrip);
+        AssertEqual(NetworkTrafficDirection.Outbound, destinationRoundTrip?.Direction);
+        AssertEqual((uint?)12, destinationRoundTrip?.NetworkCompartmentId);
+        AssertEqual((ulong?)34, destinationRoundTrip?.InterfaceLuid);
+        var ackJson = System.Text.Json.JsonSerializer.Serialize(sample.Ack, JsonDefaults.Options);
+        AssertTrue(!ackJson.Contains("ServiceAcknowledgedAt", StringComparison.Ordinal), "Wire Ack exposed a self-declared authoritative acknowledgement time.");
+        AssertTrue(!ackJson.Contains("ServiceReceivedAt", StringComparison.Ordinal), "Wire Ack exposed service-owned receipt metadata.");
         return Task.CompletedTask;
     }
 
@@ -1788,16 +1798,21 @@ internal static class Program
         AssertThrows<ArgumentOutOfRangeException>(() => _ = new EphemeralFlowGrant(1, Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), sample.Subject, sample.Destination, 1, 1, sample.Boot, 1, ServiceRange(sample.Clock, 0, 300_001)));
         AssertThrows<ArgumentOutOfRangeException>(() => _ = new EphemeralFlowGrant(1, Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), sample.Subject, sample.Destination, 1, 1, sample.Boot, OutboundGateLimits.MaximumGrantBytes + 1, sample.Grant.GrantWindow));
 
-        AssertThrows<ArgumentException>(() => _ = new GateArmAck(1, Guid.NewGuid(), sample.Intent.IntentId, sample.Subject, sample.Coverage, sample.Coverage, 7, Guid.Empty, sample.Request.RequestNonce, Guid.NewGuid(), sample.Start, sample.ReadWindow.StartedAt, sample.ReadWindow, null));
-        AssertThrows<ArgumentOutOfRangeException>(() => _ = new GateArmAck(1, Guid.NewGuid(), sample.Intent.IntentId, sample.Subject, sample.Coverage, sample.Coverage, 7, sample.DriverGeneration, sample.Request.RequestNonce, Guid.NewGuid(), sample.Start, new ServiceMonotonicTimestamp(1, Guid.NewGuid(), 1_500), sample.ReadWindow, null));
-        AssertThrows<ArgumentOutOfRangeException>(() => _ = new GateArmAck(1, Guid.NewGuid(), sample.Intent.IntentId, sample.Subject, sample.Coverage, sample.Coverage, 7, sample.DriverGeneration, sample.Request.RequestNonce, Guid.NewGuid(), sample.Start, new ServiceMonotonicTimestamp(1, sample.Clock, sample.ReadWindow.Deadline.ElapsedMilliseconds + 1), sample.ReadWindow, null));
+        AssertThrows<ArgumentException>(() => _ = new GateArmAck(1, Guid.NewGuid(), sample.Intent.IntentId, sample.Subject, sample.Coverage, sample.Coverage, 7, Guid.Empty, sample.Request.RequestNonce, Guid.NewGuid(), sample.Start, sample.ReadWindow, null));
 
-        var wrongGenerationAck = new GateArmAck(1, Guid.NewGuid(), sample.Intent.IntentId, sample.Subject, sample.Coverage, sample.Coverage, 7, Guid.NewGuid(), sample.Request.RequestNonce, Guid.NewGuid(), sample.Start, sample.Ack.ServiceAcknowledgedAt, sample.ReadWindow, null);
-        AssertThrows<InvalidOperationException>(() => wrongGenerationAck.ValidateFor(sample.Request));
+        var serviceReceipt = new ServiceMonotonicTimestamp(1, sample.Clock, 1_500);
+        sample.Ack.ValidateFor(sample.Request, serviceReceipt);
+        AssertThrows<InvalidOperationException>(() => sample.Ack.ValidateFor(sample.Request, new ServiceMonotonicTimestamp(1, sample.Clock, sample.ReadWindow.Deadline.ElapsedMilliseconds + 1)));
+        AssertThrows<InvalidOperationException>(() => sample.Ack.ValidateFor(sample.Request, new ServiceMonotonicTimestamp(1, sample.Clock, sample.ReadWindow.StartedAt.ElapsedMilliseconds - 1)));
+        AssertThrows<InvalidOperationException>(() => sample.Ack.ValidateFor(sample.Request, new ServiceMonotonicTimestamp(1, Guid.NewGuid(), 1_500)));
+
+        var oldEndpointAuditAck = new GateArmAck(1, Guid.NewGuid(), sample.Intent.IntentId, sample.Subject, sample.Coverage, sample.Coverage, 7, sample.DriverGeneration, sample.Request.RequestNonce, Guid.NewGuid(), sample.Start.AddYears(-20), sample.ReadWindow, null);
+        AssertThrows<InvalidOperationException>(() => oldEndpointAuditAck.ValidateFor(sample.Request, new ServiceMonotonicTimestamp(1, sample.Clock, sample.ReadWindow.Deadline.ElapsedMilliseconds + 1)));
+        var wrongGenerationAck = new GateArmAck(1, Guid.NewGuid(), sample.Intent.IntentId, sample.Subject, sample.Coverage, sample.Coverage, 7, Guid.NewGuid(), sample.Request.RequestNonce, Guid.NewGuid(), sample.Start, sample.ReadWindow, null);
+        AssertThrows<InvalidOperationException>(() => wrongGenerationAck.ValidateFor(sample.Request, serviceReceipt));
         AssertThrows<ArgumentException>(() => _ = new FileReadCompletionAck(1, Guid.NewGuid(), sample.Intent.IntentId, sample.Process, sample.File, sample.Disposition.Sequence, sample.Disposition.Disposition, sample.Disposition.GateAckId, FileReadCompletionResult.Released, "read-released", 3, Guid.Empty));
         AssertTrue(sample.Completion.IsBoundTo(sample.Disposition, sample.MinifilterGeneration), "Completion did not retain exact disposition and minifilter-generation binding.");
         AssertTrue(!sample.Completion.IsBoundTo(sample.Disposition, Guid.NewGuid()), "Completion accepted the wrong minifilter generation.");
-        sample.Ack.ValidateFor(sample.Request);
         return Task.CompletedTask;
     }
 
@@ -1822,6 +1837,32 @@ internal static class Program
         return Task.CompletedTask;
     }
 
+    private static Task TestOutboundGateNetworkScopeAsync()
+    {
+        var sample = OutboundGateSamples();
+        var absentEvidence = new DestinationBinding(1, IPAddress.IPv6Loopback, IpVersion.IPv6, 443, TransportProtocol.Udp, NetworkTrafficDirection.Outbound, null, null, null, DomainEvidenceProvenance.None, null);
+        AssertEqual(null, absentEvidence.NetworkCompartmentId);
+        AssertEqual(null, absentEvidence.InterfaceLuid);
+        var absentRoundTrip = System.Text.Json.JsonSerializer.Deserialize<DestinationBinding>(System.Text.Json.JsonSerializer.Serialize(absentEvidence, JsonDefaults.Options), JsonDefaults.Options);
+        AssertEqual(absentEvidence, absentRoundTrip);
+
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new DestinationBinding(1, IPAddress.Loopback, IpVersion.IPv4, 443, TransportProtocol.Tcp, NetworkTrafficDirection.Unspecified, null, null, null, DomainEvidenceProvenance.None, null));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new DestinationBinding(1, IPAddress.Loopback, IpVersion.IPv4, 443, TransportProtocol.Tcp, NetworkTrafficDirection.Inbound, null, null, null, DomainEvidenceProvenance.None, null));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new DestinationBinding(1, IPAddress.Loopback, IpVersion.IPv4, 443, TransportProtocol.Tcp, (NetworkTrafficDirection)99, null, null, null, DomainEvidenceProvenance.None, null));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new DestinationBinding(1, IPAddress.Loopback, IpVersion.IPv4, 443, TransportProtocol.Tcp, NetworkTrafficDirection.Outbound, 0, null, null, DomainEvidenceProvenance.None, null));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new DestinationBinding(1, IPAddress.Loopback, IpVersion.IPv4, 443, TransportProtocol.Tcp, NetworkTrafficDirection.Outbound, null, 0, null, DomainEvidenceProvenance.None, null));
+
+        var differentCompartment = new DestinationBinding(1, sample.Destination.Address, sample.Destination.IpVersion, sample.Destination.RemotePort, sample.Destination.Protocol, NetworkTrafficDirection.Outbound, 13, sample.Destination.InterfaceLuid, sample.Destination.DomainEvidence, sample.Destination.DomainProvenance, sample.Destination.DomainObservedAtUtc);
+        var differentInterface = new DestinationBinding(1, sample.Destination.Address, sample.Destination.IpVersion, sample.Destination.RemotePort, sample.Destination.Protocol, NetworkTrafficDirection.Outbound, sample.Destination.NetworkCompartmentId, 35, sample.Destination.DomainEvidence, sample.Destination.DomainProvenance, sample.Destination.DomainObservedAtUtc);
+        AssertTrue(sample.Destination != differentCompartment, "Destination equality ignored network compartment evidence.");
+        AssertTrue(sample.Destination != differentInterface, "Destination equality ignored interface evidence.");
+
+        var wrongNetworkScope = new RequestedPersistentScope(1, PersistentAllowPolicyKind.RememberFor30Days, sample.File, sample.Subject.ApplicationIdentity, differentCompartment);
+        var wrongNetworkDecision = new UserDecision(1, Guid.NewGuid(), sample.Challenge.ChallengeId, UserDecisionKind.AlwaysAllow, wrongNetworkScope, sample.Start, "interactive-user");
+        AssertThrows<InvalidOperationException>(() => wrongNetworkDecision.ValidatePersistentScopeFor(sample.Challenge, sample.File));
+        return Task.CompletedTask;
+    }
+
     private static Task TestOutboundGateContractValidationAsync()
     {
         var sample = OutboundGateSamples();
@@ -1833,8 +1874,9 @@ internal static class Program
         AssertThrows<ArgumentException>(() => _ = new GateSubject(1, sample.Process, "C:\\not-an-identity", null, [sample.Process]));
         AssertThrows<ArgumentException>(() => _ = new GateSubject(1, sample.Process, "sha256:app", Guid.NewGuid(), Enumerable.Repeat(sample.Process, OutboundGateLimits.MaximumGroupMembers + 1).ToArray()));
         AssertThrows<ArgumentOutOfRangeException>(() => _ = new FileVersionIdentity(1, "volume", "file", sample.Start, 1, sample.Start, sample.Start, -1, "token"));
-        AssertThrows<ArgumentOutOfRangeException>(() => _ = new DestinationBinding(1, IPAddress.Loopback, IpVersion.IPv6, 443, TransportProtocol.Tcp, null, DomainEvidenceProvenance.None, null));
-        AssertThrows<ArgumentException>(() => _ = new DestinationBinding(1, IPAddress.Loopback, IpVersion.IPv4, 443, TransportProtocol.Tcp, "example.test", DomainEvidenceProvenance.None, null));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new DestinationBinding(1, IPAddress.Loopback, IpVersion.IPv6, 443, TransportProtocol.Tcp, NetworkTrafficDirection.Outbound, null, null, null, DomainEvidenceProvenance.None, null));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new DestinationBinding(1, IPAddress.IPv6Loopback, IpVersion.IPv6, 443, (TransportProtocol)99, NetworkTrafficDirection.Outbound, null, null, null, DomainEvidenceProvenance.None, null));
+        AssertThrows<ArgumentException>(() => _ = new DestinationBinding(1, IPAddress.Loopback, IpVersion.IPv4, 443, TransportProtocol.Tcp, NetworkTrafficDirection.Outbound, null, null, "example.test", DomainEvidenceProvenance.None, null));
         AssertThrows<ArgumentOutOfRangeException>(() => _ = new FileReadIntent(1, Guid.NewGuid(), sample.Subject, sample.File, FileActivityOperation.Write, sample.Start, sample.ReadWindow, sample.Boot, 1));
         AssertThrows<ArgumentOutOfRangeException>(() => _ = new GateArmRequest(1, Guid.NewGuid(), sample.Subject, new GateCoverage(1, GateCoverageFlags.None), 1, sample.DriverGeneration, Guid.NewGuid(), sample.Start, sample.ReadWindow));
         AssertThrows<ArgumentOutOfRangeException>(() => _ = new OneTimeTicket(1, Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), sample.Subject, sample.File, sample.Destination, 1, 1, sample.Boot, sample.Start, sample.Start, sample.Ticket.ValidityWindow, 1, 1, [1]));
@@ -1843,8 +1885,8 @@ internal static class Program
         AssertThrows<ArgumentOutOfRangeException>(() => _ = new CriticalAlert(1, Guid.NewGuid(), "overflow", sample.AffectedScope, sample.Start, sample.Status.ServiceObservedAt, 0, OutboundGateLimits.MaximumDiagnosticCounter + 1, true));
         AssertThrows<ArgumentException>(() => _ = new GateStatus(1, OutboundGateMode.Simulation, GateRuntimeState.Armed, sample.Coverage, "inconsistent-fail-open", sample.AffectedScope, sample.Start, sample.Status.ServiceObservedAt, 0, 0, true));
 
-        var partial = new GateArmAck(1, sample.Ack.AckId, sample.Ack.IntentId, sample.Ack.Subject, sample.Ack.RequiredCoverage, new GateCoverage(1, GateCoverageFlags.NewTcp), sample.Ack.PolicyEpoch, sample.Ack.DriverGeneration, sample.Ack.RequestNonce, sample.Ack.AckNonce, sample.Ack.AcknowledgedAtUtc, sample.Ack.ServiceAcknowledgedAt, sample.Ack.ArmWindow, "unsupported existing coverage");
-        AssertThrows<InvalidOperationException>(() => partial.ValidateFor(sample.Request));
+        var partial = new GateArmAck(1, sample.Ack.AckId, sample.Ack.IntentId, sample.Ack.Subject, sample.Ack.RequiredCoverage, new GateCoverage(1, GateCoverageFlags.NewTcp), sample.Ack.PolicyEpoch, sample.Ack.DriverGeneration, sample.Ack.RequestNonce, sample.Ack.AckNonce, sample.Ack.EndpointAcknowledgedAtUtc, sample.Ack.ArmWindow, "unsupported existing coverage");
+        AssertThrows<InvalidOperationException>(() => partial.ValidateFor(sample.Request, new ServiceMonotonicTimestamp(1, sample.Clock, 1_500)));
         return Task.CompletedTask;
     }
 
@@ -1890,7 +1932,7 @@ internal static class Program
         var requestNonce = Guid.Parse("40000000-0000-0000-0000-000000000004");
         var subject = new GateSubject(1, process, "sha256:application", null, [process]);
         var file = new FileVersionIdentity(1, "volume-1", "file-42", start, 1024, start.AddMinutes(1), start.AddMinutes(2), 42, "version-token-1");
-        var destination = new DestinationBinding(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, "localhost", DomainEvidenceProvenance.DnsObservation, start);
+        var destination = new DestinationBinding(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, NetworkTrafficDirection.Outbound, 12, 34, "localhost", DomainEvidenceProvenance.DnsObservation, start);
         var coverage = new GateCoverage(1, GateCoverageFlags.NewTcp | GateCoverageFlags.NewUdp | GateCoverageFlags.ExistingTcpStream | GateCoverageFlags.ExistingUdpDatagram | GateCoverageFlags.ReconnectRequiredSimulation);
         var readWindow = ServiceRange(clock, 1_000, 2_000);
         var decisionWindow = ServiceRange(clock, 3_000, 15_000);
@@ -1899,7 +1941,7 @@ internal static class Program
         var intent = new FileReadIntent(1, intentId, subject, file, FileActivityOperation.Read, start, readWindow, boot, 1);
         var request = new GateArmRequest(1, intentId, subject, coverage, 7, driver, requestNonce, start, readWindow);
         var acknowledgedAt = new ServiceMonotonicTimestamp(1, clock, 1_500);
-        var ack = new GateArmAck(1, Guid.Parse("50000000-0000-0000-0000-000000000005"), intentId, subject, coverage, coverage, 7, driver, requestNonce, Guid.Parse("60000000-0000-0000-0000-000000000006"), start.AddMilliseconds(10), acknowledgedAt, readWindow, null);
+        var ack = new GateArmAck(1, Guid.Parse("50000000-0000-0000-0000-000000000005"), intentId, subject, coverage, coverage, 7, driver, requestNonce, Guid.Parse("60000000-0000-0000-0000-000000000006"), start.AddMilliseconds(10), readWindow, null);
         var disposition = new FileReadDisposition(1, intentId, process, file, FileReadDispositionKind.ReleaseAfterGateArmed, ack.AckId, readWindow, "gate-armed", 2);
         var completion = new FileReadCompletionAck(1, Guid.Parse("70000000-0000-0000-0000-000000000007"), intentId, process, file, 2, disposition.Disposition, disposition.GateAckId, FileReadCompletionResult.Released, "read-released", 3, minifilter);
         var challenge = new NetworkGateChallenge(1, Guid.Parse("80000000-0000-0000-0000-000000000008"), intentId, subject, destination, 1, false, coverage, start, decisionWindow, null);

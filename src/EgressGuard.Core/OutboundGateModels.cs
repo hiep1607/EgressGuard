@@ -252,6 +252,13 @@ public enum DomainEvidenceProvenance
     CryptographicBinding
 }
 
+public enum NetworkTrafficDirection
+{
+    Unspecified,
+    Outbound,
+    Inbound
+}
+
 public sealed record DestinationBinding
 {
     public int Version { get; }
@@ -259,11 +266,14 @@ public sealed record DestinationBinding
     public IpVersion IpVersion { get; }
     public int RemotePort { get; }
     public TransportProtocol Protocol { get; }
+    public NetworkTrafficDirection Direction { get; }
+    public uint? NetworkCompartmentId { get; }
+    public ulong? InterfaceLuid { get; }
     public string? DomainEvidence { get; }
     public DomainEvidenceProvenance DomainProvenance { get; }
     public DateTimeOffset? DomainObservedAtUtc { get; }
 
-    public DestinationBinding(int version, IPAddress address, IpVersion ipVersion, int remotePort, TransportProtocol protocol, string? domainEvidence, DomainEvidenceProvenance domainProvenance, DateTimeOffset? domainObservedAtUtc)
+    public DestinationBinding(int version, IPAddress address, IpVersion ipVersion, int remotePort, TransportProtocol protocol, NetworkTrafficDirection direction, uint? networkCompartmentId, ulong? interfaceLuid, string? domainEvidence, DomainEvidenceProvenance domainProvenance, DateTimeOffset? domainObservedAtUtc)
     {
         OutboundGateLimits.RequireVersion(version);
         ArgumentNullException.ThrowIfNull(address);
@@ -272,6 +282,12 @@ public sealed record DestinationBinding
             || (ipVersion == IpVersion.IPv4 && address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
             || (ipVersion == IpVersion.IPv6 && address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetworkV6))
             throw new ArgumentOutOfRangeException(nameof(remotePort), "Destination address family and port must be valid.");
+        if (!Enum.IsDefined(direction) || direction != NetworkTrafficDirection.Outbound)
+            throw new ArgumentOutOfRangeException(nameof(direction), direction, "Only outbound destination bindings are supported.");
+        if (networkCompartmentId == 0)
+            throw new ArgumentOutOfRangeException(nameof(networkCompartmentId), "Network compartment evidence cannot be zero when present.");
+        if (interfaceLuid == 0)
+            throw new ArgumentOutOfRangeException(nameof(interfaceLuid), "Interface LUID evidence cannot be zero when present.");
         if (!Enum.IsDefined(domainProvenance))
             throw new ArgumentOutOfRangeException(nameof(domainProvenance));
         if ((domainEvidence is null && (domainProvenance != DomainEvidenceProvenance.None || domainObservedAtUtc is not null))
@@ -282,6 +298,9 @@ public sealed record DestinationBinding
         IpVersion = ipVersion;
         RemotePort = remotePort;
         Protocol = protocol;
+        Direction = direction;
+        NetworkCompartmentId = networkCompartmentId;
+        InterfaceLuid = interfaceLuid;
         DomainEvidence = OutboundGateLimits.Optional(domainEvidence, nameof(domainEvidence), OutboundGateLimits.MaximumDomainLength);
         DomainProvenance = domainProvenance;
         DomainObservedAtUtc = domainObservedAtUtc is null ? null : OutboundGateLimits.Utc(domainObservedAtUtc.Value, nameof(domainObservedAtUtc));
@@ -371,12 +390,11 @@ public sealed record GateArmAck
     public Guid DriverGeneration { get; }
     public Guid RequestNonce { get; }
     public Guid AckNonce { get; }
-    public DateTimeOffset AcknowledgedAtUtc { get; }
-    public ServiceMonotonicTimestamp ServiceAcknowledgedAt { get; }
+    public DateTimeOffset EndpointAcknowledgedAtUtc { get; }
     public ServiceMonotonicTimeRange ArmWindow { get; }
     public string? UnsupportedOrDegradedReason { get; }
 
-    public GateArmAck(int version, Guid ackId, Guid intentId, GateSubject subject, GateCoverage requiredCoverage, GateCoverage armedCoverage, long policyEpoch, Guid driverGeneration, Guid requestNonce, Guid ackNonce, DateTimeOffset acknowledgedAtUtc, ServiceMonotonicTimestamp serviceAcknowledgedAt, ServiceMonotonicTimeRange armWindow, string? unsupportedOrDegradedReason)
+    public GateArmAck(int version, Guid ackId, Guid intentId, GateSubject subject, GateCoverage requiredCoverage, GateCoverage armedCoverage, long policyEpoch, Guid driverGeneration, Guid requestNonce, Guid ackNonce, DateTimeOffset endpointAcknowledgedAtUtc, ServiceMonotonicTimeRange armWindow, string? unsupportedOrDegradedReason)
     {
         OutboundGateLimits.RequireVersion(version);
         OutboundGateLimits.GuidValue(ackId, nameof(ackId));
@@ -384,7 +402,6 @@ public sealed record GateArmAck
         ArgumentNullException.ThrowIfNull(subject);
         ArgumentNullException.ThrowIfNull(requiredCoverage);
         ArgumentNullException.ThrowIfNull(armedCoverage);
-        ArgumentNullException.ThrowIfNull(serviceAcknowledgedAt);
         ArgumentNullException.ThrowIfNull(armWindow);
         armWindow.ValidateMaximum(OutboundGateLimits.MaximumGateArmReadDuration, nameof(armWindow));
         if (requiredCoverage.Flags == GateCoverageFlags.None)
@@ -392,8 +409,7 @@ public sealed record GateArmAck
         OutboundGateLimits.GuidValue(driverGeneration, nameof(driverGeneration));
         OutboundGateLimits.GuidValue(requestNonce, nameof(requestNonce));
         OutboundGateLimits.GuidValue(ackNonce, nameof(ackNonce));
-        if (policyEpoch < 0 || !armWindow.Contains(serviceAcknowledgedAt))
-            throw new ArgumentOutOfRangeException(nameof(policyEpoch));
+        ArgumentOutOfRangeException.ThrowIfNegative(policyEpoch);
         Version = version;
         AckId = ackId;
         IntentId = intentId;
@@ -404,14 +420,14 @@ public sealed record GateArmAck
         DriverGeneration = driverGeneration;
         RequestNonce = requestNonce;
         AckNonce = ackNonce;
-        AcknowledgedAtUtc = OutboundGateLimits.Utc(acknowledgedAtUtc, nameof(acknowledgedAtUtc));
-        ServiceAcknowledgedAt = serviceAcknowledgedAt;
+        EndpointAcknowledgedAtUtc = OutboundGateLimits.Utc(endpointAcknowledgedAtUtc, nameof(endpointAcknowledgedAtUtc));
         ArmWindow = armWindow;
         UnsupportedOrDegradedReason = OutboundGateLimits.Optional(unsupportedOrDegradedReason, nameof(unsupportedOrDegradedReason), OutboundGateLimits.MaximumReasonLength);
     }
 
-    public bool HasFullCoverageFor(GateArmRequest request) =>
+    public bool HasFullCoverageFor(GateArmRequest request, ServiceMonotonicTimestamp serviceReceivedAt) =>
         request is not null
+        && serviceReceivedAt is not null
         && IntentId == request.IntentId
         && Subject.Matches(request.Subject)
         && RequiredCoverage.Version == request.RequiredCoverage.Version
@@ -420,13 +436,15 @@ public sealed record GateArmAck
         && DriverGeneration == request.DriverGeneration
         && RequestNonce == request.RequestNonce
         && ArmWindow == request.ArmWindow
-        && ArmWindow.Contains(ServiceAcknowledgedAt)
+        && request.ArmWindow.Contains(serviceReceivedAt)
         && ArmedCoverage.Contains(request.RequiredCoverage)
         && string.IsNullOrWhiteSpace(UnsupportedOrDegradedReason);
 
-    public void ValidateFor(GateArmRequest request)
+    public void ValidateFor(GateArmRequest request, ServiceMonotonicTimestamp serviceReceivedAt)
     {
-        if (!HasFullCoverageFor(request))
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(serviceReceivedAt);
+        if (!HasFullCoverageFor(request, serviceReceivedAt))
             throw new InvalidOperationException("Gate acknowledgement is partial, stale or bound to a different request.");
     }
 }
