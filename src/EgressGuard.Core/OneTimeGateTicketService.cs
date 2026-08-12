@@ -226,6 +226,7 @@ public sealed class OneTimeGateTicketService : IDisposable
     private readonly Dictionary<Guid, OutstandingEntry> _outstanding = new();
     private readonly Dictionary<string, Tombstone> _tombstones = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _subjectCounts = new(StringComparer.Ordinal);
+    private readonly Dictionary<Guid, ServiceMonotonicTimestamp> _activeGrantIds = new();
 
     public OneTimeGateTicketService(IOutboundGateMonotonicClock monotonicClock, IOutboundGateAuditClock auditClock, IOutboundGateNonceProvider nonceProvider, IOneTimeTicketAuthenticator authenticator, long initialPolicyEpoch)
         : this(monotonicClock, auditClock, nonceProvider, authenticator, initialPolicyEpoch, null)
@@ -280,8 +281,10 @@ public sealed class OneTimeGateTicketService : IDisposable
 
             var ticketId = _nonceProvider.NextNonce();
             var nonce = _nonceProvider.NextNonce();
-            if (ticketId == Guid.Empty || nonce == Guid.Empty || ticketId == nonce || _outstanding.ContainsKey(ticketId))
+            if (ticketId == Guid.Empty || nonce == Guid.Empty || ticketId == nonce)
                 return new TicketIssueResult(TicketServiceResultKind.FailOpenCritical, "ticket-identifier-unavailable", null);
+            if (IdentifierInUse(ticketId) || IdentifierInUse(nonce))
+                return new TicketIssueResult(TicketServiceResultKind.FailOpenCritical, "ticket-identifier-collision", null, true);
 
             var validityWindow = new ServiceMonotonicTimeRange(
                 now.Version,
@@ -367,6 +370,7 @@ public sealed class OneTimeGateTicketService : IDisposable
                 return new TicketRedemptionResult(TicketServiceResultKind.Rejected, "ticket-policy-epoch-mismatch", false, null);
 
             var now = RequireClock();
+            PruneExpiredReservationsCore(now);
             if (!SameClock(now, presentedTicket.ValidityWindow.StartedAt))
                 return new TicketRedemptionResult(TicketServiceResultKind.Rejected, "ticket-clock-instance-mismatch", false, null);
             if (now.ElapsedMilliseconds < presentedTicket.ValidityWindow.StartedAt.ElapsedMilliseconds)
@@ -391,9 +395,19 @@ public sealed class OneTimeGateTicketService : IDisposable
             var tombstoneKey = ReplayFingerprint(presentedTicket);
             if (_tombstones.Count >= MaximumReplayTombstonesGlobal)
                 return new TicketRedemptionResult(TicketServiceResultKind.FailOpenCritical, "ticket-reservation-invariant-failed", true, null);
-            _tombstones[tombstoneKey] = new Tombstone(presentedTicket.ValidityWindow.Deadline);
+            var identifierCollision = _tombstones.Values.Any(tombstone =>
+                tombstone.TicketId == presentedTicket.TicketId
+                || tombstone.Nonce == presentedTicket.TicketId
+                || tombstone.TicketId == presentedTicket.Nonce
+                || tombstone.Nonce == presentedTicket.Nonce);
+            if (identifierCollision)
+                return new TicketRedemptionResult(TicketServiceResultKind.FailOpenCritical, "ticket-reservation-invariant-failed", true, null);
+            _tombstones[tombstoneKey] = new Tombstone(presentedTicket.TicketId, presentedTicket.Nonce, presentedTicket.ValidityWindow.Deadline);
 
-            var grantParameters = new TicketGrantParameters(presentedTicket, now, _nonceProvider.NextNonce());
+            var grantId = _nonceProvider.NextNonce();
+            if (grantId == Guid.Empty || IdentifierInUse(grantId) || _activeGrantIds.ContainsKey(grantId))
+                return new TicketRedemptionResult(TicketServiceResultKind.FailOpenCritical, "ticket-grant-identifier-collision", true, null);
+            var grantParameters = new TicketGrantParameters(presentedTicket, now, grantId);
             bool grantCreated;
             EphemeralFlowGrant? grant = null;
             try
@@ -407,6 +421,9 @@ public sealed class OneTimeGateTicketService : IDisposable
             }
             if (!grantCreated)
                 return new TicketRedemptionResult(TicketServiceResultKind.FailOpenCritical, "ticket-grant-creation-failed", true, null);
+            if (grant!.GrantId != grantId || grant.GrantId == presentedTicket.TicketId || grant.GrantId == presentedTicket.Nonce)
+                return new TicketRedemptionResult(TicketServiceResultKind.FailOpenCritical, "ticket-grant-creation-failed", true, null);
+            _activeGrantIds[grant.GrantId] = grant.GrantWindow.Deadline;
             return new TicketRedemptionResult(TicketServiceResultKind.Success, "ticket-redeemed-simulation", true, grant);
         }
     }
@@ -448,6 +465,7 @@ public sealed class OneTimeGateTicketService : IDisposable
                 RemoveSubjectCount(entry.SubjectKey);
                 invalidated++;
             }
+            _activeGrantIds.Clear();
             return new TicketInvalidationResult(invalidated, _tombstones.Count);
         }
     }
@@ -466,6 +484,7 @@ public sealed class OneTimeGateTicketService : IDisposable
             _outstanding.Clear();
             _subjectCounts.Clear();
             _tombstones.Clear();
+            _activeGrantIds.Clear();
             _policyEpoch = newPolicyEpoch;
             var old = _authenticator;
             _authenticator = newAuthenticator;
@@ -484,6 +503,7 @@ public sealed class OneTimeGateTicketService : IDisposable
             _outstanding.Clear();
             _subjectCounts.Clear();
             _tombstones.Clear();
+            _activeGrantIds.Clear();
             _authenticator.Dispose();
         }
     }
@@ -497,13 +517,21 @@ public sealed class OneTimeGateTicketService : IDisposable
             RemoveSubjectCount(entry.SubjectKey);
             outstandingRemoved++;
         }
+        var tombstonesRemoved = PruneExpiredReservationsCore(now);
+        return new TicketPruneResult(outstandingRemoved, tombstonesRemoved);
+    }
+
+    private int PruneExpiredReservationsCore(ServiceMonotonicTimestamp now)
+    {
         var tombstonesRemoved = 0;
         foreach (var item in _tombstones.Where(item => SameClock(now, item.Value.SafeUntil) && now.ElapsedMilliseconds >= item.Value.SafeUntil.ElapsedMilliseconds).ToArray())
         {
             _tombstones.Remove(item.Key);
             tombstonesRemoved++;
         }
-        return new TicketPruneResult(outstandingRemoved, tombstonesRemoved);
+        foreach (var item in _activeGrantIds.Where(item => SameClock(now, item.Value) && now.ElapsedMilliseconds >= item.Value.ElapsedMilliseconds).ToArray())
+            _activeGrantIds.Remove(item.Key);
+        return tombstonesRemoved;
     }
 
     private bool IsCanonicalProofValid(OneTimeTicket ticket)
@@ -542,6 +570,11 @@ public sealed class OneTimeGateTicketService : IDisposable
     private static bool SameClock(ServiceMonotonicTimestamp left, ServiceMonotonicTimestamp right) =>
         left.Version == right.Version && left.ClockInstanceId == right.ClockInstanceId;
 
+    private bool IdentifierInUse(Guid candidate) =>
+        _activeGrantIds.ContainsKey(candidate)
+        || _outstanding.Values.Any(entry => entry.Ticket.TicketId == candidate || entry.Ticket.Nonce == candidate)
+        || _tombstones.Values.Any(tombstone => tombstone.TicketId == candidate || tombstone.Nonce == candidate);
+
     private static string SubjectKey(GateSubject subject) => Convert.ToHexString(SHA256.HashData(CanonicalTicketEncoding.EncodeSubject(subject)));
 
     private static string ReplayFingerprint(OneTimeTicket ticket)
@@ -572,7 +605,7 @@ public sealed class OneTimeGateTicketService : IDisposable
         && CryptographicOperations.FixedTimeEquals(left.AuthenticatorProof.ToArray(), right.AuthenticatorProof.ToArray());
 
     private sealed record OutstandingEntry(OneTimeTicket Ticket, string SubjectKey);
-    private sealed record Tombstone(ServiceMonotonicTimestamp SafeUntil);
+    private sealed record Tombstone(Guid TicketId, Guid Nonce, ServiceMonotonicTimestamp SafeUntil);
 }
 
 internal static class CanonicalTicketEncoding

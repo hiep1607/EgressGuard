@@ -342,6 +342,12 @@ public sealed class OutboundGateStateMachine : IDisposable
 
     public GateTransitionResult ReceiveDecision(UserDecision decision)
     {
+        lock (_transitionSync)
+            return ReceiveDecisionCore(decision);
+    }
+
+    private GateTransitionResult ReceiveDecisionCore(UserDecision decision)
+    {
         ArgumentNullException.ThrowIfNull(decision);
         var context = FindActiveContextForChallenge(decision.ChallengeId);
         if (context.Decision is not null)
@@ -418,6 +424,12 @@ public sealed class OutboundGateStateMachine : IDisposable
 
     public IReadOnlyList<GateStatus> ProcessExpired()
     {
+        lock (_transitionSync)
+            return ProcessExpiredCore();
+    }
+
+    private List<GateStatus> ProcessExpiredCore()
+    {
         var now = RequireClock(_clock.Now());
         _ticketService?.PruneExpired();
         var statuses = new List<GateStatus>();
@@ -434,16 +446,25 @@ public sealed class OutboundGateStateMachine : IDisposable
 
     public IReadOnlyList<GateStatus> HandleServiceRestart(Guid newBootInstance)
     {
-        var runtime = RequireTrustedRuntime();
-        return HandleServiceRestart(new OutboundGateTrustedRuntimeState(newBootInstance, runtime.WfpGeneration, runtime.MinifilterGeneration));
+        lock (_transitionSync)
+        {
+            var runtime = RequireTrustedRuntime();
+            return HandleServiceRestartCore(new OutboundGateTrustedRuntimeState(newBootInstance, runtime.WfpGeneration, runtime.MinifilterGeneration));
+        }
     }
 
     public IReadOnlyList<GateStatus> HandleServiceRestart(OutboundGateTrustedRuntimeState newRuntime)
     {
+        lock (_transitionSync)
+            return HandleServiceRestartCore(newRuntime);
+    }
+
+    private List<GateStatus> HandleServiceRestartCore(OutboundGateTrustedRuntimeState newRuntime)
+    {
         ArgumentNullException.ThrowIfNull(newRuntime);
         var now = RequireClock(_clock.Now());
-        _trustedRuntime = newRuntime;
         _ticketService?.ResetRuntime(newRuntime.BootInstance, _policyEpoch, new HmacSha256BootTicketAuthenticator(newRuntime.BootInstance));
+        _trustedRuntime = newRuntime;
         var statuses = new List<GateStatus>();
         foreach (var context in _activeContexts.Values.ToArray())
         {
@@ -456,13 +477,19 @@ public sealed class OutboundGateStateMachine : IDisposable
 
     public IReadOnlyList<GateStatus> ApplyPolicyEpoch(long policyEpoch)
     {
+        lock (_transitionSync)
+            return ApplyPolicyEpochCore(policyEpoch);
+    }
+
+    private IReadOnlyList<GateStatus> ApplyPolicyEpochCore(long policyEpoch)
+    {
         ArgumentOutOfRangeException.ThrowIfNegative(policyEpoch);
         if (policyEpoch < _policyEpoch)
             throw new ArgumentOutOfRangeException(nameof(policyEpoch), "Policy epoch cannot move backwards.");
         if (policyEpoch == _policyEpoch)
             return Array.Empty<GateStatus>();
-        _policyEpoch = policyEpoch;
         _ticketService?.ApplyPolicyEpoch(policyEpoch);
+        _policyEpoch = policyEpoch;
         var now = RequireClock(_clock.Now());
         var statuses = new List<GateStatus>();
         foreach (var context in _activeContexts.Values.Where(context => context.Request.PolicyEpoch != policyEpoch).ToArray())
@@ -625,7 +652,11 @@ public sealed class OutboundGateStateMachine : IDisposable
         return _ticketService!.TryIssue(binding);
     }
 
-    public void Dispose() => _ticketService?.Dispose();
+    public void Dispose()
+    {
+        lock (_transitionSync)
+            _ticketService?.Dispose();
+    }
 
 
     private GateStatus Status(GateSubject subject, Guid intentId, GateRuntimeState state, string reason, ServiceMonotonicTimestamp now, bool trafficFailedOpen, GateCoverage? coverage = null) =>
