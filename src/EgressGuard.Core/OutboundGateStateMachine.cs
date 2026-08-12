@@ -10,6 +10,11 @@ public interface IOutboundGateNonceProvider
     Guid NextNonce();
 }
 
+public interface IOutboundGateAuditClock
+{
+    DateTimeOffset NowUtc();
+}
+
 public sealed record OutboundGateTrustedRuntimeState
 {
     public Guid BootInstance { get; }
@@ -45,18 +50,20 @@ public sealed record GateTransitionResult
     public GateStatus Status { get; init; }
     public GateArmRequest? ArmRequest { get; init; }
     public FileReadDisposition? Disposition { get; init; }
+    public FileReadCompletionAck? Completion { get; init; }
     public NetworkGateChallenge? Challenge { get; init; }
     public OneTimeTicket? Ticket { get; init; }
     public EphemeralFlowGrant? Grant { get; init; }
     public CriticalAlert? CriticalAlert { get; init; }
     public bool IsDuplicate { get; init; }
 
-    internal GateTransitionResult(GateStatus status, GateArmRequest? armRequest = null, FileReadDisposition? disposition = null, NetworkGateChallenge? challenge = null, OneTimeTicket? ticket = null, EphemeralFlowGrant? grant = null, CriticalAlert? criticalAlert = null, bool isDuplicate = false)
+    internal GateTransitionResult(GateStatus status, GateArmRequest? armRequest = null, FileReadDisposition? disposition = null, NetworkGateChallenge? challenge = null, OneTimeTicket? ticket = null, EphemeralFlowGrant? grant = null, CriticalAlert? criticalAlert = null, bool isDuplicate = false, FileReadCompletionAck? completion = null)
     {
         Version = OutboundGateLimits.CurrentVersion;
         Status = status;
         ArmRequest = armRequest;
         Disposition = disposition;
+        Completion = completion;
         Challenge = challenge;
         Ticket = ticket;
         Grant = grant;
@@ -77,6 +84,7 @@ public sealed class OutboundGateStateMachine
 
     private readonly IOutboundGateMonotonicClock _clock;
     private readonly IOutboundGateNonceProvider _nonces;
+    private readonly IOutboundGateAuditClock _auditClock;
     private readonly OutboundGateMode _mode;
     private readonly Dictionary<Guid, Context> _activeContexts = new();
     private readonly Dictionary<Guid, TerminalRecord> _terminalHistory = new();
@@ -92,12 +100,14 @@ public sealed class OutboundGateStateMachine
     public OutboundGateStateMachine(
         IOutboundGateMonotonicClock clock,
         IOutboundGateNonceProvider nonces,
+        IOutboundGateAuditClock auditClock,
         OutboundGateMode mode = OutboundGateMode.Disabled,
         long initialPolicyEpoch = 0,
         OutboundGateTrustedRuntimeState? trustedRuntime = null)
     {
         _clock = clock ?? throw new ArgumentNullException(nameof(clock));
         _nonces = nonces ?? throw new ArgumentNullException(nameof(nonces));
+        _auditClock = auditClock ?? throw new ArgumentNullException(nameof(auditClock));
         if (!Enum.IsDefined(mode))
             throw new ArgumentOutOfRangeException(nameof(mode));
         ArgumentOutOfRangeException.ThrowIfNegative(initialPolicyEpoch);
@@ -204,6 +214,12 @@ public sealed class OutboundGateStateMachine
 
     public GateTransitionResult ReleaseAfterGateArmed(Guid intentId)
     {
+        if (!_activeContexts.ContainsKey(intentId) && _terminalHistory.TryGetValue(intentId, out var terminal))
+        {
+            if (terminal.Disposition is null)
+                throw new InvalidOperationException("Release cannot mutate a terminal intent without an accepted disposition.");
+            return terminal.ReplayResult with { IsDuplicate = true, Disposition = terminal.Disposition };
+        }
         var context = RequireActiveContext(intentId, "Release");
         if (context.Disposition is not null)
             return context.Result with { IsDuplicate = true };
@@ -221,9 +237,34 @@ public sealed class OutboundGateStateMachine
         return context.Result;
     }
 
+    public GateTransitionResult ReleaseAfterGateArmed(FileReadDisposition disposition)
+    {
+        ArgumentNullException.ThrowIfNull(disposition);
+        if (!_activeContexts.ContainsKey(disposition.IntentId) && _terminalHistory.TryGetValue(disposition.IntentId, out var terminal))
+        {
+            if (terminal.Disposition is null || !DispositionMatches(terminal.Disposition, disposition))
+                throw new InvalidOperationException("Terminal disposition fingerprint does not match.");
+            return terminal.ReplayResult with { IsDuplicate = true, Disposition = terminal.Disposition };
+        }
+        var context = RequireActiveContext(disposition.IntentId, "Release");
+        if (context.Disposition is not null)
+        {
+            if (DispositionMatches(context.Disposition, disposition))
+                return context.Result with { IsDuplicate = true };
+            throw new InvalidOperationException("Disposition fingerprint does not match the accepted disposition.");
+        }
+        throw new InvalidOperationException("A disposition payload cannot create a release; use the intent transition.");
+    }
+
     public GateTransitionResult AcceptCompletion(FileReadCompletionAck completion)
     {
         ArgumentNullException.ThrowIfNull(completion);
+        if (!_activeContexts.ContainsKey(completion.IntentId) && _terminalHistory.TryGetValue(completion.IntentId, out var terminal))
+        {
+            if (terminal.Completion is null || !CompletionMatches(terminal.Completion, completion))
+                throw new InvalidOperationException("Terminal completion fingerprint does not match.");
+            return terminal.ReplayResult with { IsDuplicate = true, Completion = terminal.Completion, Disposition = terminal.Disposition };
+        }
         var context = RequireActiveContext(completion.IntentId, "Completion");
         if (context.Completion is not null)
         {
@@ -239,9 +280,13 @@ public sealed class OutboundGateStateMachine
             || completion.Result != FileReadCompletionResult.Released
             || completion.MinifilterGeneration != context.ExpectedMinifilterGeneration
             || !completion.IsBoundTo(context.Disposition, context.ExpectedMinifilterGeneration))
+        {
+            context.CompletionAttempt = completion;
             return FailOpen(context, "completion-binding-or-generation-invalid", now);
+        }
 
         context.Completion = completion;
+        context.CompletionAttempt = completion;
         context.Phase = ContextPhase.AwaitingChallenge;
         context.PhaseDeadline = NewDeadline(now, OutboundGateLimits.MaximumDecisionHoldDuration);
         context.Result = new GateTransitionResult(Status(context.Intent.Subject, context.Intent.IntentId, GateRuntimeState.Armed, "read-completion-accepted", now, false, context.Request.RequiredCoverage), context.Request, context.Disposition);
@@ -413,7 +458,7 @@ public sealed class OutboundGateStateMachine
         {
             if (!IntentMatches(terminal.Intent, intent))
                 throw new InvalidOperationException("Terminal intent ID has a different payload.");
-            result = terminal.Result with { IsDuplicate = true };
+            result = terminal.ReplayResult with { IsDuplicate = true };
             return true;
         }
         result = null;
@@ -466,7 +511,7 @@ public sealed class OutboundGateStateMachine
             _overflowCount++;
         _failedOpenCount++;
         var alert = Alert(reason, new GateAffectedScope(1, GateAffectedScopeKind.Intent, context.Intent.IntentId, context.Intent.Subject), now);
-        var result = new GateTransitionResult(Status(context.Intent.Subject, context.Intent.IntentId, GateRuntimeState.FailedOpen, reason, now, true, context.Request.RequiredCoverage), criticalAlert: alert);
+        var result = new GateTransitionResult(Status(context.Intent.Subject, context.Intent.IntentId, GateRuntimeState.FailedOpen, reason, now, true, context.Request.RequiredCoverage), criticalAlert: alert, disposition: context.Disposition, completion: context.Completion);
         CompleteTerminal(context, result);
         return result;
     }
@@ -489,22 +534,28 @@ public sealed class OutboundGateStateMachine
     {
         RemoveChallengeMapping(context);
         _activeContexts.Remove(context.Intent.IntentId);
+        context.Result = result;
+        var replayResult = new GateTransitionResult(
+            result.Status,
+            disposition: context.Disposition,
+            criticalAlert: result.CriticalAlert,
+            completion: context.Completion ?? context.CompletionAttempt);
+        RememberTerminal(context.Intent, replayResult, context.Disposition, context.Completion ?? context.CompletionAttempt);
         context.Ack = null;
         context.Disposition = null;
         context.Completion = null;
+        context.CompletionAttempt = null;
         context.Challenge = null;
         context.Decision = null;
         context.Ticket = null;
         context.Grant = null;
-        context.Result = result;
-        RememberTerminal(context.Intent, result);
     }
 
-    private void RememberTerminal(FileReadIntent intent, GateTransitionResult result)
+    private void RememberTerminal(FileReadIntent intent, GateTransitionResult result, FileReadDisposition? disposition = null, FileReadCompletionAck? completion = null)
     {
         if (_terminalHistory.ContainsKey(intent.IntentId))
             return;
-        _terminalHistory.Add(intent.IntentId, new TerminalRecord(intent, result));
+        _terminalHistory.Add(intent.IntentId, new TerminalRecord(intent, result, disposition, completion));
         _terminalOrder.Enqueue(intent.IntentId);
         while (_terminalHistory.Count > MaximumTerminalHistory)
         {
@@ -642,10 +693,17 @@ public sealed class OutboundGateStateMachine
     private static ServiceMonotonicTimeRange NewWindow(ServiceMonotonicTimestamp start, TimeSpan duration) =>
         new(1, start, NewDeadline(start, duration));
 
-    private static DateTimeOffset AuditUtc(ServiceMonotonicTimestamp timestamp) => DateTimeOffset.UnixEpoch.AddMilliseconds(timestamp.ElapsedMilliseconds);
+    private DateTimeOffset AuditUtc(ServiceMonotonicTimestamp timestamp)
+    {
+        _ = timestamp;
+        var utc = _auditClock.NowUtc();
+        if (utc == default)
+            throw new InvalidOperationException("Audit clock returned the default timestamp.");
+        return utc.ToUniversalTime();
+    }
 
-    private int PendingCount() => _activeContexts.Values.Count(context => context.Phase == ContextPhase.AwaitingArmAcknowledgement);
-    private int PendingCountFor(GateSubject subject) => _activeContexts.Values.Count(context => context.Phase == ContextPhase.AwaitingArmAcknowledgement && context.Intent.Subject.Matches(subject));
+    private int PendingCount() => _activeContexts.Values.Count(IsPendingRead);
+    private int PendingCountFor(GateSubject subject) => _activeContexts.Values.Count(context => IsPendingRead(context) && context.Intent.Subject.Matches(subject));
     private int ActiveChallengeCountFor(GateSubject subject) => _activeContexts.Values.Count(context => context.Phase == ContextPhase.AwaitingDecision && context.Intent.Subject.Matches(subject));
     private Context RequireSingleActiveContext() => _activeContexts.Values.SingleOrDefault() ?? throw new InvalidOperationException("Exactly one active intent is required for this operation.");
 
@@ -684,6 +742,7 @@ public sealed class OutboundGateStateMachine
         public GateArmAck? Ack { get; set; }
         public FileReadDisposition? Disposition { get; set; }
         public FileReadCompletionAck? Completion { get; set; }
+        public FileReadCompletionAck? CompletionAttempt { get; set; }
         public NetworkGateChallenge? Challenge { get; set; }
         public UserDecision? Decision { get; set; }
         public OneTimeTicket? Ticket { get; set; }
@@ -691,5 +750,18 @@ public sealed class OutboundGateStateMachine
         public GateTransitionResult Result { get; set; }
     }
 
-    private sealed record TerminalRecord(FileReadIntent Intent, GateTransitionResult Result);
+    private static bool IsPendingRead(Context context) => context.Phase is ContextPhase.AwaitingArmAcknowledgement or ContextPhase.AwaitingDisposition or ContextPhase.AwaitingCompletion;
+
+    private static bool DispositionMatches(FileReadDisposition left, FileReadDisposition right) =>
+        left.Version == right.Version
+        && left.IntentId == right.IntentId
+        && left.ProcessIdentity == right.ProcessIdentity
+        && left.File == right.File
+        && left.Disposition == right.Disposition
+        && left.GateAckId == right.GateAckId
+        && left.ReadWindow == right.ReadWindow
+        && string.Equals(left.ReasonCode, right.ReasonCode, StringComparison.Ordinal)
+        && left.Sequence == right.Sequence;
+
+    private sealed record TerminalRecord(FileReadIntent Intent, GateTransitionResult ReplayResult, FileReadDisposition? Disposition, FileReadCompletionAck? Completion);
 }
