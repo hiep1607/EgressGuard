@@ -14,6 +14,7 @@ public static class OutboundGateMessageTypes
     public const string OneTimeTicket = "Phase5B.OneTimeTicket";
     public const string EphemeralFlowGrant = "Phase5B.EphemeralFlowGrant";
     public const string GateStatus = "Phase5B.GateStatus";
+    public const string CriticalAlert = "Phase5B.CriticalAlert";
 }
 
 public sealed record FileReadIntentMessage(FileReadIntent Intent);
@@ -26,3 +27,4 @@ public sealed record UserDecisionMessage(UserDecision Decision);
 public sealed record OneTimeTicketMessage(OneTimeTicket Ticket);
 public sealed record EphemeralFlowGrantMessage(EphemeralFlowGrant Grant);
 public sealed record GateStatusMessage(GateStatus Status);
+public sealed record CriticalAlertMessage(CriticalAlert Alert);
