@@ -128,6 +128,7 @@ public sealed record PersistentDecisionTransitionResult
     public GateTransitionResult DecisionResult { get; }
     public IReadOnlyList<GateStatus> InvalidatedStatuses { get; }
     public long PolicyEpoch { get; }
+    public bool PolicyEpochAccepted { get; }
 }
 
 public PersistentDecisionTransitionResult ReceivePersistentDecision(
@@ -153,12 +154,17 @@ transition lock it must:
 
 The result constructor requires version `1`, a non-null decision result, a
 copied list of at most 255 invalidated statuses (all old-epoch contexts other
-than the selected one), and a non-negative epoch. While the selected context
-remains active, an exact repeat of the same decision/epoch returns the same
-result with the nested decision result marked duplicate and changes no
-epoch/counter/alert; a different binding is rejected. The Service's bounded
-receipt remains the terminal replay authority after the Core active context
-leaves.
+than the selected one), a non-negative epoch, and an explicit
+`PolicyEpochAccepted` proof. A prevalidation rejection returns
+`PolicyEpochAccepted == false`, the unchanged current epoch, no invalidated
+statuses, and a non-mutating decision result. A successful epoch transition,
+including one whose subsequent current-ticket issuance fails open, returns
+`PolicyEpochAccepted == true` and the accepted new epoch. While the selected
+context remains active, an exact repeat of the same accepted decision/epoch
+returns the same result with the nested decision result marked duplicate and
+changes no epoch/counter/alert; a different binding is rejected. The Service's
+bounded receipt remains the terminal replay authority after the Core active
+context leaves.
 
 If validation fails, epoch and all state remain unchanged. Once epoch advancement
 succeeds, the Service commits the pre-reserved in-memory rule even if current
@@ -188,8 +194,8 @@ the existing API do not justify shipping a partial three-decision UI.
 
 | Component | 5B-05 responsibility | Must not do |
 |---|---|---|
-| `SimulatedDecisionCoordinator` in Service | Own trusted prompt projections, remembered simulation rules, decision receipts, monotonic expiry, exact Core/authority forwarding, and snapshot construction. | Duplicate Core authority, trust UI scope/time/caller, persist raw data, or mint a ticket/grant itself. |
-| `ISimulatedDecisionAuthority` Service boundary | Expose the current simulation clock/audit clock, accept a Service-built `UserDecision`, apply policy epoch, return only the authoritative transition result, and expose the one internal projection-capacity recovery operation below. Default implementation is Disabled. | Accept a decision from the pipe directly, accept an arbitrary invalidation reason, or expose ticket/grant material to UI code. |
+| `SimulatedDecisionCoordinator` in Service | Own trusted prompt projections, joins, remembered simulation rules, decision receipts, the RuleId registry, monotonic expiry, exact Core/authority forwarding, and Coordinator/UI snapshot construction. | Duplicate or report Core authority ownership, trust UI scope/time/caller, persist raw data, or mint a ticket/grant itself. |
+| `ISimulatedDecisionAuthority` Service boundary | Expose the current simulation clock/audit clock, accept a Service-built `UserDecision`, apply policy epoch, return only authoritative transition results and Authority-owned ownership snapshots, and expose the one internal projection-capacity recovery operation below. Default implementation is Disabled. | Accept a decision from the pipe directly, accept an arbitrary invalidation reason, read Coordinator collections, or expose ticket/grant material to UI code. |
 | Trusted simulation fixture/source | Supply paired `FileReadIntent`, redacted display metadata, accepted challenge/status/alert, mutation events, and deterministic manual-clock pumping through an in-process Service boundary. | Listen on a UI-writable seed message, accept raw paths, or create a second mutable authority engine. |
 | `PipeServer` | Authorize the impersonated caller, dispatch snapshot/decision/revoke/subscription messages, preserve correlation IDs, and translate stable errors. | Trust handshake client name, payload caller/time/scope, or open a driver handle for UI. |
 | `SimulatedDecisionEventHub` | One bounded, non-blocking event stream for decision UI state with sequence, overflow marker, subscriber cap, and resync. | Store authority or block a publisher on a slow UI. |
@@ -223,25 +229,29 @@ internal enum SimulationRuntimeInvalidationKind
     ProjectionCapacityExhausted
 }
 
-internal sealed record SimulationRuntimeOwnershipSnapshot(
+internal sealed record AuthoritySimulationRuntimeOwnershipSnapshot(
     int CoreActiveContextCount,
     int ChallengeMappingCount,
     int HeldFlowCount,
     long HeldByteCount,
     int TicketReservationCount,
-    int GrantReservationCount,
+    int GrantReservationCount);
+
+internal sealed record CoordinatorSimulationRuntimeOwnershipSnapshot(
     int PromptOwnershipCount,
     int JoinOwnershipCount,
-    int RuleOwnershipCount,
-    int ReceiptOwnershipCount);
+    int RememberedRuleCount,
+    int DecisionReceiptCount,
+    int RuleIdRegistryEntryCount);
 
 internal sealed record SimulationRuntimeInvalidationResult(
     int Version,
     SimulationRuntimeInvalidationKind Kind,
     IReadOnlyList<GateStatus> InvalidatedStatuses,
     long FailedOpenOperationCount,
-    SimulationRuntimeOwnershipSnapshot Ownership,
-    bool CriticalAlertEmitted);
+    AuthoritySimulationRuntimeOwnershipSnapshot AuthorityOwnershipBefore,
+    AuthoritySimulationRuntimeOwnershipSnapshot AuthorityOwnershipAfter,
+    bool CriticalFailOpenEvidenceRecorded);
 
 internal interface ISimulatedDecisionAuthority
 {
@@ -254,14 +264,51 @@ This is the only accepted invalidation kind; there is no arbitrary reason
 string and no generic public Core `force fail-open` API. The authority owns fresh
 trusted boot/clock/WFP/minifilter generations, invokes the existing conservative
 service-restart/runtime invalidation path, fails open every live Core context,
-and releases all held-flow/endpoint state. The coordinator clears prompt, join,
-rule, and receipt ownership that the invalidation makes stale, then reconciles
-the returned bounded statuses and counters. It emits
-`sim-ui-projection-capacity-exhausted` only after the authoritative result is
-reconciled and proves zero Core contexts, challenge mappings, held flows/bytes,
-tickets, grants, prompts, joins, rules, and receipts plus Critical fail-open
-evidence. No UI, Named Pipe, environment variable, test-only shortcut, or
-second authority may call this operation.
+and releases all held-flow/endpoint state. Its before/after snapshots contain
+only Authority-owned Core contexts, challenge mappings, held flows/bytes,
+ticket reservations, and grant reservations. It never reads a coordinator
+collection and never reports prompts, joins, rules, decision receipts, or the
+RuleId registry. `FailedOpenOperationCount` and
+`CriticalFailOpenEvidenceRecorded` describe the Authority-owned transition and
+its existing authoritative status/alert evidence; they do not claim that the
+Coordinator's stable projection-capacity Alert has already been emitted.
+
+Under the coordinator transition lock, recovery is ordered exactly as follows:
+
+```text
+coordinatorBefore = CaptureCoordinatorOwnership()
+authorityResult = authority.InvalidateRuntimeForProjectionCapacityFailure()
+ValidateVersionKindBoundsAndAuthoritativeBeforeAfter(authorityResult)
+ReconcileEveryAuthoritativeStatusAndFailedOpenCounter(authorityResult)
+ClearStalePromptsJoinsRulesDecisionReceiptsAndRuleIdRegistry()
+coordinatorAfter = CaptureCoordinatorOwnership()
+
+require authorityResult.AuthorityOwnershipAfter == all-zero
+require coordinatorAfter == all-zero
+require authorityResult.CriticalFailOpenEvidenceRecorded
+increment ProjectionCapacityFailureCount exactly once
+emit sim-ui-projection-capacity-exhausted Critical Alert exactly once
+```
+
+`coordinatorBefore` and the Authority-owned before snapshot must both contain
+non-zero owned state in the deterministic recovery acceptance. The coordinator
+validates that every returned status belongs to the invalidated authoritative
+set before it clears the Coordinator-owned projections made stale by those
+statuses. A missing status, inconsistent count, non-zero after snapshot, or
+missing Critical fail-open evidence produces `sim-ui-authority-result-invalid`,
+keeps decision commands disabled, and must not emit or increment the projection-
+capacity reason/counter. The coordinator emits
+`sim-ui-projection-capacity-exhausted` only after the two independent after
+snapshots prove the aggregate all-zero postcondition. There is no dependency
+from Authority back to Coordinator and no shared snapshot type that can hide
+cross-owner state. No UI, Named Pipe, environment variable, test-only shortcut,
+or second authority may call this operation.
+
+All snapshot fields are exact, non-negative values captured under their owner's
+lock. `RememberedRuleCount` counts active rules, while
+`RuleIdRegistryEntryCount` counts all stored registry entries; an active rule is
+therefore represented in both views, and the postcondition checks each field for
+zero rather than summing the snapshots.
 
 ## Protocol contract
 
@@ -505,11 +552,12 @@ public sealed record SimulatedDecisionCapacitySnapshot(
     int PipeInstanceCapacity,
     int ReservedRequestReconnectCount,
     int ReservedRequestReconnectCapacity,
-    int RuleIdReceiptTombstoneCount,
-    int RuleIdReceiptTombstoneCapacity);
+    int RuleIdRegistryEntryCount,
+    int RuleIdRegistryEntryCapacity);
 
 public sealed record SimulatedDecisionCounterSnapshot(
     long RuleIdCollisionCount,
+    long RuleIdRegistryCapacityRejectedCount,
     long DecisionSubscriberRejectedCount,
     long ProjectionCapacityFailureCount);
 
@@ -594,14 +642,21 @@ projection constructors enforce the collection caps below.
 `SimulatedDecisionCapacitySnapshot` always reports
 `DecisionSubscriberCapacity == 2`, `PipeInstanceCapacity == 8`,
 `ReservedRequestReconnectCapacity == 2`, and
-`RuleIdReceiptTombstoneCapacity == 256`. Counts never exceed their capacity;
+`RuleIdRegistryEntryCapacity == 256`. `RuleIdRegistryEntryCount` is the total of
+pending reservations, active rule entries, and retained tombstones still stored
+in the registry; promotion or tombstoning changes an entry state rather than
+increasing this count. A deadline-reached tombstone continues to count until the
+same-lock expiry/admission sweep removes it. Counts never exceed their capacity;
 the cap+1 subscriber attempt leaves the live count at 2 and increments
 `DecisionSubscriberRejectedCount` exactly once. A RuleId collision increments
 only `RuleIdCollisionCount` and its Critical Alert diagnostic; it does not
-change Core/authority counters. A projection-capacity failure increments
+change Core/authority counters. A full RuleId registry refusal increments only
+`RuleIdRegistryCapacityRejectedCount` once for that refused request and its
+Critical Alert diagnostic. A projection-capacity failure increments
 `ProjectionCapacityFailureCount` only after the authoritative invalidation
-result is reconciled and the zero-ownership postcondition is proven. These
-diagnostic counters are bounded checked values and are not authority.
+result is reconciled, both independent ownership snapshots are zero, and
+Critical fail-open evidence is proven. These diagnostic counters are bounded
+checked values and are not authority.
 
 `SimulatedRememberedRuleOutcome.RuleId` is non-empty and its `Revision` is the
 strictly increasing Service-owned revision for that rule. The top-level
@@ -620,10 +675,11 @@ persistent scope, or caller identity.
 The result constructor enforces this one-of contract:
 
 - `AllowOnce` and `BlockCurrent` must have `RememberedRule == null`.
-- `RememberFor30Days` may omit `RememberedRule` only when pre-mutation
-  reservation fails and the prompt remains `AwaitingDecision`; the user may
-  still choose Allow once or Block. A completed Remember always contains a
-  non-null outcome with `State == Remembered`.
+- `RememberFor30Days` may omit `RememberedRule` only when admission fails before
+  Core or a pending reservation is rolled back on a proven Core prevalidation
+  rejection, and the prompt remains `AwaitingDecision`; the user may still
+  choose Allow once or Block. A completed Remember always contains a non-null
+  outcome with `State == Remembered`.
 - If the remembered rule was committed but current ticket issuance fails open,
   `RememberedRule.State == Remembered` while `DecisionState == FailedOpen` and
   `TrafficFailedOpen == true`. The UI must show both “Rule remembered” and
@@ -639,6 +695,20 @@ the existing `MessageTypes.Error` envelope with `ErrorMessage.Code` equal to one
 stable reason code from this document and a bounded sanitized display message.
 Unknown message types remain `REQUEST_REJECTED`; they never fall back to a
 firewall or Core message handler.
+
+A RuleId registry-cap refusal is a bounded decision outcome rather than a
+terminal validation error: it returns `Phase5B.Ui.DecisionResult` with the
+request correlation ID, the same `ChallengeId` and `RememberFor30Days` choice,
+`DecisionState == AwaitingDecision`,
+`DecisionReasonCode == sim-ui-rule-id-retention-capacity-exhausted`,
+`TrafficFailedOpen == false`, `RememberedRule == null`, and `IsDuplicate ==
+false`. Its `Revision` equals the unchanged active-prompt presentation revision.
+The active prompt remains unchanged and selectable for any permitted choice
+until its original monotonic deadline. The Service increments only
+`RuleIdRegistryCapacityRejectedCount`, appends one non-fail-open Critical Alert
+with that reason, publishes the corresponding sequenced Alert event, and returns
+the resulting current `Sequence`; it creates no decision receipt for the refused
+Remember attempt.
 
 `GetSnapshot` returns `Phase5B.Ui.Snapshot`; `SubmitDecision` returns
 `Phase5B.Ui.DecisionResult`; `RevokeRememberedRule` returns
@@ -717,34 +787,68 @@ finite:
 1. The coordinator canonicalizes the trusted file-version/application/
    destination-protocol scope and checks for an exact live-rule match. An exact
    live match reuses the existing `RuleId` and revision, does not create a new
-   `RuleId`, and does not advance `PolicyEpoch`.
-2. For a genuinely new rule, the Service obtains one candidate `RuleId` from
-   its scripted nonce provider, validates it as non-empty before calling Core
-   or changing `PolicyEpoch`, and checks it against every active rule ID and
-   every still-live rule receipt/tombstone ID.
-3. A collision is rejected once with
+   registry entry or take a nonce, and does not advance `PolicyEpoch`; this check
+   precedes cleanup and remains available when the registry count is 256.
+2. For a genuinely new rule, the coordinator applies the independent live-rule
+   table limits of 8/application and 64/global. A refusal here uses only
+   `sim-ui-remembered-rule-capacity-exhausted`, does not mutate the RuleId
+   registry, and is not a RuleId-retention-cap refusal.
+3. The coordinator then removes only retained tombstones
+   whose five-minute monotonic retention deadline is at or before now. It never
+   removes a pending reservation, active rule ID, or unexpired tombstone to make
+   room.
+4. If the RuleId registry still contains 256 entries, admission stops before
+   nonce acquisition with
+   `sim-ui-rule-id-retention-capacity-exhausted`. The Service does not call Core,
+   advance `PolicyEpoch`, mutate a rule, change an authority counter, or evict
+   any registry entry; the prompt remains selectable under the result-envelope
+   contract above.
+5. Only after capacity is proven does the Service obtain exactly one candidate
+   `RuleId` from its scripted nonce provider, validate it as non-empty before
+   calling Core or changing `PolicyEpoch`, and check it against all 256-bounded
+   registry entries, regardless of entry state.
+6. An empty candidate or collision is rejected once with
    `sim-ui-rule-id-collision`; there is no unbounded retry. The Service does not
    call Core, advance `PolicyEpoch`, commit a rule, or change authority
    counters. The current prompt remains active so the user may choose `Allow
    once` or `Block` before its deadline, and one Critical Alert is emitted.
-4. A non-colliding candidate is reserved before the approved atomic Core
-   transition. The reservation and the eventual rule commit carry a strictly
-   increasing checked revision; revision is identity metadata, never an
-   authority widening input.
+7. A non-colliding candidate creates one `PendingReservation` entry before the
+   approved atomic Core transition. The reservation and eventual active rule
+   carry a strictly increasing checked revision; revision is identity metadata,
+   never an authority-widening input.
 
-An exact existing live-rule match is idempotent; a different rule at cap is
-rejected without evicting live state or calling Core. The UI remains on the
-current active prompt and may choose `Allow once` or `Block` before its
-deadline. Deterministic acceptance injects a scripted nonce that collides with
-an active or retained ID and proves the no-Core/no-epoch/no-commit path.
+An exact existing live-rule match is idempotent. A different rule at either the
+live-rule-table cap or RuleId-registry cap is rejected with its distinct reason,
+without evicting live state or calling Core. The UI remains on the current
+active prompt and may choose `Allow once` or `Block` before its deadline.
+Deterministic collision acceptance injects one scripted nonce that collides with
+a pending, active, or retained ID and proves the no-Core/no-epoch/no-commit path.
 
 For a new rule, the coordinator calls the approved atomic
-`ReceivePersistentDecision` with the checked next epoch. On authoritative epoch
-acceptance, it commits the already reserved rule at the returned epoch and
-reconciles all returned invalidated statuses. An exact live-rule match does not
-change the policy table or epoch; it sends a Service-built `AlwaysAllow` decision
-through ordinary `ReceiveDecision` using that current rule/epoch. The coordinator
-renders a preview equal to the hidden canonical selector:
+`ReceivePersistentDecision` with the checked next epoch while holding the same
+transition lock. If Core prevalidation fails and returns
+`PolicyEpochAccepted == false`, the coordinator immediately removes that exact
+pending entry before releasing the lock. It creates neither an active rule nor
+a tombstone or terminal decision receipt; PolicyEpoch, Core state, authority
+counters, prompt state/revision, and the registry count all equal their
+pre-attempt values. Repeated prevalidation failures therefore return the
+registry count to the same baseline after every attempt.
+
+An exception, timeout, malformed result, or any response that does not prove
+`PolicyEpochAccepted == false` is not prevalidation rollback evidence. The
+coordinator retains the bounded pending entry, disables the associated prompt,
+emits `sim-ui-authority-result-invalid`, and requires authoritative
+reconciliation or runtime restart/dispose; it must neither promote the entry nor
+guess that the epoch was rejected.
+
+On `PolicyEpochAccepted == true`, the coordinator promotes that same pending
+entry in place to `ActiveRuleId` at the returned epoch; promotion does not add a
+second registry entry. It reconciles all returned invalidated statuses and
+commits the active rule even when independent current-ticket issuance later
+fails open. An exact live-rule match does not change the policy table or epoch;
+it sends a Service-built `AlwaysAllow` decision through ordinary
+`ReceiveDecision` using that current rule/epoch. The coordinator renders a
+preview equal to the hidden canonical selector:
 
 ```text
 exact FileVersionIdentity
@@ -801,12 +905,40 @@ Service restart clears all remembered rules rather than reconstructing a 30-day
 deadline from wall clock. The UI states: `Remembered for up to 30 days in this
 simulation; service restart, mutation, revocation, or policy change clears it.`
 
+The coordinator also owns one RuleId registry with exactly three states:
+
+```text
+PendingReservation --PolicyEpochAccepted==true--> ActiveRuleId
+PendingReservation --PolicyEpochAccepted==false--> removed
+ActiveRuleId --revoke/expire/invalidate--> RetainedTombstone
+RetainedTombstone --five-minute monotonic deadline reached--> removed
+```
+
+The registry has one hard cap of 256 entries across all three states. A pending
+reservation consumes one of those entries; there is no side dictionary, nonce
+set, or other unbounded reservation state outside this cap. Every active rule
+has exactly one `ActiveRuleId` registry entry, and transition to a tombstone
+updates that same entry in place. A tombstone retains its RuleId, last revision,
+terminal reason, and monotonic retention deadline for five minutes. Deadline
+equality permits removal. Active IDs and unexpired tombstones are never evicted
+for admission. In ordinary operation, only proven pending rollback or removal
+of a deadline-reached tombstone reduces registry count; promotion and active-to-
+tombstone transitions do not free a slot.
+
+The revoke/expire/file-version/policy invalidation arrows above are ordinary
+per-rule lifecycle transitions. Projection-capacity recovery is an atomic
+runtime purge: after Authority reconciliation it clears all Coordinator-owned
+registry entries, including tombstones and any indeterminate pending entry, so
+the mandatory aggregate recovery snapshot can reach zero. Service restart and
+dispose likewise clear the RAM-only registry rather than retaining tombstones.
+
 ### Mutation, revoke, expiry, and policy epoch
 
 - Trusted mutation input identifies the stable hidden volume/file identity and a
   changed full file version. It is never a UI/Named Pipe mutation message.
 - Mutation removes every rule for the old exact version immediately, marks its
-  projection `FileVersionInvalidated`, and prevents it matching a later prompt.
+  projection `FileVersionInvalidated`, converts each active registry entry in
+  place to a five-minute tombstone, and prevents it matching a later prompt.
 - Revoke accepts `RuleId + ExpectedRevision` and removes a rule only when both
   values exactly match the current live record under the coordinator lock. An
   unknown ID returns `sim-ui-remembered-rule-not-found`; a known ID with a stale
@@ -814,28 +946,34 @@ simulation; service restart, mutation, revocation, or policy change clears it.`
   deletion, PolicyEpoch change, receipt mutation, or authority counter change.
   The Service never looks up a RuleId alone, so a stale revoke cannot delete a
   newer rule that reused an old identifier after bounded-history expiry.
-- One manual expiry sweep removes every rule at or beyond deadline.
+- One manual expiry sweep removes every rule at or beyond deadline and converts
+  each corresponding active registry entry in place to a five-minute tombstone.
 - New-rule creation advances PolicyEpoch through the approved atomic persistent
   decision transition. Revoke, mutation invalidation, expiry batch, or explicit
   policy change increments PolicyEpoch exactly once for that batch and calls the
   existing authority policy-epoch transition so outstanding tickets/grants
   cannot outlive the change. Surviving rules are atomically restamped to the new
-  epoch under the coordinator lock; the removed/invalid rule never survives.
+  epoch under the coordinator lock; every removed/invalid rule becomes a
+  retained tombstone in the same registry entry and never survives as active.
 - An exact remembered match may auto-submit only a Service-built
   `AlwaysAllow/RememberFor30Days` decision for a later exact challenge. A stale
   file, application, destination, protocol, epoch, or expired rule cannot match.
 
-No rule is evicted to admit another live rule. Terminal UI history may evict its
-oldest non-authoritative item at its documented cap.
+Explicit revoke likewise converts the exact active RuleId/revision entry in
+place to a five-minute tombstone. No rule, pending reservation, active ID, or
+unexpired tombstone is evicted to admit another rule. Terminal UI history may
+evict its oldest non-authoritative item at its documented cap.
 
 ## State ownership and lock order
 
 | State | Owner | Release rule |
 |---|---|---|
-| Core intent/challenge/ticket/grant | Existing simulation authority | Existing terminal, expiry, restart, policy, and dispose transitions. |
+| Core active contexts and challenge mappings | Existing simulation authority | Existing terminal, expiry, restart, policy, projection-capacity recovery, and dispose transitions. |
+| Held flows/bytes and ticket/grant reservations | Existing simulation authority | Existing terminal, capacity failure, expiry, restart, policy, projection-capacity recovery, and dispose transitions. |
 | Trusted intent/challenge join | `SimulatedDecisionCoordinator` | Challenge terminal, timeout, failed open, restart, policy invalidation, or dispose. |
 | Active prompt projection map | Coordinator | Same exact challenge terminal transition; never independently authorizes. |
-| Remembered simulation rules | Coordinator | 30-day monotonic expiry, revoke, mutation, epoch change, restart, or dispose. |
+| Remembered simulation rules | Coordinator | Become non-active on 30-day monotonic expiry, revoke, mutation, epoch change, projection-capacity recovery, restart, or dispose. |
+| RuleId registry: pending, active, retained tombstone | Coordinator | Pending rollback on proven Core prevalidation rejection; active transitions in place to a five-minute tombstone; expired tombstone removal; projection-capacity recovery, restart, or dispose. Hard cap 256 across all states. |
 | Decision receipt dedupe | Coordinator terminal diagnostics | Five-minute monotonic diagnostic retention, cap eviction, restart, or dispose. Never authority. |
 | Event subscribers/channels | `SimulatedDecisionEventHub` | Disconnect, overflow/resync, service stop, or dispose. |
 | UI active collections/event buffer | `SimulatedDecisionViewModel` | Terminal event, resync snapshot replacement, window close, or dispose. |
@@ -869,7 +1007,7 @@ New 5B-05 bounds are:
 | Service trusted intent/challenge joins | 128 global |
 | Remembered simulation rules | 8 per application; 64 global |
 | Decision terminal receipt dedupe | 256 global; five-minute monotonic retention |
-| Remembered-rule ID receipts/tombstones | 256 global; five-minute monotonic retention; expired-only removal; active IDs are never evicted |
+| RuleId registry entries: pending + active + retained tombstone | 256 global across all states; five-minute monotonic tombstone retention; expired-tombstone-only admission cleanup; pending, active, and unexpired tombstone entries are never evicted |
 | Reconnect-required presentation history | 64 terminal notices |
 | Recent gate-status presentation history | 64 terminal/current rows |
 | Critical-alert presentation history | 64 terminal alerts; Core/Service authoritative history remains 256 |
@@ -902,20 +1040,27 @@ subscriber behavior are unchanged in this ticket.
 No live prompt, rule, or subscriber is evicted to admit new live state. A full
 subscriber channel is drained, receives one `ResyncRequired` marker, and skips
 further events until reconnect. A full UI buffer clears and requests a snapshot.
-Only terminal presentation/receipt history uses oldest-first eviction, with an
-exact eviction counter where exposed.
+Only terminal presentation/decision-receipt history uses oldest-first eviction,
+with an exact eviction counter where exposed. RuleId registry tombstones use
+deadline-based removal only and are never oldest-first capacity-evicted.
 
 The prompt/join maps are a one-to-one projection of Core's active challenge
 authority and are reconciled synchronously under the coordinator lock. A Core
 cap refusal creates no projection. If a projection reservation nevertheless
-fails for an already accepted challenge, the coordinator calls the exact
-internal `InvalidateRuntimeForProjectionCapacityFailure()` operation. It does
-not invent a reason string or call a generic Core force-fail-open API. Only
-after the returned `SimulationRuntimeInvalidationResult` is reconciled may it
-emit `sim-ui-projection-capacity-exhausted`, disable every prompt, and report
-the Critical fail-open evidence. The postcondition is zero Core contexts,
-challenge mappings, held flows/bytes, ticket/grant reservations, prompt/join/
-rule/receipt ownership, with no hidden live hold.
+fails for an already accepted challenge, the coordinator captures its non-zero
+independent ownership snapshot, then calls the exact internal
+`InvalidateRuntimeForProjectionCapacityFailure()` operation. It does not invent
+a reason string or call a generic Core force-fail-open API. Only after the
+returned `SimulationRuntimeInvalidationResult` is validated and reconciled does
+it clear stale Coordinator-owned prompts, joins, rules, decision receipts, and
+RuleId registry entries and capture the Coordinator after snapshot. It may emit
+`sim-ui-projection-capacity-exhausted`, disable every prompt, and report the
+Critical fail-open evidence only when the Authority after snapshot and
+Coordinator after snapshot are both all-zero. The aggregate postcondition is
+zero Core contexts, challenge mappings, held flows/bytes, ticket/grant
+reservations, prompts, joins, remembered rules, decision receipts, and RuleId
+registry entries, with no hidden live hold. Authority never reads Coordinator
+collections, so this recovery adds no reverse or circular dependency.
 
 ## IPC, reconnect, dedupe, and resync
 
@@ -987,7 +1132,8 @@ The Service/Protocol layer uses these exact codes:
 | `sim-ui-remember-30-days-accepted` | Current exact challenge and canonical remembered scope accepted. |
 | `sim-ui-block-current-accepted` | Current intent/flow blocked without persistent deny. |
 | `sim-ui-rule-revoked` | Exact remembered simulation rule revoked. |
-| `sim-ui-rule-id-collision` | Service nonce produced a RuleId already held by an active rule or retained live receipt/tombstone; no Core/epoch/rule mutation occurred. |
+| `sim-ui-rule-id-collision` | The one Service nonce was empty or produced a RuleId already held by a pending, active, or retained tombstone registry entry; no Core/epoch/rule mutation occurred. |
+| `sim-ui-rule-id-retention-capacity-exhausted` | The 256-entry pending + active + retained-tombstone RuleId registry remained full after expired-tombstone cleanup; refusal occurred before nonce/Core/epoch/rule mutation, no entry was evicted, and the prompt remains selectable. |
 | `sim-ui-rule-revision-conflict` | Revoke supplied a RuleId whose `ExpectedRevision` does not equal the current live rule revision; no deletion or epoch mutation occurred. |
 | `sim-ui-rule-file-version-invalidated` | Trusted file mutation invalidated the rule. |
 | `sim-ui-rule-policy-invalidated` | Policy epoch invalidated the rule. |
@@ -1000,7 +1146,7 @@ The Service/Protocol layer uses these exact codes:
 | `sim-ui-challenge-expired` | Monotonic deadline was reached before acceptance. |
 | `sim-ui-challenge-terminal` | Challenge is terminal and cannot accept new authority. |
 | `sim-ui-decision-conflict` | A different choice attempted to reuse a terminal challenge. |
-| `sim-ui-remembered-rule-capacity-exhausted` | Rule reservation cap rejected the new rule without eviction. |
+| `sim-ui-remembered-rule-capacity-exhausted` | The independent 8/application or 64/global live-rule-table cap rejected the new rule without RuleId-registry mutation or eviction; this is not the 256-entry RuleId-retention reason. |
 | `sim-ui-projection-capacity-exhausted` | An accepted challenge could not obtain its required bounded UI projection; all simulation authority fails open and is reconciled. |
 | `sim-ui-subscriber-capacity-exhausted` | A third decision event subscription is rejected without evicting the two live subscribers; the rejected pipe is closed cleanly. |
 | `sim-ui-remembered-rule-not-found` | Revoke target is unknown or already removed. |
@@ -1154,7 +1300,7 @@ or display-specific assumptions.
 | `sim-ui-allow-once` | UI invokes by AutomationId; pipe contains only ChallengeId + AllowOnce; Service supplies nonce/audit/caller; authority called once; UI receives no ticket/grant. |
 | `sim-ui-remember-scope-preview` | Preview equals Service canonical file-version/application/destination/protocol projection and displays group collateral; request carries no scope. |
 | `sim-ui-remember-policy-transaction` | Approved atomic Core transition advances epoch once, invalidates every other old-epoch context, carries only the selected context forward, and binds its ticket to the new epoch; failed prevalidation changes nothing. |
-| `sim-ui-rule-id-collision` | Scripted nonce collides with an active/retained RuleId; no retry loop, Core call, epoch change, rule commit, or authority-counter change occurs; one stable Critical Alert is emitted and the prompt remains selectable. |
+| `sim-ui-rule-id-collision` | The one scripted nonce is empty or collides with a pending/active/retained RuleId; no retry loop, Core call, epoch change, rule commit, or authority-counter change occurs; one stable Critical Alert is emitted and the prompt remains selectable. |
 | `sim-ui-remember-rule-committed-ticket-failed-open` | Policy/rule result is `Remembered` with RuleId+revision while the independent current decision result is `FailedOpen`, `TrafficFailedOpen=true`, and the UI renders both outcomes without rollback. |
 | `sim-ui-remember-and-auto-match` | Exact rule reservation/commit succeeds, later exact challenge auto-matches through Service-built decision, and any selector mismatch prompts again. |
 | `sim-ui-revoke` | Admin sends `RuleId + ExpectedRevision`; exact pair removes the live rule and advances epoch once; stale revision returns conflict/not-found without deletion, epoch change, or removal of a newer rule; old rule/ticket/grant cannot revive. |
@@ -1168,14 +1314,19 @@ or display-specific assumptions.
 | `sim-ui-conflicting-replay` | Different choice for terminal ChallengeId returns conflict without mutation or authority. |
 | `sim-ui-caller-forgery-rejected` | DTO has no caller/time/scope fields; non-admin policy is rejected; handshake name cannot grant rights; Service-built caller is impersonated SID. |
 | `sim-ui-disconnect-reconnect-resync` | Lost connection, sequence gap, server/UI buffer overflow, and explicit marker disable commands, replace from snapshot, and resume at exact sequence without duplicate authority. |
-| `sim-ui-projection-capacity-recovery` | After Core accepts a challenge but projection reservation fails, the coordinator calls only `InvalidateRuntimeForProjectionCapacityFailure()`, reconciles authoritative statuses/counters, emits the stable reason only after recovery, and proves zero Core/challenge/held/ticket/grant/prompt/join/rule/receipt ownership plus Critical fail-open evidence. |
-| `sim-ui-bounds-and-framing` | 4/subject and 128/global prompts preserved; cap+1 rejected without live eviction; rules stop at 8/application/64 global; RuleId receipts/tombstones are bounded at 256 with five-minute retention; maximum snapshot stays below 1 MiB. |
+| `sim-ui-projection-capacity-recovery` | Begin with non-zero Core/challenge/held/ticket/grant counts in the Authority before snapshot and non-zero prompt/join/remembered-rule/decision-receipt/RuleId-registry counts in the Coordinator before snapshot. After accepted-challenge projection reservation fails, the coordinator calls only `InvalidateRuntimeForProjectionCapacityFailure()`, validates and reconciles authoritative statuses/counters, clears its own stale state without Authority reading it, and proves both independent after snapshots are all-zero plus Critical fail-open evidence before incrementing/emitting the stable projection-capacity reason. |
+| `sim-ui-rule-id-prevalidation-rollback` | Starting from a fixed registry baseline, repeat Core prevalidation rejection with `PolicyEpochAccepted == false`; each attempt creates then removes exactly one pending entry under the transition lock, returns the registry count to baseline, leaves the prompt active, and changes no epoch, Core state, rule, tombstone, terminal receipt, or authority counter. |
+| `sim-ui-rule-id-registry-capacity` | With exactly 256 pending/active/unexpired-tombstone registry entries and no expired tombstone, cap+1 returns `Phase5B.Ui.DecisionResult` with `sim-ui-rule-id-retention-capacity-exhausted` and `AwaitingDecision`; the capacity counter and one non-fail-open Critical Alert increment, but nonce calls, Core calls, epoch/rule/authority mutation, decision receipt creation, and entry eviction are all zero. |
+| `sim-ui-rule-id-exact-reuse-at-registry-cap` | With the registry count at 256, an exact live-rule match is checked first, reuses its RuleId/revision through ordinary `ReceiveDecision`, takes no nonce or slot, and leaves registry count and PolicyEpoch unchanged. |
+| `sim-ui-rule-id-promotion-count-stable` | A new-rule success takes one nonce, creates one pending entry, receives `PolicyEpochAccepted == true`, and promotes that same entry to active; registry count is baseline + 1 before and after promotion, including when later current-ticket issuance fails open. |
+| `sim-ui-rule-id-tombstone-lifecycle` | Independently revoke, expire, file-version-invalidate, and policy-invalidate an active rule; each transition changes that exact registry entry to a tombstone without changing registry count, retains it through strictly less than five monotonic minutes, removes it at deadline equality, and never evicts another active or unexpired entry. |
+| `sim-ui-bounds-and-framing` | 4/subject and 128/global prompts preserved; cap+1 rejected without live eviction; rules stop at 8/application/64 global; the combined pending + active + retained-tombstone RuleId registry is bounded at 256 with five-minute tombstone retention; maximum snapshot stays below 1 MiB. |
 | `sim-ui-pipe-subscriber-capacity` | Two full UI sessions use 6/8 pipe instances; the third decision subscriber is rejected with `sim-ui-subscriber-capacity-exhausted` and clean close, two live subscribers remain, and a normal request succeeds afterward. |
 | `sim-ui-small-window-dpi` | MainWindow and every tab remain reachable at the new 640 × 480 DIP minimum; deterministic 100/150/200% viewport models preserve wrapping, scrolling, focus, and reachable simulation commands. |
 | `sim-ui-keyboard-screen-reader` | Required AutomationIds, accessible names/help/live regions, tab order, invoke peers, and terminal focus behavior pass without coordinate clicks. |
 | `sim-ui-privacy-scan` | Reflection/source/serialized JSON find no raw path, hidden file IDs, caller SID, content/payload, ticket/grant/proof, or prohibited field type. |
 | `sim-ui-zero-false-enforcement-claims` | Source/resources/rendered text contain no upload-blocked/real-enforcement claim; all surfaces visibly say Simulation. |
-| `sim-ui-cleanup-zero-owned-state` | Every test closes windows/dispatcher/pipe/subscribers and disposes prompts/rules/receipts; all owned counts end zero. |
+| `sim-ui-cleanup-zero-owned-state` | Every test closes windows/dispatcher/pipe/subscribers and disposes Authority contexts/holds/reservations plus Coordinator prompts/joins/rules/decision receipts/RuleId registry; every field in both ownership snapshots ends zero. |
 
 All existing tests, including all 34 5B-04 scenarios and current Named Pipe/UI
 tests, must continue to pass. Authorization and expiry tests use manual time and
@@ -1266,8 +1417,16 @@ Stop implementation and report a DESIGN BLOCKER if any of these becomes true:
   revalidates monotonic state.
 - Authority: UI/coordinator never mint ticket/grant; existing authority remains
   sole owner.
+- Projection-capacity recovery: Authority and Coordinator expose separate exact
+  ownership snapshots; Coordinator reconciles then clears only its own state,
+  and the stable reason requires both after snapshots at zero plus Critical
+  fail-open evidence.
 - Persistent simulation: exact, RAM-only, 30-day monotonic, revocable,
   mutation/epoch/restart invalidated, and hard bounded.
+- RuleId lifecycle: pending, active, and five-minute tombstone states share one
+  256-entry registry; proven Core prevalidation rejection rolls pending state
+  back, promotion/tombstoning never double-counts, and cap refusal precedes the
+  single nonce/Core call while exact live reuse remains available.
 - IPC: dedicated authorized stream, two decision subscribers within the 8-instance
   pipe budget, bounded channels, exact sequence, dedupe (including
   RuleId+ExpectedRevision revoke), reconnect, and snapshot resync.
