@@ -1,16 +1,17 @@
 # Phase 5B-04 deterministic driver simulator design lock
 
-Status: **locked for implementation**
+Status: **locked for implementation with approved challenge-admission amendment**
 
 Base: `1410e6b843c482d0e2d2fee4b6846e90678d1d47`
 
 Scope: ticket `5B-04` only
-Implementation owner after this design-lock: Luna
+Implementation owner after this amendment: Sol
 
 This document is normative for Phase 5B-04. “Must”, exact type and method names,
-limits, reason codes, ownership rules, and acceptance rows are frozen. A required
-change to a Core contract or to `OutboundGateStateMachine` is a blocker and must
-return to design review; it is not part of 5B-04 implementation.
+limits, reason codes, ownership rules, and acceptance rows are frozen. The
+targeted challenge-admission contract below is the approved resolution of the
+WFP-reservation ordering blocker. Any other Core contract or state-machine
+change remains a blocker and must return to design review.
 
 ## Scope
 
@@ -35,13 +36,13 @@ enforcement claim.
 - No UI and no Phase 5B-05 work.
 - No persistent policy implementation and no expansion of an `AlwaysAllow`
   decision beyond what the existing Core state machine already returns.
-- No change to `src/EgressGuard.Core/OutboundGateModels.cs`,
-  `src/EgressGuard.Core/OutboundGateStateMachine.cs`, or
-  `src/EgressGuard.Core/OneTimeGateTicketService.cs`.
+- No Core change other than the typed `ChallengeAdmissionFailure` contract and
+  targeted `ReceiveChallengeAdmissionFailure` transition locked below. No change
+  to `src/EgressGuard.Core/OneTimeGateTicketService.cs`.
 - No claim that an existing stream or datagram was blocked. Existing multiplexed
   TCP, UDP, and QUIC observations return `ReconnectRequired` only.
 
-## Existing Core contract is sufficient
+## Core contract and approved targeted amendment
 
 The implementation must compose, not replace, these existing APIs:
 
@@ -54,6 +55,7 @@ The implementation must compose, not replace, these existing APIs:
 | `ReceiveGateArmAck` | Validates full coverage, policy, nonce, WFP generation, and deadline. |
 | `ReleaseAfterGateArmed(Guid)` | Creates the exact disposition that can release the pending read. |
 | `AcceptCompletion` | Validates the minifilter completion and generation. |
+| `ReceiveChallengeAdmissionFailure` | Terminally fails only the exact `AwaitingChallenge` intent when current WFP held-flow capacity rejects it before a challenge exists. |
 | `ReceiveChallenge` / `ReceiveDecision` | Own the new-flow challenge and decision transition. |
 | `RedeemTicket` | Atomically consumes a one-time ticket and returns a separate ephemeral grant. |
 | `ProcessExpired` | Performs deterministic timeout/grant-expiry processing after manual time advances. |
@@ -69,6 +71,57 @@ invalidation API. This is deliberately conservative: unrelated live simulator
 operations may also fail open, but no stale ticket, grant, read, or held flow can
 survive. Core alert reason codes remain unchanged; the simulator also records the
 specific endpoint fault reason defined below.
+
+### Typed challenge-admission failure contract
+
+The only approved pre-challenge failure contract is:
+
+```csharp
+public enum ChallengeAdmissionFailureKind
+{
+    Unspecified,
+    HeldFlowCapacityExhausted
+}
+
+public sealed record ChallengeAdmissionFailure
+{
+    int Version { get; }
+    Guid FailureId { get; }
+    Guid IntentId { get; }
+    GateSubject Subject { get; }
+    Guid WfpGeneration { get; }
+    ChallengeAdmissionFailureKind FailureKind { get; }
+    ServiceMonotonicTimestamp ObservedAt { get; }
+}
+
+public GateTransitionResult ReceiveChallengeAdmissionFailure(
+    ChallengeAdmissionFailure failure);
+```
+
+The model constructor accepts only the current contract version, non-empty
+identifiers, a non-null exact subject and monotonic observation, and the locked
+`HeldFlowCapacityExhausted` kind. `Unspecified` and every unknown enum value are
+invalid. The state-machine transition accepts a first delivery only in
+`Simulation`, for an existing context in exactly `AwaitingChallenge`, with no
+challenge, decision, ticket, or grant, an exact subject match, the context's
+trusted current WFP generation, and an observation equal to the current service
+monotonic timestamp before its deadline.
+
+Acceptance terminally fails exactly that context with Core reason
+`challenge-admission-held-flow-capacity-exhausted`, increments Core failed-open
+and overflow once, emits one Core Critical Alert, and creates no challenge or
+challenge mapping. An exact duplicate retained in bounded terminal history
+returns the same terminal result with `IsDuplicate = true` and changes no
+counter or alert. Reuse of its failure ID or intent with different metadata is
+rejected without mutation. Unknown intent, stale WFP generation, subject
+mismatch, wrong phase, or a context that already owns a challenge, decision,
+ticket, or grant is rejected without terminalizing any other context.
+
+The accepted failure fingerprint is stored only in the existing bounded Core
+terminal history and leaves with that record on normal terminal-history
+eviction. No new unbounded dedupe or authority collection is permitted. This is
+not a general-purpose force-fail-open API: it accepts one allowlisted WFP
+held-flow capacity condition before challenge creation and nothing else.
 
 ## Component and API map
 
@@ -173,6 +226,7 @@ ambient environment-variable opt-in.
 |---|---|---|
 | Mode, runtime generations, fault plan, simulator counters | `OutboundGateSimulatorHost` | Dispose or service restart clears it. |
 | Core intent/challenge/decision/ticket/grant phase | `OutboundGateStateMachine` | Core terminal transition, expiry, policy change, or runtime invalidation. Host must invalidate live state before disposing Core. |
+| Accepted challenge-admission failure fingerprint | `OutboundGateStateMachine` terminal history | Exact duplicate replay or normal bounded terminal-history eviction; never a separate unbounded table. |
 | Outstanding tickets, tombstones, active grant-ID reservations | `OneTimeGateTicketService` through Core | Existing expiry, policy, restart, and dispose rules only. |
 | Pending read metadata and per-subject count | `FakeMinifilterEndpoint` | Matching disposition, fail-open, crash/restart, timeout cleanup, or dispose. |
 | Arm request/Ack endpoint envelopes | `FakeWfpEndpoint` | Delivery, fault cleanup, crash/restart, or dispose. |
@@ -296,7 +350,7 @@ stores only the number; it does not allocate that number of bytes.
 | 3. Full-coverage Ack | Fake WFP accepts only its current generation and returns exact required coverage: new TCP, new UDP, existing TCP stream, existing UDP/datagram, and reconnect-required simulation. Partial/degraded/stale Ack is delivered unchanged so Core rejects it and alerts. |
 | 4. Matching disposition | Only after Core accepts the Ack may host call `ReleaseAfterGateArmed(IntentId)`. Fake minifilter releases only on exact intent/process/file/Ack/disposition/sequence binding. |
 | 5. Completion Ack | Fake minifilter removes its pending record exactly once and emits `Released` with its current generation. Host passes the exact Ack to `AcceptCompletion`. |
-| 6. New TCP/UDP challenge | Fake WFP reserves a held-flow entry and checked byte count before creating an exact, non-existing-flow `NetworkGateChallenge`; Core validates subject, coverage, generation, and 15-second window. |
+| 6. New TCP/UDP challenge | After file completion, fake WFP first attempts to reserve a held-flow entry and checked byte count. Only a successful reservation permits creation of an exact, non-existing-flow `NetworkGateChallenge`, followed by delivery to Core for subject, coverage, generation, and 15-second-window validation. |
 | 7. Decision | `Block` terminates and releases held ownership. `AllowOnce` is passed to Core and may return a one-time ticket. No UI or persistent-policy side effect is added. |
 | 8. One-time redemption | Host calls `RedeemTicket` once. Any rejected or fail-open result releases held ownership. A replay never creates a grant. |
 | 9. Ephemeral grant | Fake WFP installs only the exact returned grant, releases the held-flow reservation, and tracks metadata plus used-byte count for that one flow until duration/byte expiry, policy change, runtime invalidation, or dispose. |
@@ -306,6 +360,25 @@ public Core transition, the host performs conservative global volatile-authority
 invalidation with fresh endpoint generations. It then reconciles every endpoint
 and scheduler owner to zero. This rule is required; adding a Core “force fail
 open” API is not permitted in 5B-04.
+
+WFP held-flow capacity rejection is the one approved exception to global
+invalidation because it now has the typed targeted transition above. Its exact
+order is:
+
+```text
+File completion
+→ WFP tries held-flow and byte reservation
+→ reservation succeeds: create NetworkGateChallenge → deliver to Core
+→ held-flow capacity fails: create no challenge
+  → deliver ChallengeAdmissionFailure to Core
+  → terminalize only the rejected operation
+  → retain all prior 4/subject or 128/global challenges and held flows
+```
+
+The host must not change endpoint generations or call global runtime
+invalidation on the accepted targeted-failure path. If the Core response violates
+the typed transition contract, the host must fail safely and must never continue
+to challenge, ticket, or grant creation.
 
 ### Existing multiplexed flow rule
 
@@ -339,8 +412,8 @@ New QUIC admission is outside 5B-04. New-flow challenges are TCP or UDP only.
 | Partial coverage | `PartialCoverage` on next gate Ack | Core reason `gate-ack-invalid-or-expired`; fail open, Critical Alert, no later capability. |
 | Degraded coverage | `DegradedCoverage` plus non-null limitation reason | Same terminal fail-open behavior; never release as gate-armed. |
 | Endpoint queue overflow | Fill a channel without pumping, then submit one more | Reject only the new reservation, preserve prior live entries, fail open affected traffic, emit exact capacity reason, increment overflow once. |
-| Pending/challenge map overflow | Reach exact per-subject or global cap, then submit one more | Core/simulator cap refusal is fail-open; live state is not evicted; count never exceeds cap. |
-| Held-flow entry overflow | Reach 4/subject or 128/global | Current flow fails open; prior holds remain; after cleanup all owned held state is zero. |
+| Pending/challenge map overflow | Reach exact per-subject or global cap, then submit one more | Core/simulator cap refusal is fail-open; live state is not evicted; count never exceeds cap. WFP failure uses the typed targeted transition without creating a challenge. |
+| Held-flow entry overflow | Reach 4/subject or 128/global | Current flow fails open through `ReceiveChallengeAdmissionFailure`; prior holds/challenges remain, generations do not change, and after intentional cleanup all owned state is zero. |
 | Per-flow byte overflow | Submit more than 256 KiB for one new flow | Do not reserve bytes or allocate content; fail open with Critical Alert. |
 | Global byte overflow | Make accepted held counts total 4 MiB, then add one byte | Reject current flow; held total never exceeds 4 MiB; later cleanup reaches zero. |
 | Scheduler/fault-plan overflow | Reach exact cap, then schedule one more | Reject new item, increment overflow once, alert; post-admission impact invokes conservative invalidation. |
@@ -396,7 +469,8 @@ through without translation.
 
 For a Core-owned operation, expected Core fault reasons include
 `gate-ack-invalid-or-expired`, `completion-binding-or-generation-invalid`,
-`active-challenge-capacity-exhausted`, `monotonic-deadline-expired`,
+`active-challenge-capacity-exhausted`,
+`challenge-admission-held-flow-capacity-exhausted`, `monotonic-deadline-expired`,
 `service-restart-invalidated-state`, `service-restart-revoked-grant`, and the
 existing `ticket-*` codes. Simulator-specific endpoint alerts supplement, but do
 not rewrite, those Core records.
@@ -412,6 +486,12 @@ new simulator-limit table and these cumulative checked counters:
   ownership, whether normally or fail-open. Duplicate dispositions do not count.
 - `AcceptedFlowCount`: increment once after held-flow entry and byte reservations
   both succeed. Existing reconnect-required observations do not count.
+- `ChallengeCreatedCount`: increment once only after WFP held-flow and byte
+  reservation succeeds and the immutable `NetworkGateChallenge` constructor
+  returns. A rejected WFP reservation cannot increment it.
+- `ChallengeDeliveredCount`: increment once immediately before a created
+  challenge is delivered to `ReceiveChallenge`. A typed admission failure cannot
+  increment it.
 - `ReleasedFlowCount`: increment once when an accepted held flow leaves WFP
   ownership by grant, block, fail-open, crash, or timeout.
 - `FailedOpenOperationCount`: increment once per unique `OperationId` that had an
@@ -491,8 +571,8 @@ or output claims real enforcement.
 | `stale-minifilter-generation-rejected` | Stale completion fails open; pending metadata removed exactly once. |
 | `pending-read-subject-cap` | Four live reads for one subject remain; fifth fails open; map count remains four. |
 | `pending-read-global-cap` | Sixty-four live reads remain; sixty-fifth fails open; map count remains 64. |
-| `challenge-subject-cap` | Four live challenges for one subject remain; fifth fails open; held/challenge counts do not exceed four. |
-| `challenge-global-cap` | 128 live challenges remain; 129th fails open; count remains 128. |
+| `challenge-subject-cap` | Four live challenges/held flows remain; the fifth WFP reservation fails and uses the typed targeted failure. Core/host ownership for only the fifth is terminal, generations and challenge-created/delivered counters do not change at cap+1, and no challenge/ticket/grant is created for it. |
+| `challenge-global-cap` | 128 live challenges/held flows remain; the 129th follows the same targeted failure path without challenge creation/delivery, eviction, generation change, or global invalidation. |
 | `endpoint-channel-boundaries` | Every 64/128-sized endpoint channel accepts exactly its cap and rejects the next without live eviction. |
 | `held-flow-entry-boundaries` | Per-subject/global held maps accept exact caps and reject the next. |
 | `held-data-flow-cap` | 256 KiB is accepted; 256 KiB + 1 fails open with no byte allocation. |
@@ -513,7 +593,7 @@ All pre-existing tests must continue to pass. New tests must not use
 with a bounded cancellation token only as a harness safety net, never as a
 simulation decision clock.
 
-## Files Luna may change for 5B-04
+## Files Sol may change for 5B-04
 
 Only these paths are permitted:
 
@@ -524,23 +604,28 @@ Only these paths are permitted:
 - `tools/EgressGuard.OutboundGateSimulator/packages.lock.json` (new, only if
   generated by locked restore);
 - `tests/EgressGuard.Tests/Program.cs` (register and validate the acceptance suite);
+- `docs/phase-5b-04-design-lock.md` (this approved amendment only);
+- `src/EgressGuard.Core/OutboundGateModels.cs` (typed challenge-admission failure only);
+- `src/EgressGuard.Core/OutboundGateStateMachine.cs` (targeted transition and bounded terminal fingerprint only);
 - `EgressGuard.sln` (add the new project only);
 - solution/project lock files only if `dotnet restore --locked-mode` demonstrably
   requires them and they contain no dependency unrelated to the new project.
 
 `tests/EgressGuard.Tests/EgressGuard.Tests.csproj` is not expected to change. The
 test harness invokes the built simulator executable, matching existing tool-test
-patterns. Any need to change a Core, protocol, service, Windows, persistence, UI,
-driver, or documentation file is a stop condition and requires review before
-editing.
+patterns. Any need to change another Core contract, the ticket service, protocol,
+service, Windows, persistence, UI, driver, or documentation file is a stop
+condition and requires review before editing.
 
 ## Stop conditions
 
 Stop 5B-04 implementation and report a blocker if any of the following occurs:
 
-- a required scenario cannot be expressed through the existing Core public API;
-- implementation would require changing a Core contract/state machine/ticket
-  service, weakening replay protection, or creating a second authority engine;
+- a required scenario cannot be expressed through the existing Core public API
+  plus the targeted amendment above;
+- implementation would require another Core contract/state-machine change,
+  changing the ticket service, weakening replay protection, or creating a second
+  authority engine;
 - a read can release normally before a current full-coverage Ack and exact
   disposition, or a held flow can receive a grant without ticket redemption;
 - a queue/map/scheduler has no hard cap, evicts live state, exceeds its count, or
