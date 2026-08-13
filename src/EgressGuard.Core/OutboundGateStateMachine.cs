@@ -303,6 +303,51 @@ public sealed class OutboundGateStateMachine : IDisposable
         return context.Result;
     }
 
+    public GateTransitionResult ReceiveChallengeAdmissionFailure(ChallengeAdmissionFailure failure)
+    {
+        lock (_transitionSync)
+            return ReceiveChallengeAdmissionFailureCore(failure);
+    }
+
+    private GateTransitionResult ReceiveChallengeAdmissionFailureCore(ChallengeAdmissionFailure failure)
+    {
+        ArgumentNullException.ThrowIfNull(failure);
+        if (_mode != OutboundGateMode.Simulation)
+            throw new InvalidOperationException("Challenge admission failures are supported only in Simulation mode.");
+
+        var existingFailure = _terminalHistory.Values.FirstOrDefault(item => item.ChallengeAdmissionFailure?.FailureId == failure.FailureId);
+        if (existingFailure?.ChallengeAdmissionFailure is { } acceptedFailure)
+        {
+            if (ChallengeAdmissionFailureMatches(acceptedFailure, failure))
+                return existingFailure.ReplayResult with { IsDuplicate = true };
+            throw new InvalidOperationException("Challenge admission failure ID is already bound to different metadata.");
+        }
+        if (_terminalHistory.ContainsKey(failure.IntentId))
+            throw new InvalidOperationException("Challenge admission failure cannot mutate a terminal intent with a different fingerprint.");
+
+        var context = RequireActiveContext(failure.IntentId, "Challenge admission failure");
+        RequirePhase(context, ContextPhase.AwaitingChallenge, "Challenge admission failure");
+        if (context.Challenge is not null || context.Decision is not null || context.Ticket is not null || context.Grant is not null)
+            throw new InvalidOperationException("Challenge admission failure cannot replace existing challenge authority.");
+        var runtime = RequireTrustedRuntime();
+        var now = RequireClock(_clock.Now());
+        if (!context.Intent.Subject.Matches(failure.Subject))
+            throw new InvalidOperationException("Challenge admission failure subject does not match the intent.");
+        if (failure.WfpGeneration != runtime.WfpGeneration || failure.WfpGeneration != context.ExpectedWfpGeneration)
+            throw new InvalidOperationException("Challenge admission failure has an untrusted WFP generation.");
+        if (failure.FailureKind != ChallengeAdmissionFailureKind.HeldFlowCapacityExhausted)
+            throw new InvalidOperationException("Challenge admission failure kind is not allowed.");
+        if (failure.ObservedAt != now || DeadlineReached(now, context.PhaseDeadline))
+            throw new InvalidOperationException("Challenge admission failure observation is stale or outside the active deadline.");
+
+        return FailOpen(
+            context,
+            "challenge-admission-held-flow-capacity-exhausted",
+            now,
+            overflow: true,
+            challengeAdmissionFailure: failure);
+    }
+
     public GateTransitionResult ReceiveChallenge(NetworkGateChallenge challenge)
     {
         ArgumentNullException.ThrowIfNull(challenge);
@@ -561,14 +606,14 @@ public sealed class OutboundGateStateMachine : IDisposable
         return result;
     }
 
-    private GateTransitionResult FailOpen(Context context, string reason, ServiceMonotonicTimestamp now, bool overflow = false)
+    private GateTransitionResult FailOpen(Context context, string reason, ServiceMonotonicTimestamp now, bool overflow = false, ChallengeAdmissionFailure? challengeAdmissionFailure = null)
     {
         if (overflow)
             _overflowCount++;
         _failedOpenCount++;
         var alert = Alert(reason, new GateAffectedScope(1, GateAffectedScopeKind.Intent, context.Intent.IntentId, context.Intent.Subject), now);
         var result = new GateTransitionResult(Status(context.Intent.Subject, context.Intent.IntentId, GateRuntimeState.FailedOpen, reason, now, true, context.Request.RequiredCoverage), criticalAlert: alert, disposition: context.Disposition, completion: context.Completion);
-        CompleteTerminal(context, result);
+        CompleteTerminal(context, result, challengeAdmissionFailure);
         return result;
     }
 
@@ -586,7 +631,7 @@ public sealed class OutboundGateStateMachine : IDisposable
         return result;
     }
 
-    private void CompleteTerminal(Context context, GateTransitionResult result)
+    private void CompleteTerminal(Context context, GateTransitionResult result, ChallengeAdmissionFailure? challengeAdmissionFailure = null)
     {
         RemoveChallengeMapping(context);
         _activeContexts.Remove(context.Intent.IntentId);
@@ -596,7 +641,7 @@ public sealed class OutboundGateStateMachine : IDisposable
             disposition: context.Disposition,
             criticalAlert: result.CriticalAlert,
             completion: context.Completion ?? context.CompletionAttempt);
-        RememberTerminal(context.Intent, replayResult, context.Disposition, context.Completion ?? context.CompletionAttempt);
+        RememberTerminal(context.Intent, replayResult, context.Disposition, context.Completion ?? context.CompletionAttempt, challengeAdmissionFailure);
         context.Ack = null;
         context.Disposition = null;
         context.Completion = null;
@@ -607,11 +652,11 @@ public sealed class OutboundGateStateMachine : IDisposable
         context.Grant = null;
     }
 
-    private void RememberTerminal(FileReadIntent intent, GateTransitionResult result, FileReadDisposition? disposition = null, FileReadCompletionAck? completion = null)
+    private void RememberTerminal(FileReadIntent intent, GateTransitionResult result, FileReadDisposition? disposition = null, FileReadCompletionAck? completion = null, ChallengeAdmissionFailure? challengeAdmissionFailure = null)
     {
         if (_terminalHistory.ContainsKey(intent.IntentId))
             return;
-        _terminalHistory.Add(intent.IntentId, new TerminalRecord(intent, result, disposition, completion));
+        _terminalHistory.Add(intent.IntentId, new TerminalRecord(intent, result, disposition, completion, challengeAdmissionFailure));
         _terminalOrder.Enqueue(intent.IntentId);
         while (_terminalHistory.Count > MaximumTerminalHistory)
         {
@@ -723,6 +768,15 @@ public sealed class OutboundGateStateMachine : IDisposable
         && left.DecisionWindow == right.DecisionWindow
         && string.Equals(left.LimitationReason, right.LimitationReason, StringComparison.Ordinal);
 
+    private static bool ChallengeAdmissionFailureMatches(ChallengeAdmissionFailure left, ChallengeAdmissionFailure right) =>
+        left.Version == right.Version
+        && left.FailureId == right.FailureId
+        && left.IntentId == right.IntentId
+        && left.Subject.Matches(right.Subject)
+        && left.WfpGeneration == right.WfpGeneration
+        && left.FailureKind == right.FailureKind
+        && left.ObservedAt == right.ObservedAt;
+
     private static bool DeadlineReached(ServiceMonotonicTimestamp now, ServiceMonotonicTimestamp deadline) =>
         !SameClock(now, deadline) || now.ElapsedMilliseconds >= deadline.ElapsedMilliseconds;
 
@@ -817,5 +871,5 @@ public sealed class OutboundGateStateMachine : IDisposable
         && string.Equals(left.ReasonCode, right.ReasonCode, StringComparison.Ordinal)
         && left.Sequence == right.Sequence;
 
-    private sealed record TerminalRecord(FileReadIntent Intent, GateTransitionResult ReplayResult, FileReadDisposition? Disposition, FileReadCompletionAck? Completion);
+    private sealed record TerminalRecord(FileReadIntent Intent, GateTransitionResult ReplayResult, FileReadDisposition? Disposition, FileReadCompletionAck? Completion, ChallengeAdmissionFailure? ChallengeAdmissionFailure);
 }

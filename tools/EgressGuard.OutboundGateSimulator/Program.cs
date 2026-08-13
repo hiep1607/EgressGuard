@@ -239,6 +239,8 @@ internal sealed record SimulationSnapshot(
     long AcceptedReadCount,
     long ReleasedReadCount,
     long AcceptedFlowCount,
+    long ChallengeCreatedCount,
+    long ChallengeDeliveredCount,
     long ReleasedFlowCount,
     long FailedOpenOperationCount,
     long OverflowCount,
@@ -858,6 +860,8 @@ internal sealed class OutboundGateSimulatorHost : IDisposable
     private long _acceptedReadCount;
     private long _releasedReadCount;
     private long _acceptedFlowCount;
+    private long _challengeCreatedCount;
+    private long _challengeDeliveredCount;
     private long _releasedFlowCount;
     private long _failedOpenCount;
     private long _overflowCount;
@@ -971,6 +975,8 @@ internal sealed class OutboundGateSimulatorHost : IDisposable
                 _acceptedReadCount,
                 _releasedReadCount,
                 _acceptedFlowCount,
+                _challengeCreatedCount,
+                _challengeDeliveredCount,
                 _releasedFlowCount,
                 _failedOpenCount,
                 _overflowCount,
@@ -1105,18 +1111,19 @@ internal sealed class OutboundGateSimulatorHost : IDisposable
             return Remember(new(SimulatedFlowOutcome.FailedOpen, "sim-flow-intent-not-found"));
         if (operationId != flow.OperationId)
             return Remember(new(SimulatedFlowOutcome.FailedOpen, "sim-flow-operation-binding-mismatch"));
-        var now = _clock.Now();
-        var window = new ServiceMonotonicTimeRange(1, now, new ServiceMonotonicTimestamp(1, now.ClockInstanceId, checked(now.ElapsedMilliseconds + (long)OutboundGateLimits.MaximumDecisionHoldDuration.TotalMilliseconds)));
-        var challenge = new NetworkGateChallenge(1, _nonces.NextNonce(), flow.IntentId, flow.Subject, flow.Destination, flow.FlowGeneration, false, FullCoverage, _clock.NowUtc(), window, "Simulation");
         var reserved = _wfp.ObserveFlow(flow);
         if (reserved.Outcome == SimulatedFlowOutcome.FailedOpen)
         {
-            if (reserved.ReasonCode == "sim-held-flow-capacity-exhausted" && IsChallengeCapacitySaturated(flow.Subject))
-                return RejectAtChallengeCapacity(flow.OperationId, flow.Subject, challenge, reserved.ReasonCode);
+            if (reserved.ReasonCode == "sim-held-flow-capacity-exhausted")
+                return RejectChallengeAdmission(flow.OperationId, flow.IntentId, flow.Subject, reserved.ReasonCode);
             return Overflow(flow.OperationId, reserved.ReasonCode, flow.Subject);
         }
         _acceptedFlowOperations.Add(flow.OperationId);
         Increment(ref _acceptedFlowCount);
+        var now = _clock.Now();
+        var window = new ServiceMonotonicTimeRange(1, now, new ServiceMonotonicTimestamp(1, now.ClockInstanceId, checked(now.ElapsedMilliseconds + (long)OutboundGateLimits.MaximumDecisionHoldDuration.TotalMilliseconds)));
+        var challenge = new NetworkGateChallenge(1, _nonces.NextNonce(), flow.IntentId, flow.Subject, flow.Destination, flow.FlowGeneration, false, FullCoverage, _clock.NowUtc(), window, "Simulation");
+        Increment(ref _challengeCreatedCount);
         if (!_wfp.TryEnqueueChallenge(challenge) || !_wfp.TryDequeueChallenge(out var observed) || observed is null)
             return Overflow(flow.OperationId, "sim-wfp-channel-capacity-exhausted", flow.Subject);
         var scheduled = Schedule(SimulationEnvelope.ForChallenge(flow.OperationId, observed));
@@ -1580,6 +1587,7 @@ internal sealed class OutboundGateSimulatorHost : IDisposable
     {
         if (!_intents.ContainsKey(envelope.OperationId) || envelope.Challenge is not { } challenge)
             return;
+        Increment(ref _challengeDeliveredCount);
         var transition = _machine!.ReceiveChallenge(challenge);
         ObserveCore(transition);
         if (transition.Challenge is null || transition.Status.State == GateRuntimeState.FailedOpen)
@@ -1728,29 +1736,52 @@ internal sealed class OutboundGateSimulatorHost : IDisposable
         return Remember(new(SimulatedFlowOutcome.FailedOpen, reason, Alert: _alerts.LastOrDefault()));
     }
 
-    private SimulationStepResult RejectAtChallengeCapacity(Guid operationId, GateSubject subject, NetworkGateChallenge challenge, string simulatorReason)
+    private SimulationStepResult RejectChallengeAdmission(Guid operationId, Guid intentId, GateSubject subject, string simulatorReason)
     {
         Increment(ref _overflowCount);
-        var transition = _machine!.ReceiveChallenge(challenge);
+        var failure = new ChallengeAdmissionFailure(
+            1,
+            _nonces.NextNonce(),
+            intentId,
+            subject,
+            _wfpGeneration,
+            ChallengeAdmissionFailureKind.HeldFlowCapacityExhausted,
+            _clock.Now());
+        GateTransitionResult transition;
+        try
+        {
+            transition = _machine!.ReceiveChallengeAdmissionFailure(failure);
+        }
+        catch (InvalidOperationException)
+        {
+            return FailChallengeAdmissionInvariant(operationId, subject);
+        }
         ObserveCore(transition);
         if (transition.Status.State != GateRuntimeState.FailedOpen
-            || transition.Status.ReasonCode != "active-challenge-capacity-exhausted"
-            || transition.Challenge is not null)
-        {
-            var liveOperations = OwnedOperationIds().ToArray();
-            _wfpGeneration = _generations.Next(SimulationGenerationDomain.Wfp);
-            _minifilterGeneration = _generations.Next(SimulationGenerationDomain.Minifilter);
-            InvalidateRuntime(liveOperations);
-            _minifilter.Restart(_minifilterGeneration);
-            _wfp.Restart(_wfpGeneration);
-        }
-        else
-        {
-            MarkFailedOpen(operationId);
-            CompleteOperation(operationId);
-        }
+            || transition.Status.ReasonCode != "challenge-admission-held-flow-capacity-exhausted"
+            || transition.Status.AffectedScope.IntentId != intentId
+            || transition.Challenge is not null
+            || transition.Ticket is not null
+            || transition.Grant is not null
+            || transition.CriticalAlert is null)
+            return FailChallengeAdmissionInvariant(operationId, subject);
+
+        MarkFailedOpen(operationId);
+        CompleteOperation(operationId);
         EmitAlert(simulatorReason, operationId, subject);
         return Remember(new(SimulatedFlowOutcome.FailedOpen, simulatorReason, transition, Alert: transition.CriticalAlert));
+    }
+
+    private SimulationStepResult FailChallengeAdmissionInvariant(Guid operationId, GateSubject subject)
+    {
+        var liveOperations = OwnedOperationIds().ToArray();
+        _wfpGeneration = _generations.Next(SimulationGenerationDomain.Wfp);
+        _minifilterGeneration = _generations.Next(SimulationGenerationDomain.Minifilter);
+        InvalidateRuntime(liveOperations);
+        _minifilter.Restart(_minifilterGeneration);
+        _wfp.Restart(_wfpGeneration);
+        EmitAlert("sim-challenge-admission-transition-invalid", operationId, subject);
+        return Remember(new(SimulatedFlowOutcome.FailedOpen, "sim-challenge-admission-transition-invalid", Alert: _alerts.LastOrDefault()));
     }
 
     private void ObserveCore(GateTransitionResult result)
@@ -1832,9 +1863,6 @@ internal sealed class OutboundGateSimulatorHost : IDisposable
 
     private IEnumerable<Guid> OwnedOperationIds() => _minifilter.PendingOperationIds.Concat(_wfp.HeldOperationIds).Concat(_intents.Keys).Distinct();
     private int OwnedOperationCount() => OwnedOperationIds().Count();
-    private bool IsChallengeCapacitySaturated(GateSubject subject) =>
-        _challengeOperations.Count >= FakeWfpEndpoint.HeldFlowCapacity
-        || _challengeOperations.Values.Count(operationId => _intents.TryGetValue(operationId, out var intent) && intent.Subject.Matches(subject)) >= FakeWfpEndpoint.HeldSubjectCapacity;
     private static void Increment(ref long counter) => counter = checked(counter + 1);
     private static bool TransportMatchesDestination(SimulatedTransportKind transport, TransportProtocol protocol) => transport switch
     {
@@ -2406,14 +2434,25 @@ internal static class Program
             Ensure(host.TryGetIntentId(operationId, out var intentId), "challenge setup intent missing");
             host.SubmitFlow(SimulationFixture.Flow(operationId, intentId, subject: subject));
         }
-        Ensure(host.Snapshot.ActiveChallengeCount == capacity && host.Snapshot.HeldFlowCount == capacity, "challenge cap was not reached exactly");
+        var beforeOverflow = host.Snapshot;
+        Ensure(beforeOverflow.ActiveChallengeCount == capacity
+            && beforeOverflow.HeldFlowCount == capacity
+            && beforeOverflow.CoreActiveContextCount == capacity
+            && beforeOverflow.ChallengeCreatedCount == capacity
+            && beforeOverflow.ChallengeDeliveredCount == capacity,
+            "challenge cap was not reached exactly");
         var subjectForOverflow = global ? NewSubject(20_000) : SimulationFixture.Subject;
         var operation = SimulationFixture.Id(29_500);
         host.SubmitRead(SimulationFixture.Read(operation, subjectForOverflow, capacity + 1));
         Ensure(host.TryGetIntentId(operation, out var overflowIntent), "challenge overflow setup intent missing");
         var overflow = host.SubmitFlow(SimulationFixture.Flow(operation, overflowIntent, subject: subjectForOverflow));
         Ensure(overflow.Outcome == SimulatedFlowOutcome.FailedOpen && overflow.ReasonCode == "sim-held-flow-capacity-exhausted", "challenge overflow returned the wrong stable reason");
-        Ensure(overflow.CoreResult?.Status.ReasonCode == "active-challenge-capacity-exhausted", "challenge overflow did not terminal-fail the rejected Core operation");
+        Ensure(overflow.CoreResult?.Status.ReasonCode == "challenge-admission-held-flow-capacity-exhausted"
+            && overflow.CoreResult.Status.State == GateRuntimeState.FailedOpen
+            && overflow.CoreResult.Challenge is null
+            && overflow.CoreResult.Ticket is null
+            && overflow.CoreResult.Grant is null,
+            "challenge overflow did not use the targeted pre-challenge Core failure");
         var atCapacity = host.Snapshot;
         Ensure(atCapacity.ActiveChallengeCount == capacity
             && atCapacity.HeldFlowCount == capacity
@@ -2422,13 +2461,31 @@ internal static class Program
             && atCapacity.ReleasedReadCount == capacity + 1
             && atCapacity.AcceptedFlowCount == capacity
             && atCapacity.ReleasedFlowCount == 0
+            && atCapacity.ChallengeCreatedCount == beforeOverflow.ChallengeCreatedCount
+            && atCapacity.ChallengeDeliveredCount == beforeOverflow.ChallengeDeliveredCount
             && atCapacity.OverflowCount == 1
-            && atCapacity.CriticalAlertCount > 0,
+            && atCapacity.FailedOpenOperationCount == 1
+            && atCapacity.CoreAlertCount == 1
+            && atCapacity.CriticalAlertCount == 2
+            && atCapacity.WfpGeneration == beforeOverflow.WfpGeneration
+            && atCapacity.MinifilterGeneration == beforeOverflow.MinifilterGeneration
+            && atCapacity.ServiceRestartCount == 0,
             "challenge cap+1 did not preserve all prior live entries and exact counters");
         Ensure(!host.TryGetIntentId(operation, out _), "rejected challenge-cap operation retained host authority");
+        Ensure(!host.TryGetChallengeId(operation, out _), "WFP-rejected operation created a challenge identity");
+        Ensure(!host.TryGetTicket(operation, out _)
+            && atCapacity.OutstandingTicketCount == 0
+            && atCapacity.ActiveGrantReservationCount == 0
+            && atCapacity.InstalledGrantCount == 0,
+            "WFP-rejected operation created ticket or grant authority");
         var replay = host.SubmitFlow(SimulationFixture.Flow(operation, overflowIntent, subject: subjectForOverflow));
         Ensure(replay.Outcome == SimulatedFlowOutcome.FailedOpen && replay.ReasonCode == "sim-flow-intent-not-found", "rejected challenge-cap operation could be submitted again");
-        Ensure(host.Snapshot.ActiveChallengeCount == capacity && host.Snapshot.HeldFlowCount == capacity && host.Snapshot.OverflowCount == 1, "rejected operation retry changed prior live state");
+        Ensure(host.Snapshot.ActiveChallengeCount == capacity
+            && host.Snapshot.HeldFlowCount == capacity
+            && host.Snapshot.ChallengeCreatedCount == capacity
+            && host.Snapshot.ChallengeDeliveredCount == capacity
+            && host.Snapshot.OverflowCount == 1,
+            "rejected operation retry changed prior live state");
         host.Inject(new SimulationFault(SimulationFaultKind.ServiceRestart));
         Ensure(host.Snapshot.AcceptedReadCount == host.Snapshot.ReleasedReadCount && host.Snapshot.AcceptedFlowCount == host.Snapshot.ReleasedFlowCount, "challenge cleanup counters did not balance");
         EnsureZeroOwnedState(host, authorityMustBeZero: true);
