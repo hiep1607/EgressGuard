@@ -875,14 +875,16 @@ internal sealed class OutboundGateSimulatorHost : IDisposable
     private bool _disposed;
 
     public OutboundGateSimulatorHost(bool simulation = false)
-        : this(simulation, 0)
+        : this(simulation, 0, 0)
     {
     }
 
-    private OutboundGateSimulatorHost(bool simulation, int seededOutstandingTickets)
+    private OutboundGateSimulatorHost(bool simulation, int seededOutstandingTickets, int seededActiveGrants)
     {
         if (seededOutstandingTickets is < 0 or > OneTimeGateTicketService.MaximumOutstandingPerSubject)
             throw new ArgumentOutOfRangeException(nameof(seededOutstandingTickets));
+        if (seededActiveGrants is < 0 or > OneTimeGateTicketService.MaximumActiveGrantsGlobal)
+            throw new ArgumentOutOfRangeException(nameof(seededActiveGrants));
         _simulation = simulation;
         _generations = new DeterministicGenerationSource();
         _bootInstance = _generations.Next(SimulationGenerationDomain.Boot);
@@ -913,12 +915,35 @@ internal sealed class OutboundGateSimulatorHost : IDisposable
             if (_ticketService.TryIssue(binding).Kind != TicketServiceResultKind.Success)
                 throw new InvalidOperationException("Unable to seed deterministic ticket reservations.");
         }
+        for (var index = 0; index < seededActiveGrants; index++)
+        {
+            var process = new ProcessIdentity(100_000 + index, SimulationFixture.Start);
+            var subject = new GateSubject(1, process, $"sha256:grant-capacity-{index}", null, [process]);
+            var binding = new TicketAuthorizationBinding(
+                1,
+                _nonces.NextNonce(),
+                subject,
+                SimulationFixture.File,
+                SimulationFixture.Destination(),
+                index + 1,
+                _bootInstance,
+                0,
+                OutboundGateLimits.MaximumGrantBytes,
+                (long)OutboundGateLimits.MaximumGrantDuration.TotalMilliseconds);
+            var issued = _ticketService.TryIssue(binding);
+            if (issued.Kind != TicketServiceResultKind.Success || issued.Ticket is null
+                || _ticketService.TryRedeem(issued.Ticket, binding).Kind != TicketServiceResultKind.Success)
+                throw new InvalidOperationException("Unable to seed deterministic active grant reservations.");
+        }
         _machine = new OutboundGateStateMachine(_clock, _nonces, _clock, OutboundGateMode.Simulation, 0, new OutboundGateTrustedRuntimeState(_bootInstance, _wfpGeneration, _minifilterGeneration), _ticketService);
         _lastReasonCode = "sim-ready";
     }
 
     internal static OutboundGateSimulatorHost CreateTicketCapacityHostForAcceptance() =>
-        new(true, OneTimeGateTicketService.MaximumOutstandingPerSubject);
+        new(true, OneTimeGateTicketService.MaximumOutstandingPerSubject, 0);
+
+    internal static OutboundGateSimulatorHost CreateGrantCapacityHostForAcceptance() =>
+        new(true, 0, OneTimeGateTicketService.MaximumActiveGrantsGlobal);
 
     public SimulationSnapshot Snapshot
     {
@@ -1080,14 +1105,18 @@ internal sealed class OutboundGateSimulatorHost : IDisposable
             return Remember(new(SimulatedFlowOutcome.FailedOpen, "sim-flow-intent-not-found"));
         if (operationId != flow.OperationId)
             return Remember(new(SimulatedFlowOutcome.FailedOpen, "sim-flow-operation-binding-mismatch"));
-        var reserved = _wfp.ObserveFlow(flow);
-        if (reserved.Outcome == SimulatedFlowOutcome.FailedOpen)
-            return Overflow(flow.OperationId, reserved.ReasonCode, flow.Subject);
-        _acceptedFlowOperations.Add(flow.OperationId);
-        Increment(ref _acceptedFlowCount);
         var now = _clock.Now();
         var window = new ServiceMonotonicTimeRange(1, now, new ServiceMonotonicTimestamp(1, now.ClockInstanceId, checked(now.ElapsedMilliseconds + (long)OutboundGateLimits.MaximumDecisionHoldDuration.TotalMilliseconds)));
         var challenge = new NetworkGateChallenge(1, _nonces.NextNonce(), flow.IntentId, flow.Subject, flow.Destination, flow.FlowGeneration, false, FullCoverage, _clock.NowUtc(), window, "Simulation");
+        var reserved = _wfp.ObserveFlow(flow);
+        if (reserved.Outcome == SimulatedFlowOutcome.FailedOpen)
+        {
+            if (reserved.ReasonCode == "sim-held-flow-capacity-exhausted" && IsChallengeCapacitySaturated(flow.Subject))
+                return RejectAtChallengeCapacity(flow.OperationId, flow.Subject, challenge, reserved.ReasonCode);
+            return Overflow(flow.OperationId, reserved.ReasonCode, flow.Subject);
+        }
+        _acceptedFlowOperations.Add(flow.OperationId);
+        Increment(ref _acceptedFlowCount);
         if (!_wfp.TryEnqueueChallenge(challenge) || !_wfp.TryDequeueChallenge(out var observed) || observed is null)
             return Overflow(flow.OperationId, "sim-wfp-channel-capacity-exhausted", flow.Subject);
         var scheduled = Schedule(SimulationEnvelope.ForChallenge(flow.OperationId, observed));
@@ -1369,6 +1398,51 @@ internal sealed class OutboundGateSimulatorHost : IDisposable
         }
     }
 
+    internal SimulationStepResult RunSchedulerCapacityForAcceptance(bool ownerCapacity)
+    {
+        lock (_transitionSync)
+        {
+            EnsureNotDisposed();
+            var eventsPerOwner = ownerCapacity ? 1 : 2;
+            for (var owner = 0; owner < SchedulerOwnerCapacity; owner++)
+                for (var eventIndex = 0; eventIndex < eventsPerOwner; eventIndex++)
+                    if (!_scheduler.TrySchedule(SimulationEnvelope.ForPumpChain(SimulationFixture.Id(80_000 + owner), 1), 1))
+                        throw new InvalidOperationException("Scheduler rejected before the locked acceptance boundary.");
+            var rejectedOwner = ownerCapacity ? SimulationFixture.Id(81_000) : SimulationFixture.Id(80_000);
+            if (_scheduler.TrySchedule(SimulationEnvelope.ForPumpChain(rejectedOwner, 1), 1))
+                throw new InvalidOperationException("Scheduler accepted beyond the locked acceptance boundary.");
+            return Overflow(Guid.Empty, "sim-scheduler-capacity-exhausted", null);
+        }
+    }
+
+    internal SimulationStepResult RunEndpointChannelCapacityForAcceptance(bool minifilter)
+    {
+        lock (_transitionSync)
+        {
+            EnsureNotDisposed();
+            var now = _clock.Now();
+            var window = new ServiceMonotonicTimeRange(1, now, new ServiceMonotonicTimestamp(1, now.ClockInstanceId, checked(now.ElapsedMilliseconds + 2_000)));
+            if (minifilter)
+            {
+                var intent = new FileReadIntent(1, _nonces.NextNonce(), SimulationFixture.Subject, SimulationFixture.File, FileActivityOperation.Read, _clock.NowUtc(), window, _bootInstance, 1);
+                for (var index = 0; index < FakeMinifilterEndpoint.IntentOutboxCapacity; index++)
+                    if (!_minifilter.TryEnqueueIntent(intent))
+                        throw new InvalidOperationException("Minifilter channel rejected before the locked acceptance boundary.");
+                if (_minifilter.TryEnqueueIntent(intent))
+                    throw new InvalidOperationException("Minifilter channel accepted beyond the locked acceptance boundary.");
+                return Overflow(Guid.Empty, "sim-minifilter-channel-capacity-exhausted", null);
+            }
+
+            var request = new GateArmRequest(1, _nonces.NextNonce(), SimulationFixture.Subject, FullCoverage, 0, _wfpGeneration, _nonces.NextNonce(), _clock.NowUtc(), window);
+            for (var index = 0; index < FakeWfpEndpoint.ArmChannelCapacity; index++)
+                if (!_wfp.TryEnqueueArmRequest(request))
+                    throw new InvalidOperationException("WFP channel rejected before the locked acceptance boundary.");
+            if (_wfp.TryEnqueueArmRequest(request))
+                throw new InvalidOperationException("WFP channel accepted beyond the locked acceptance boundary.");
+            return Overflow(Guid.Empty, "sim-wfp-channel-capacity-exhausted", null);
+        }
+    }
+
     private SimulationStepResult? Schedule(SimulationEnvelope envelope)
     {
         var fault = TakeDeliveryFault(envelope.Kind, envelope.OperationId);
@@ -1563,6 +1637,7 @@ internal sealed class OutboundGateSimulatorHost : IDisposable
     {
         var liveOperations = OwnedOperationIds().ToArray();
         Increment(ref _serviceRestartCount);
+        _faults.Clear();
         _bootInstance = _generations.Next(SimulationGenerationDomain.Boot);
         _wfpGeneration = _generations.Next(SimulationGenerationDomain.Wfp);
         _minifilterGeneration = _generations.Next(SimulationGenerationDomain.Minifilter);
@@ -1653,6 +1728,31 @@ internal sealed class OutboundGateSimulatorHost : IDisposable
         return Remember(new(SimulatedFlowOutcome.FailedOpen, reason, Alert: _alerts.LastOrDefault()));
     }
 
+    private SimulationStepResult RejectAtChallengeCapacity(Guid operationId, GateSubject subject, NetworkGateChallenge challenge, string simulatorReason)
+    {
+        Increment(ref _overflowCount);
+        var transition = _machine!.ReceiveChallenge(challenge);
+        ObserveCore(transition);
+        if (transition.Status.State != GateRuntimeState.FailedOpen
+            || transition.Status.ReasonCode != "active-challenge-capacity-exhausted"
+            || transition.Challenge is not null)
+        {
+            var liveOperations = OwnedOperationIds().ToArray();
+            _wfpGeneration = _generations.Next(SimulationGenerationDomain.Wfp);
+            _minifilterGeneration = _generations.Next(SimulationGenerationDomain.Minifilter);
+            InvalidateRuntime(liveOperations);
+            _minifilter.Restart(_minifilterGeneration);
+            _wfp.Restart(_wfpGeneration);
+        }
+        else
+        {
+            MarkFailedOpen(operationId);
+            CompleteOperation(operationId);
+        }
+        EmitAlert(simulatorReason, operationId, subject);
+        return Remember(new(SimulatedFlowOutcome.FailedOpen, simulatorReason, transition, Alert: transition.CriticalAlert));
+    }
+
     private void ObserveCore(GateTransitionResult result)
     {
         _lastReasonCode = result.Status.ReasonCode;
@@ -1732,6 +1832,9 @@ internal sealed class OutboundGateSimulatorHost : IDisposable
 
     private IEnumerable<Guid> OwnedOperationIds() => _minifilter.PendingOperationIds.Concat(_wfp.HeldOperationIds).Concat(_intents.Keys).Distinct();
     private int OwnedOperationCount() => OwnedOperationIds().Count();
+    private bool IsChallengeCapacitySaturated(GateSubject subject) =>
+        _challengeOperations.Count >= FakeWfpEndpoint.HeldFlowCapacity
+        || _challengeOperations.Values.Count(operationId => _intents.TryGetValue(operationId, out var intent) && intent.Subject.Matches(subject)) >= FakeWfpEndpoint.HeldSubjectCapacity;
     private static void Increment(ref long counter) => counter = checked(counter + 1);
     private static bool TransportMatchesDestination(SimulatedTransportKind transport, TransportProtocol protocol) => transport switch
     {
@@ -1762,6 +1865,7 @@ internal sealed class OutboundGateSimulatorHost : IDisposable
             _disposed = true;
             if (_simulation)
                 InvalidateRuntime(OwnedOperationIds().ToArray());
+            _faults.Clear();
             _machine?.Dispose();
         }
     }
@@ -1841,7 +1945,9 @@ internal static class Program
 
     internal static ScenarioReport RunNamedScenario(string name)
     {
-        using var host = new OutboundGateSimulatorHost(name != "disabled-default-zero-state");
+        using var host = name == "ticket-capacity-through-endpoint"
+            ? OutboundGateSimulatorHost.CreateTicketCapacityHostForAcceptance()
+            : new OutboundGateSimulatorHost(name != "disabled-default-zero-state");
         try
         {
             RunScenario(name, host);
@@ -1921,7 +2027,7 @@ internal static class Program
                 EnsureChallengeCap(host, 128, true);
                 break;
             case "endpoint-channel-boundaries":
-                EnsureEndpointChannelBoundaries();
+                EnsureEndpointChannelBoundaries(host);
                 break;
             case "held-flow-entry-boundaries":
                 EnsureHeldFlowBoundaries();
@@ -1933,12 +2039,10 @@ internal static class Program
                 EnsureGlobalByteCap();
                 break;
             case "scheduler-cap":
-                EnsureSchedulerBoundaries();
+                EnsureSchedulerBoundaries(host);
                 break;
             case "fault-plan-cap":
-                for (var index = 0; index < OutboundGateSimulatorHost.FaultPlanCapacity; index++)
-                    Ensure(host.Inject(new SimulationFault(SimulationFaultKind.DelayNext, SimulationEnvelopeKind.GateArmRequest)).ReasonCode == "sim-fault-planned", "fault plan rejected before cap");
-                Ensure(host.Inject(new SimulationFault(SimulationFaultKind.DelayNext, SimulationEnvelopeKind.GateArmRequest)).ReasonCode == "sim-fault-plan-capacity-exhausted", "fault plan exceeded cap");
+                EnsureFaultPlanCap(host);
                 break;
             case "pump-dispatch-budget":
                 EnsurePumpBudget(host);
@@ -1947,7 +2051,7 @@ internal static class Program
                 EnsureReplay(host);
                 break;
             case "ticket-capacity-through-endpoint":
-                EnsureTicketCapacityThroughEndpoint();
+                EnsureTicketCapacityThroughEndpoint(host);
                 break;
             case "grant-expiry-and-byte-count":
                 EnsureGrantExpiryAndByteCount(host);
@@ -1962,7 +2066,7 @@ internal static class Program
                 EnsureNoWorkersAndConcurrentEntry(host);
                 break;
             case "all-faults-finish-zero-owned-state":
-                EnsureRepeatedPostAdmissionOverflowAndAlertBound(host);
+                EnsureAllFaultClasses(host);
                 break;
             default:
                 throw new TestFailureException($"Unknown scenario {name}.");
@@ -2050,7 +2154,7 @@ internal static class Program
         EnsureZeroOwnedState(host, authorityMustBeZero: true);
     }
 
-    private static void EnsureDelayCoverage(OutboundGateSimulatorHost host, bool timeout)
+    private static void EnsureDelayCoverage(OutboundGateSimulatorHost host, bool timeout, long afterDeadlineMilliseconds = 0)
     {
         var readStages = new[]
         {
@@ -2063,15 +2167,15 @@ internal static class Program
         {
             using var owned = index == 0 ? null : new OutboundGateSimulatorHost(true);
             var selected = owned ?? host;
-            EnsureReadDelay(selected, readStages[index], timeout, 23_000 + index);
+            EnsureReadDelay(selected, readStages[index], timeout, 23_000 + index, afterDeadlineMilliseconds);
         }
         using var challengeHost = new OutboundGateSimulatorHost(true);
-        EnsureChallengeDelay(challengeHost, timeout);
+        EnsureChallengeDelay(challengeHost, timeout, afterDeadlineMilliseconds);
     }
 
-    private static void EnsureReadDelay(OutboundGateSimulatorHost host, SimulationEnvelopeKind kind, bool timeout, int identifier)
+    private static void EnsureReadDelay(OutboundGateSimulatorHost host, SimulationEnvelopeKind kind, bool timeout, int identifier, long afterDeadlineMilliseconds)
     {
-        var delay = timeout ? 2_000L : 500L;
+        var delay = timeout ? checked(2_000L + afterDeadlineMilliseconds) : 500L;
         host.Inject(new SimulationFault(SimulationFaultKind.DelayNext, kind, delayMilliseconds: delay));
         host.SubmitRead(SimulationFixture.Read(SimulationFixture.Id(identifier)));
         Ensure(host.Snapshot.ScheduledCount == 1 && host.Snapshot.CoreActiveContextCount == 1, $"{kind} delay did not retain one scheduled Core operation");
@@ -2090,12 +2194,12 @@ internal static class Program
         }
     }
 
-    private static void EnsureChallengeDelay(OutboundGateSimulatorHost host, bool timeout)
+    private static void EnsureChallengeDelay(OutboundGateSimulatorHost host, bool timeout, long afterDeadlineMilliseconds)
     {
         var operationId = SimulationFixture.Id(timeout ? 23_101 : 23_100);
         host.SubmitRead(SimulationFixture.Read(operationId));
         Ensure(host.TryGetIntentId(operationId, out var intentId), "challenge-delay intent missing");
-        host.Inject(new SimulationFault(SimulationFaultKind.DelayNext, SimulationEnvelopeKind.NetworkGateChallenge, delayMilliseconds: timeout ? 15_000 : 500));
+        host.Inject(new SimulationFault(SimulationFaultKind.DelayNext, SimulationEnvelopeKind.NetworkGateChallenge, delayMilliseconds: timeout ? checked(15_000 + afterDeadlineMilliseconds) : 500));
         host.SubmitFlow(SimulationFixture.Flow(operationId, intentId));
         Ensure(host.Snapshot.ScheduledCount == 1 && host.Snapshot.HeldFlowCount == 1, "challenge delay did not retain its held owner");
         if (timeout)
@@ -2237,16 +2341,26 @@ internal static class Program
     private static void EnsureServiceRestart(OutboundGateSimulatorHost host)
     {
         RunHappy(host, TransportProtocol.Tcp);
+        Ensure(host.Inject(new SimulationFault(SimulationFaultKind.DelayNext, SimulationEnvelopeKind.GateArmRequest, delayMilliseconds: 1_000)).ReasonCode == "sim-fault-planned", "restart fixture delivery fault was not planned");
+        Ensure(host.Inject(new SimulationFault(SimulationFaultKind.PartialCoverage, SimulationEnvelopeKind.GateArmAck)).ReasonCode == "sim-fault-planned", "restart fixture mutation fault was not planned");
+        Ensure(host.Snapshot.FaultPlanCount == 2, "restart fixture did not retain both planned faults");
         var seen = new HashSet<Guid>();
         for (var index = 0; index < 8; index++)
         {
             var before = host.Snapshot;
             Ensure(seen.Add(before.BootInstance) && seen.Add(before.Now.ClockInstanceId) && seen.Add(before.WfpGeneration) && seen.Add(before.MinifilterGeneration), "generation domains collided or reused before restart");
             host.Inject(new SimulationFault(SimulationFaultKind.ServiceRestart));
+            if (index == 0)
+            {
+                Ensure(host.Snapshot.FaultPlanCount == 0, "service restart retained an old fault plan");
+                var newGenerationWork = host.SubmitRead(SimulationFixture.Read(SimulationFixture.Id(26_100), sequence: 2));
+                Ensure(newGenerationWork.ReasonCode == "sim-read-completion-accepted", "pre-restart fault affected new-generation work");
+                Ensure(host.Snapshot.FaultPlanCount == 0, "new-generation work revived an old fault plan");
+            }
         }
         var final = host.Snapshot;
         Ensure(seen.Add(final.BootInstance) && seen.Add(final.Now.ClockInstanceId) && seen.Add(final.WfpGeneration) && seen.Add(final.MinifilterGeneration), "service restart reused an old generation");
-        Ensure(final.ServiceRestartCount == 8 && final.CriticalAlertCount >= 8, "service restart counters were not exact");
+        Ensure(final.ServiceRestartCount == 8 && final.CriticalAlertCount >= 8 && final.FaultPlanCount == 0, "service restart counters or fault cleanup were not exact");
         EnsureZeroOwnedState(host, authorityMustBeZero: true);
     }
 
@@ -2299,11 +2413,28 @@ internal static class Program
         Ensure(host.TryGetIntentId(operation, out var overflowIntent), "challenge overflow setup intent missing");
         var overflow = host.SubmitFlow(SimulationFixture.Flow(operation, overflowIntent, subject: subjectForOverflow));
         Ensure(overflow.Outcome == SimulatedFlowOutcome.FailedOpen && overflow.ReasonCode == "sim-held-flow-capacity-exhausted", "challenge overflow returned the wrong stable reason");
-        Ensure(host.Snapshot.OverflowCount == 1 && host.Snapshot.CriticalAlertCount > 0, "challenge overflow counters were not exact");
+        Ensure(overflow.CoreResult?.Status.ReasonCode == "active-challenge-capacity-exhausted", "challenge overflow did not terminal-fail the rejected Core operation");
+        var atCapacity = host.Snapshot;
+        Ensure(atCapacity.ActiveChallengeCount == capacity
+            && atCapacity.HeldFlowCount == capacity
+            && atCapacity.CoreActiveContextCount == capacity
+            && atCapacity.AcceptedReadCount == capacity + 1
+            && atCapacity.ReleasedReadCount == capacity + 1
+            && atCapacity.AcceptedFlowCount == capacity
+            && atCapacity.ReleasedFlowCount == 0
+            && atCapacity.OverflowCount == 1
+            && atCapacity.CriticalAlertCount > 0,
+            "challenge cap+1 did not preserve all prior live entries and exact counters");
+        Ensure(!host.TryGetIntentId(operation, out _), "rejected challenge-cap operation retained host authority");
+        var replay = host.SubmitFlow(SimulationFixture.Flow(operation, overflowIntent, subject: subjectForOverflow));
+        Ensure(replay.Outcome == SimulatedFlowOutcome.FailedOpen && replay.ReasonCode == "sim-flow-intent-not-found", "rejected challenge-cap operation could be submitted again");
+        Ensure(host.Snapshot.ActiveChallengeCount == capacity && host.Snapshot.HeldFlowCount == capacity && host.Snapshot.OverflowCount == 1, "rejected operation retry changed prior live state");
+        host.Inject(new SimulationFault(SimulationFaultKind.ServiceRestart));
+        Ensure(host.Snapshot.AcceptedReadCount == host.Snapshot.ReleasedReadCount && host.Snapshot.AcceptedFlowCount == host.Snapshot.ReleasedFlowCount, "challenge cleanup counters did not balance");
         EnsureZeroOwnedState(host, authorityMustBeZero: true);
     }
 
-    private static void EnsureEndpointChannelBoundaries()
+    private static void EnsureEndpointChannelBoundaries(OutboundGateSimulatorHost host)
     {
         var clock = new ManualSimulationClock(SimulationFixture.Id(30_000), SimulationFixture.Start);
         var nonces = new DeterministicNonceProvider();
@@ -2348,6 +2479,35 @@ internal static class Program
             && wfpFlow.Snapshot.FlowObservationInboxCount == 128
             && wfpChallenge.Snapshot.ChallengeOutboxCount == 128,
             "endpoint snapshots did not expose exact channel boundaries");
+        minifilterIntent.ReleaseAll();
+        minifilterDisposition.ReleaseAll();
+        minifilterCompletion.ReleaseAll();
+        wfpForAck.ReleaseAll();
+        wfpArm.ReleaseAll();
+        wfpAck.ReleaseAll();
+        wfpFlow.ReleaseAll();
+        wfpChallenge.ReleaseAll();
+        Ensure(minifilterIntent.Snapshot.IntentOutboxCount == 0
+            && minifilterDisposition.Snapshot.DispositionInboxCount == 0
+            && minifilterCompletion.Snapshot.CompletionAckOutboxCount == 0
+            && wfpArm.Snapshot.GateArmInboxCount == 0
+            && wfpAck.Snapshot.GateAckOutboxCount == 0
+            && wfpFlow.Snapshot.FlowObservationInboxCount == 0
+            && wfpChallenge.Snapshot.ChallengeOutboxCount == 0,
+            "direct endpoint channel cleanup retained state");
+
+        var minifilterOverflow = host.RunEndpointChannelCapacityForAcceptance(minifilter: true);
+        Ensure(minifilterOverflow.Outcome == SimulatedFlowOutcome.FailedOpen && minifilterOverflow.ReasonCode == "sim-minifilter-channel-capacity-exhausted", "host minifilter channel overflow returned the wrong reason");
+        Ensure(host.Snapshot.MinifilterIntentOutboxCount == 64 && host.Snapshot.OverflowCount == 1 && host.Snapshot.CriticalAlertCount > 0, "host minifilter channel overflow evicted entries or omitted evidence");
+        host.Inject(new SimulationFault(SimulationFaultKind.ServiceRestart));
+        EnsureZeroOwnedState(host, authorityMustBeZero: true);
+
+        using var wfpHost = new OutboundGateSimulatorHost(true);
+        var wfpOverflow = wfpHost.RunEndpointChannelCapacityForAcceptance(minifilter: false);
+        Ensure(wfpOverflow.Outcome == SimulatedFlowOutcome.FailedOpen && wfpOverflow.ReasonCode == "sim-wfp-channel-capacity-exhausted", "host WFP channel overflow returned the wrong reason");
+        Ensure(wfpHost.Snapshot.WfpGateArmInboxCount == 64 && wfpHost.Snapshot.OverflowCount == 1 && wfpHost.Snapshot.CriticalAlertCount > 0, "host WFP channel overflow evicted entries or omitted evidence");
+        wfpHost.Inject(new SimulationFault(SimulationFaultKind.ServiceRestart));
+        EnsureZeroOwnedState(wfpHost, authorityMustBeZero: true);
     }
 
     private static void EnsureHeldFlowBoundaries()
@@ -2379,6 +2539,8 @@ internal static class Program
         Ensure(overflow.Outcome == SimulatedFlowOutcome.FailedOpen && overflow.ReasonCode == "sim-held-data-flow-capacity-exhausted" && endpoint.Snapshot.HeldByteCount == 0, "per-flow byte cap was exceeded");
         var exact = endpoint.ObserveFlow(SimulationFixture.Flow(SimulationFixture.Id(33_102), SimulationFixture.Id(33_103), bytes: FakeWfpEndpoint.FlowByteCapacity));
         Ensure(exact.ReasonCode == "sim-held-flow-reserved" && endpoint.Snapshot.HeldByteCount == FakeWfpEndpoint.FlowByteCapacity, "exact per-flow byte cap was not accepted");
+        endpoint.ReleaseAll();
+        Ensure(endpoint.Snapshot.HeldFlowCount == 0 && endpoint.Snapshot.HeldByteCount == 0, "per-flow byte fixture did not clean held state");
     }
 
     private static void EnsureGlobalByteCap()
@@ -2394,9 +2556,11 @@ internal static class Program
         var overflowSubject = NewSubject(34_999);
         var overflow = endpoint.ObserveFlow(SimulationFixture.Flow(SimulationFixture.Id(34_999), SimulationFixture.Id(35_000), subject: overflowSubject, bytes: 1));
         Ensure(overflow.ReasonCode == "sim-held-data-global-capacity-exhausted" && endpoint.Snapshot.HeldByteCount == FakeWfpEndpoint.GlobalByteCapacity, "global byte cap was exceeded");
+        endpoint.ReleaseAll();
+        Ensure(endpoint.Snapshot.HeldFlowCount == 0 && endpoint.Snapshot.HeldByteCount == 0, "global byte fixture did not clean held state");
     }
 
-    private static void EnsureSchedulerBoundaries()
+    private static void EnsureSchedulerBoundaries(OutboundGateSimulatorHost host)
     {
         var clock = new ManualSimulationClock(SimulationFixture.Id(35_100), SimulationFixture.Start);
         var scheduler = new DeterministicSimulationScheduler(clock);
@@ -2411,6 +2575,44 @@ internal static class Program
         Ensure(!scheduler.TrySchedule(SimulationEnvelope.ForPumpChain(SimulationFixture.Id(36_999), 1), 1) && scheduler.Count == 256, "scheduler accepted owner 257");
         scheduler.Clear();
         Ensure(scheduler.Count == 0 && scheduler.OwnerCount == 0, "scheduler cleanup retained ownership");
+
+        var eventOverflow = host.RunSchedulerCapacityForAcceptance(ownerCapacity: false);
+        Ensure(eventOverflow.Outcome == SimulatedFlowOutcome.FailedOpen && eventOverflow.ReasonCode == "sim-scheduler-capacity-exhausted", "host scheduler event 513 did not fail open");
+        var atEventCapacity = host.Snapshot;
+        Ensure(atEventCapacity.ScheduledCount == OutboundGateSimulatorHost.SchedulerCapacity
+            && atEventCapacity.SchedulerOwnerCount == OutboundGateSimulatorHost.SchedulerOwnerCapacity
+            && atEventCapacity.OverflowCount == 1
+            && atEventCapacity.CriticalAlertCount > 0,
+            "host scheduler event 513 evicted live events or omitted evidence");
+        host.Inject(new SimulationFault(SimulationFaultKind.ServiceRestart));
+        Ensure(host.Snapshot.OverflowCount == 1, "scheduler cleanup changed the event-overflow counter");
+        EnsureZeroOwnedState(host, authorityMustBeZero: true);
+
+        using var ownerHost = new OutboundGateSimulatorHost(true);
+        var ownerOverflow = ownerHost.RunSchedulerCapacityForAcceptance(ownerCapacity: true);
+        Ensure(ownerOverflow.Outcome == SimulatedFlowOutcome.FailedOpen && ownerOverflow.ReasonCode == "sim-scheduler-capacity-exhausted", "host scheduler owner 257 did not fail open");
+        var atOwnerCapacity = ownerHost.Snapshot;
+        Ensure(atOwnerCapacity.ScheduledCount == OutboundGateSimulatorHost.SchedulerOwnerCapacity
+            && atOwnerCapacity.SchedulerOwnerCount == OutboundGateSimulatorHost.SchedulerOwnerCapacity
+            && atOwnerCapacity.OverflowCount == 1
+            && atOwnerCapacity.CriticalAlertCount > 0,
+            "host scheduler owner 257 evicted live owners or omitted evidence");
+        ownerHost.Inject(new SimulationFault(SimulationFaultKind.ServiceRestart));
+        EnsureZeroOwnedState(ownerHost, authorityMustBeZero: true);
+    }
+
+    private static void EnsureFaultPlanCap(OutboundGateSimulatorHost host)
+    {
+        for (var index = 0; index < OutboundGateSimulatorHost.FaultPlanCapacity; index++)
+            Ensure(host.Inject(new SimulationFault(SimulationFaultKind.DelayNext, SimulationEnvelopeKind.GateArmRequest)).ReasonCode == "sim-fault-planned", "fault plan rejected before cap");
+        Ensure(host.Snapshot.FaultPlanCount == OutboundGateSimulatorHost.FaultPlanCapacity, "fault plan did not retain entries 1 through 256");
+        var overflow = host.Inject(new SimulationFault(SimulationFaultKind.DelayNext, SimulationEnvelopeKind.GateArmRequest));
+        Ensure(overflow.Outcome == SimulatedFlowOutcome.FailedOpen && overflow.ReasonCode == "sim-fault-plan-capacity-exhausted", "fault plan entry 257 did not fail open");
+        var atCapacity = host.Snapshot;
+        Ensure(atCapacity.FaultPlanCount == OutboundGateSimulatorHost.FaultPlanCapacity && atCapacity.OverflowCount == 1 && atCapacity.CriticalAlertCount > 0, "fault plan cap exceeded 256 or omitted exact overflow evidence");
+        host.Inject(new SimulationFault(SimulationFaultKind.ServiceRestart));
+        Ensure(host.Snapshot.FaultPlanCount == 0 && host.Snapshot.OverflowCount == 1, "service restart did not clear the full fault plan while preserving counters");
+        EnsureZeroOwnedState(host, authorityMustBeZero: true);
     }
 
     private static void EnsurePumpBudget(OutboundGateSimulatorHost host)
@@ -2419,11 +2621,11 @@ internal static class Program
         Ensure(result.Outcome == SimulatedFlowOutcome.FailedOpen && result.ReasonCode == "sim-pump-budget-exhausted", "pump event 1025 did not fail open");
         var snapshot = host.Snapshot;
         Ensure(snapshot.OverflowCount == 1 && snapshot.ScheduledCount == 0 && snapshot.SchedulerOwnerCount == 0 && snapshot.CriticalAlertCount > 0, "pump overflow did not clean scheduler state exactly");
+        EnsureZeroOwnedState(host, authorityMustBeZero: true);
     }
 
-    private static void EnsureTicketCapacityThroughEndpoint()
+    private static void EnsureTicketCapacityThroughEndpoint(OutboundGateSimulatorHost host)
     {
-        using var host = OutboundGateSimulatorHost.CreateTicketCapacityHostForAcceptance();
         var operationId = SimulationFixture.Id(37_000);
         Ensure(host.SubmitRead(SimulationFixture.Read(operationId)).ReasonCode == "sim-read-completion-accepted", "ticket cap fixture read failed");
         Ensure(host.TryGetIntentId(operationId, out var intentId), "ticket cap fixture intent missing");
@@ -2434,6 +2636,21 @@ internal static class Program
         Ensure(host.Snapshot.OutstandingTicketCount == OneTimeGateTicketService.MaximumOutstandingPerSubject && host.Snapshot.HeldFlowCount == 0, "ticket capacity failure leaked held state");
         host.Inject(new SimulationFault(SimulationFaultKind.ServiceRestart));
         EnsureZeroOwnedState(host, authorityMustBeZero: true);
+
+        using var grantHost = OutboundGateSimulatorHost.CreateGrantCapacityHostForAcceptance();
+        var grantOperationId = SimulationFixture.Id(37_100);
+        Ensure(grantHost.SubmitRead(SimulationFixture.Read(grantOperationId)).ReasonCode == "sim-read-completion-accepted", "grant cap fixture read failed");
+        Ensure(grantHost.TryGetIntentId(grantOperationId, out var grantIntentId), "grant cap fixture intent missing");
+        Ensure(grantHost.SubmitFlow(SimulationFixture.Flow(grantOperationId, grantIntentId)).ReasonCode == "sim-challenge-created", "grant cap fixture challenge missing");
+        Ensure(grantHost.TryGetChallengeId(grantOperationId, out var grantChallengeId), "grant cap fixture challenge identity missing");
+        var grantDenied = grantHost.SubmitDecision(SimulationFixture.Decision(grantChallengeId, sequence: 38));
+        Ensure(grantDenied.Outcome == SimulatedFlowOutcome.FailedOpen && grantDenied.ReasonCode == "ticket-active-grant-capacity-exhausted", "active-grant capacity did not propagate through the endpoint path");
+        Ensure(grantHost.Snapshot.ActiveGrantReservationCount == OneTimeGateTicketService.MaximumActiveGrantsGlobal
+            && grantHost.Snapshot.HeldFlowCount == 0
+            && grantHost.Snapshot.CriticalAlertCount > 0,
+            "active-grant capacity failure leaked held state or omitted evidence");
+        grantHost.Inject(new SimulationFault(SimulationFaultKind.ServiceRestart));
+        EnsureZeroOwnedState(grantHost, authorityMustBeZero: true);
     }
 
     private static void EnsureGrantExpiryAndByteCount(OutboundGateSimulatorHost host)
@@ -2443,6 +2660,7 @@ internal static class Program
         Ensure(exactGrant.MaximumBytes == OutboundGateLimits.MaximumGrantBytes, "grant byte limit was not the frozen 512 MiB");
         var counted = host.ConsumeGrantBytes(exactGrant.GrantId, OutboundGateLimits.MaximumGrantBytes);
         Ensure(counted.Outcome == SimulatedFlowOutcome.Granted && host.Snapshot.InstalledGrantCount == 0 && host.Snapshot.ActiveGrantReservationCount == 0, "exact grant byte limit did not revoke authority");
+        EnsureZeroOwnedState(host, authorityMustBeZero: true);
 
         using var overflowHost = new OutboundGateSimulatorHost(true);
         var overflowGrant = RunHappy(overflowHost, TransportProtocol.Tcp).Grant!;
@@ -2528,6 +2746,43 @@ internal static class Program
         Ensure(snapshot.OverflowCount == repetitions && snapshot.FailedOpenOperationCount == repetitions, "repeated overflow counters were not exact");
         Ensure(snapshot.CoreAlertDedupeCount == OutboundGateSimulatorHost.CoreAlertDedupeCapacity && snapshot.CoreAlertDedupeCount <= snapshot.CoreAlertDedupeCapacity, "Core alert dedupe map was not bounded at cap");
         Ensure(snapshot.AlertRingCount == OutboundGateSimulatorHost.AlertRingCapacity && snapshot.DiagnosticAlertEvictionCount > 0, "diagnostic alert ring was not bounded");
+    }
+
+    private static void EnsureAllFaultClasses(OutboundGateSimulatorHost host)
+    {
+        static void Run(Action<OutboundGateSimulatorHost> assertion)
+        {
+            using var fixture = new OutboundGateSimulatorHost(true);
+            assertion(fixture);
+            EnsureZeroOwnedState(fixture, authorityMustBeZero: true);
+        }
+
+        Run(fixture => EnsureDelayCoverage(fixture, timeout: true));
+        Run(fixture => EnsureDelayCoverage(fixture, timeout: true, afterDeadlineMilliseconds: 1));
+        Run(EnsureDropCoverage);
+        Run(fixture => EnsureEndpointRestart(fixture, minifilter: true));
+        Run(fixture => EnsureEndpointRestart(fixture, minifilter: false));
+        Run(EnsureServiceRestart);
+        Run(fixture => EnsureStaleGeneration(fixture, SimulationEnvelopeKind.GateArmAck, "sim-stale-wfp-generation"));
+        Run(fixture => EnsureStaleGeneration(fixture, SimulationEnvelopeKind.FileReadCompletionAck, "sim-stale-minifilter-generation"));
+        Run(fixture => EnsureCoverageFault(fixture, SimulationFaultKind.PartialCoverage, "sim-coverage-partial"));
+        Run(fixture => EnsureCoverageFault(fixture, SimulationFaultKind.DegradedCoverage, "sim-coverage-degraded"));
+        Run(fixture => EnsurePendingCap(fixture, FakeMinifilterEndpoint.SubjectCapacity, SimulationFixture.Subject));
+        Run(EnsurePendingGlobalCap);
+        Run(fixture => EnsureChallengeCap(fixture, FakeWfpEndpoint.HeldSubjectCapacity, global: false));
+        Run(fixture => EnsureChallengeCap(fixture, FakeWfpEndpoint.HeldFlowCapacity, global: true));
+        Run(EnsureEndpointChannelBoundaries);
+        EnsureHeldFlowBoundaries();
+        EnsureHeldByteCap();
+        EnsureGlobalByteCap();
+        Run(EnsureSchedulerBoundaries);
+        Run(EnsureFaultPlanCap);
+        Run(EnsurePumpBudget);
+        using (var ticketHost = OutboundGateSimulatorHost.CreateTicketCapacityHostForAcceptance())
+            EnsureTicketCapacityThroughEndpoint(ticketHost);
+        Run(EnsureGrantExpiryAndByteCount);
+        EnsureRepeatedPostAdmissionOverflowAndAlertBound(host);
+        EnsureZeroOwnedState(host, authorityMustBeZero: true);
     }
 
     private static void EnsureZeroOwnedState(OutboundGateSimulatorHost host, bool authorityMustBeZero)

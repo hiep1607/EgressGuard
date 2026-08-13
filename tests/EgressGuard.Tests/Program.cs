@@ -2875,6 +2875,73 @@ internal static class Program
             var scenarios = root.GetProperty("Scenarios").EnumerateArray().ToArray();
             AssertTrue(scenarios.Select(item => item.GetProperty("Name").GetString()).SequenceEqual(expectedNames), "Simulator scenario names/order differ from the 34 locked cases.");
             AssertTrue(scenarios.All(item => item.GetProperty("Passed").GetBoolean()), "The simulator acceptance suite contained a failing scenario.");
+            var snapshots = scenarios.ToDictionary(
+                item => item.GetProperty("Name").GetString() ?? throw new InvalidOperationException("Simulator scenario omitted its name."),
+                item => item.GetProperty("Snapshot"),
+                StringComparer.Ordinal);
+
+            var challengeSubject = snapshots["challenge-subject-cap"];
+            AssertEqual(1L, challengeSubject.GetProperty("OverflowCount").GetInt64());
+            AssertTrue(challengeSubject.GetProperty("CriticalAlertCount").GetInt64() > 0, "Subject challenge cap omitted Critical Alert evidence.");
+            AssertEqual(5L, challengeSubject.GetProperty("AcceptedReadCount").GetInt64());
+            AssertEqual(5L, challengeSubject.GetProperty("ReleasedReadCount").GetInt64());
+            AssertEqual(4L, challengeSubject.GetProperty("AcceptedFlowCount").GetInt64());
+            AssertEqual(4L, challengeSubject.GetProperty("ReleasedFlowCount").GetInt64());
+            AssertEqual(1L, challengeSubject.GetProperty("ServiceRestartCount").GetInt64());
+            AssertSimulatorSnapshotClean(challengeSubject, "subject challenge cap cleanup");
+
+            var challengeGlobal = snapshots["challenge-global-cap"];
+            AssertEqual(1L, challengeGlobal.GetProperty("OverflowCount").GetInt64());
+            AssertTrue(challengeGlobal.GetProperty("CriticalAlertCount").GetInt64() > 0, "Global challenge cap omitted Critical Alert evidence.");
+            AssertEqual(129L, challengeGlobal.GetProperty("AcceptedReadCount").GetInt64());
+            AssertEqual(129L, challengeGlobal.GetProperty("ReleasedReadCount").GetInt64());
+            AssertEqual(128L, challengeGlobal.GetProperty("AcceptedFlowCount").GetInt64());
+            AssertEqual(128L, challengeGlobal.GetProperty("ReleasedFlowCount").GetInt64());
+            AssertEqual(1L, challengeGlobal.GetProperty("ServiceRestartCount").GetInt64());
+            AssertSimulatorSnapshotClean(challengeGlobal, "global challenge cap cleanup");
+
+            var serviceRestart = snapshots["service-restart-cleans"];
+            AssertEqual(0, serviceRestart.GetProperty("FaultPlanCount").GetInt32());
+            AssertEqual(8L, serviceRestart.GetProperty("ServiceRestartCount").GetInt64());
+            AssertEqual(2L, serviceRestart.GetProperty("AcceptedReadCount").GetInt64());
+            AssertEqual(2L, serviceRestart.GetProperty("ReleasedReadCount").GetInt64());
+            AssertSimulatorSnapshotClean(serviceRestart, "service restart cleanup");
+
+            var endpointChannels = snapshots["endpoint-channel-boundaries"];
+            AssertEqual(1L, endpointChannels.GetProperty("OverflowCount").GetInt64());
+            AssertTrue(endpointChannels.GetProperty("CriticalAlertCount").GetInt64() > 0, "Endpoint channel cap omitted Critical Alert evidence.");
+            AssertEqual(1L, endpointChannels.GetProperty("ServiceRestartCount").GetInt64());
+            AssertSimulatorSnapshotClean(endpointChannels, "endpoint channel cleanup");
+
+            var scheduler = snapshots["scheduler-cap"];
+            AssertEqual(1L, scheduler.GetProperty("OverflowCount").GetInt64());
+            AssertTrue(scheduler.GetProperty("CriticalAlertCount").GetInt64() > 0, "Scheduler cap omitted Critical Alert evidence.");
+            AssertEqual(1L, scheduler.GetProperty("ServiceRestartCount").GetInt64());
+            AssertSimulatorSnapshotClean(scheduler, "scheduler cap cleanup");
+
+            var faultPlan = snapshots["fault-plan-cap"];
+            AssertEqual(0, faultPlan.GetProperty("FaultPlanCount").GetInt32());
+            AssertEqual(1L, faultPlan.GetProperty("OverflowCount").GetInt64());
+            AssertTrue(faultPlan.GetProperty("CriticalAlertCount").GetInt64() > 0, "Fault-plan cap omitted Critical Alert evidence.");
+            AssertEqual(1L, faultPlan.GetProperty("ServiceRestartCount").GetInt64());
+            AssertSimulatorSnapshotClean(faultPlan, "fault-plan cleanup");
+
+            var ticketCapacity = snapshots["ticket-capacity-through-endpoint"];
+            AssertEqual(1L, ticketCapacity.GetProperty("AcceptedReadCount").GetInt64());
+            AssertEqual(1L, ticketCapacity.GetProperty("ReleasedReadCount").GetInt64());
+            AssertEqual(1L, ticketCapacity.GetProperty("AcceptedFlowCount").GetInt64());
+            AssertEqual(1L, ticketCapacity.GetProperty("ReleasedFlowCount").GetInt64());
+            AssertEqual(1L, ticketCapacity.GetProperty("FailedOpenOperationCount").GetInt64());
+            AssertTrue(ticketCapacity.GetProperty("CriticalAlertCount").GetInt64() > 0, "Ticket capacity omitted Critical Alert evidence.");
+            AssertEqual(1L, ticketCapacity.GetProperty("ServiceRestartCount").GetInt64());
+            AssertSimulatorSnapshotClean(ticketCapacity, "ticket/grant capacity cleanup");
+
+            var allFaults = snapshots["all-faults-finish-zero-owned-state"];
+            AssertEqual(300L, allFaults.GetProperty("OverflowCount").GetInt64());
+            AssertEqual(300L, allFaults.GetProperty("FailedOpenOperationCount").GetInt64());
+            AssertTrue(allFaults.GetProperty("CriticalAlertCount").GetInt64() > 0, "All-fault fixture omitted Critical Alert evidence.");
+            AssertSimulatorSnapshotClean(allFaults, "all-fault common cleanup");
+
             var final = root.GetProperty("FinalSnapshot");
             AssertEqual(0, final.GetProperty("PendingReadCount").GetInt32());
             AssertEqual(0, final.GetProperty("HeldFlowCount").GetInt32());
@@ -2909,6 +2976,22 @@ internal static class Program
         AssertTrue(!firstSuite.StandardOutput.Contains("real enforcement", StringComparison.OrdinalIgnoreCase), "Simulator output claimed real enforcement.");
         AssertTrue(!simulatorSource.Contains("Guid.NewGuid", StringComparison.Ordinal), "Simulator source uses nondeterministic identifiers.");
         AssertTrue(!simulatorSource.Contains("Task.Delay", StringComparison.Ordinal) && !simulatorSource.Contains("Thread.Sleep", StringComparison.Ordinal) && !simulatorSource.Contains("DateTimeOffset.UtcNow", StringComparison.Ordinal), "Simulator source uses wall-clock scheduling.");
+    }
+
+    private static void AssertSimulatorSnapshotClean(JsonElement snapshot, string context)
+    {
+        foreach (var countName in new[]
+        {
+            "PendingReadCount", "ActiveChallengeCount", "HeldFlowCount", "ScheduledCount", "OwnedOperationCount",
+            "HostOwnershipCount", "SchedulerOwnerCount", "CoreActiveContextCount", "OutstandingTicketCount",
+            "ActiveGrantReservationCount", "InstalledGrantCount", "FaultPlanCount", "MinifilterIntentOutboxCount",
+            "MinifilterDispositionInboxCount", "MinifilterCompletionAckOutboxCount", "WfpGateArmInboxCount",
+            "WfpGateAckOutboxCount", "WfpFlowObservationInboxCount", "WfpChallengeOutboxCount"
+        })
+            AssertTrue(snapshot.GetProperty(countName).GetInt32() == 0, $"{context} retained {countName}.");
+        AssertTrue(snapshot.GetProperty("HeldByteCount").GetInt64() == 0, $"{context} retained held bytes.");
+        AssertTrue(snapshot.GetProperty("AcceptedReadCount").GetInt64() == snapshot.GetProperty("ReleasedReadCount").GetInt64(), $"{context} left read counters unbalanced.");
+        AssertTrue(snapshot.GetProperty("AcceptedFlowCount").GetInt64() == snapshot.GetProperty("ReleasedFlowCount").GetInt64(), $"{context} left flow counters unbalanced.");
     }
 
     private static async Task<(int ExitCode, string StandardOutput, string StandardError)> RunSimulatorAsync(string executable, params string[] arguments)
