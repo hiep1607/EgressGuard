@@ -147,6 +147,17 @@ internal static class Program
             ("Phase 5B-02 pending-read caps include acknowledged dispositions and completions", TestOutboundGatePendingAfterAckBoundsAsync),
             ("Phase 5B-02 terminal disposition and completion duplicates remain idempotent", TestOutboundGateTerminalDuplicateAsync),
             ("Phase 5B-02 audit UTC is injected and cannot affect monotonic authorization", TestOutboundGateAuditClockAsync),
+            ("Phase 5B-03 authenticator creates canonical one-time proof and separate grant", TestOneTimeTicketSuccessAsync),
+            ("Phase 5B-03 exact binding rejects altered and replayed tickets", TestOneTimeTicketBindingAsync),
+            ("Phase 5B-03 monotonic expiry ignores UTC jumps", TestOneTimeTicketExpiryAsync),
+            ("Phase 5B-03 concurrent redemption consumes exactly once", TestOneTimeTicketConcurrentRedemptionAsync),
+            ("Phase 5B-03 outstanding and tombstone reservations are bounded", TestOneTimeTicketCapacityAsync),
+            ("Phase 5B-03 capacity failure fails open with a critical alert", TestOneTimeTicketCapacityFailOpenAsync),
+            ("Phase 5B-03 restart and policy changes invalidate volatile authority", TestOneTimeTicketInvalidationAsync),
+            ("Phase 5B-03 ticket identifiers cannot collide across authority reservations", TestOneTimeTicketIdentifierCollisionAsync),
+            ("Phase 5B-03 authenticated ticket fields and grants remain distinct", TestOneTimeTicketAuthenticatedFieldsAsync),
+            ("Phase 5B-03 active grant reservations are bounded and expire monotonically", TestOneTimeTicketActiveGrantCapacityAsync),
+            ("Phase 5B-03 policy and restart transitions serialize with redemption", TestOneTimeTicketAuthorityRaceAsync),
             ("Default UI clients honor configured pipe name", TestConfiguredPipeNameAsync),
             ("File correlation IPC stays compatible and bounded", TestFileCorrelationProtocolAsync),
             ("UI correlation refresh coalesces updates and cancels stale selection", TestUiCorrelationRefreshAsync),
@@ -2401,8 +2412,485 @@ internal static class Program
         return Task.CompletedTask;
     }
 
-    private static OutboundGateStateMachine CreateOutboundGateMachine(OutboundGateSample sample, TestMonotonicClock clock, TestNonceProvider nonces, long policyEpoch = 7, TestAuditClock? auditClock = null) =>
-        new(clock, nonces, auditClock ?? new TestAuditClock(sample.Start), OutboundGateMode.Simulation, policyEpoch, new OutboundGateTrustedRuntimeState(sample.Boot, sample.DriverGeneration, sample.MinifilterGeneration));
+    private static Task TestOneTimeTicketSuccessAsync()
+    {
+        var sample = OutboundGateSamples();
+        var clock = new TestMonotonicClock(new ServiceMonotonicTimestamp(1, sample.Clock, 10_000));
+        var nonces = new TestNonceProvider();
+        using var service = CreateTicketService(sample, clock, nonces);
+        var binding = TicketBinding(sample);
+
+        var issued = service.TryIssue(binding);
+        AssertEqual(TicketServiceResultKind.Success, issued.Kind);
+        AssertTrue(issued.Ticket is not null, "One-time ticket was not issued.");
+        AssertEqual(OutboundGateLimits.AuthenticatorProofBytes, issued.Ticket!.AuthenticatorProof.Count);
+        AssertTrue(issued.Ticket.AuthenticatorProof.Any(value => value != 0), "Authenticator proof was empty/placeholder.");
+
+        var redeemed = service.TryRedeem(issued.Ticket, binding);
+        AssertEqual(TicketServiceResultKind.Success, redeemed.Kind);
+        AssertTrue(redeemed.TicketConsumed, "Successful redemption did not consume the ticket.");
+        AssertTrue(redeemed.Grant is not null, "Successful redemption did not create a separate grant.");
+        AssertTrue(redeemed.Grant!.TicketId == issued.Ticket.TicketId && redeemed.Grant.GrantId != issued.Ticket.TicketId, "Grant authority was not separate from ticket authority.");
+        AssertEqual(binding.FlowGeneration, redeemed.Grant.FlowGeneration);
+        AssertEqual(binding.Destination, redeemed.Grant.Destination);
+        AssertEqual(binding.Subject, redeemed.Grant.Subject);
+        AssertEqual(1, service.Snapshot.ReplayTombstones);
+
+        var failureClock = new TestMonotonicClock(new ServiceMonotonicTimestamp(1, sample.Clock, 10_000));
+        using var failureService = new OneTimeGateTicketService(failureClock, new TestAuditClock(sample.Start), new TestNonceProvider(), new DeterministicTestTicketAuthenticator(sample.Boot), 7, new FailingGrantFactory());
+        var failureTicket = failureService.TryIssue(binding).Ticket!;
+        var grantFailure = failureService.TryRedeem(failureTicket, binding);
+        AssertEqual(TicketServiceResultKind.FailOpenCritical, grantFailure.Kind);
+        AssertTrue(grantFailure.TicketConsumed, "Grant creation failure resurrected the ticket.");
+        AssertEqual("ticket-replay", failureService.TryRedeem(failureTicket, binding).ReasonCode);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestOneTimeTicketBindingAsync()
+    {
+        var sample = OutboundGateSamples();
+        var variants = new List<TicketAuthorizationBinding>
+        {
+            TicketBinding(sample, subject: new GateSubject(1, new ProcessIdentity(sample.Process.ProcessId, sample.Start.AddSeconds(1)), sample.Subject.ApplicationIdentity, null, [new ProcessIdentity(sample.Process.ProcessId, sample.Start.AddSeconds(1))])),
+            TicketBinding(sample, subject: new GateSubject(1, sample.Process, sample.Subject.ApplicationIdentity, Guid.Parse("31000000-0000-0000-0000-000000000031"), [sample.Process, new ProcessIdentity(43, sample.Start)])),
+            TicketBinding(sample, subject: new GateSubject(1, sample.Process, "sha256:other", null, [sample.Process])),
+            TicketBinding(sample, file: new FileVersionIdentity(1, sample.File.VolumeId, sample.File.FileId, sample.File.CreationTimeUtc, sample.File.SizeBytes + 1, sample.File.LastWriteTimeUtc, sample.File.ChangeTimeUtc, sample.File.Usn, "mutated-version")),
+            TicketBinding(sample, destination: new DestinationBinding(1, IPAddress.Parse("127.0.0.2"), IpVersion.IPv4, 5050, TransportProtocol.Tcp, NetworkTrafficDirection.Outbound, 12, 34, "localhost", DomainEvidenceProvenance.DnsObservation, sample.Start)),
+            TicketBinding(sample, destination: new DestinationBinding(1, IPAddress.Loopback, IpVersion.IPv4, 5051, TransportProtocol.Tcp, NetworkTrafficDirection.Outbound, 12, 34, "localhost", DomainEvidenceProvenance.DnsObservation, sample.Start)),
+            TicketBinding(sample, destination: new DestinationBinding(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Udp, NetworkTrafficDirection.Outbound, 12, 34, "localhost", DomainEvidenceProvenance.DnsObservation, sample.Start)),
+            TicketBinding(sample, destination: new DestinationBinding(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, NetworkTrafficDirection.Outbound, 13, 34, "localhost", DomainEvidenceProvenance.DnsObservation, sample.Start)),
+            TicketBinding(sample, destination: new DestinationBinding(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, NetworkTrafficDirection.Outbound, 12, 35, "localhost", DomainEvidenceProvenance.DnsObservation, sample.Start)),
+            TicketBinding(sample, flowGeneration: 2)
+        };
+
+        foreach (var variant in variants)
+        {
+            var clock = new TestMonotonicClock(new ServiceMonotonicTimestamp(1, sample.Clock, 10_000));
+            var service = CreateTicketService(sample, clock, new TestNonceProvider());
+            using (service)
+            {
+                var issued = service.TryIssue(TicketBinding(sample));
+                var result = service.TryRedeem(issued.Ticket!, variant);
+                AssertEqual(TicketServiceResultKind.Rejected, result.Kind);
+                AssertEqual(0, result.Grant is null ? 0 : 1);
+                AssertEqual(1, service.Snapshot.OutstandingGlobal);
+            }
+        }
+
+        using var replayService = CreateTicketService(sample, new TestMonotonicClock(new ServiceMonotonicTimestamp(1, sample.Clock, 10_000)), new TestNonceProvider());
+        var replayBinding = TicketBinding(sample);
+        var replayTicket = replayService.TryIssue(replayBinding).Ticket!;
+        AssertEqual(TicketServiceResultKind.Success, replayService.TryRedeem(replayTicket, replayBinding).Kind);
+        var replay = replayService.TryRedeem(replayTicket, replayBinding);
+        AssertEqual(TicketServiceResultKind.Rejected, replay.Kind);
+        AssertEqual("ticket-replay", replay.ReasonCode);
+
+        var alteredProof = replayTicket.AuthenticatorProof.ToArray();
+        alteredProof[0] ^= 0x80;
+        AssertEqual("ticket-proof-invalid", replayService.TryRedeem(new OneTimeTicket(replayTicket.Version, replayTicket.TicketId, replayTicket.Nonce, replayTicket.IntentId, replayTicket.Subject, replayTicket.File, replayTicket.Destination, replayTicket.FlowGeneration, replayTicket.PolicyEpoch, replayTicket.BootInstance, replayTicket.IssuedAtUtc, replayTicket.ExpiresAtUtc, replayTicket.ValidityWindow, replayTicket.GrantMaxBytes, replayTicket.GrantMaxDurationMilliseconds, alteredProof), replayBinding).ReasonCode);
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new DestinationBinding(1, sample.Destination.Address, sample.Destination.IpVersion, sample.Destination.RemotePort, sample.Destination.Protocol, NetworkTrafficDirection.Inbound, sample.Destination.NetworkCompartmentId, sample.Destination.InterfaceLuid, sample.Destination.DomainEvidence, sample.Destination.DomainProvenance, sample.Destination.DomainObservedAtUtc));
+        AssertThrows<ArgumentException>(() => _ = new OneTimeTicket(replayTicket.Version, replayTicket.TicketId, replayTicket.Nonce, replayTicket.IntentId, replayTicket.Subject, replayTicket.File, replayTicket.Destination, replayTicket.FlowGeneration, replayTicket.PolicyEpoch, replayTicket.BootInstance, replayTicket.IssuedAtUtc, replayTicket.ExpiresAtUtc, replayTicket.ValidityWindow, replayTicket.GrantMaxBytes, replayTicket.GrantMaxDurationMilliseconds, [1]));
+        return Task.CompletedTask;
+    }
+
+    private static Task TestOneTimeTicketExpiryAsync()
+    {
+        var sample = OutboundGateSamples();
+        var clock = new TestMonotonicClock(new ServiceMonotonicTimestamp(1, sample.Clock, 10_000));
+        var audit = new TestAuditClock(sample.Start);
+        using var service = new OneTimeGateTicketService(clock, audit, new TestNonceProvider(), new DeterministicTestTicketAuthenticator(sample.Boot), 7);
+        var binding = TicketBinding(sample);
+        var ticket = service.TryIssue(binding).Ticket!;
+
+        clock.Set(new ServiceMonotonicTimestamp(1, sample.Clock, 9_999));
+        AssertEqual("ticket-not-yet-valid", service.TryRedeem(ticket, binding).ReasonCode);
+        AssertEqual(1, service.Snapshot.OutstandingGlobal);
+
+        audit.Set(sample.Start.AddYears(50));
+        clock.Set(new ServiceMonotonicTimestamp(1, sample.Clock, 15_000));
+        var expired = service.TryRedeem(ticket, binding);
+        AssertEqual(TicketServiceResultKind.FailOpenCritical, expired.Kind);
+        AssertEqual("ticket-expired", expired.ReasonCode);
+        AssertEqual(0, service.Snapshot.OutstandingGlobal);
+
+        var second = service.TryIssue(binding).Ticket!;
+        clock.Set(new ServiceMonotonicTimestamp(1, Guid.NewGuid(), 10_000));
+        AssertEqual("ticket-clock-instance-mismatch", service.TryRedeem(second, binding).ReasonCode);
+        return Task.CompletedTask;
+    }
+
+    private static async Task TestOneTimeTicketConcurrentRedemptionAsync()
+    {
+        var sample = OutboundGateSamples();
+        var clock = new TestMonotonicClock(new ServiceMonotonicTimestamp(1, sample.Clock, 10_000));
+        using var service = CreateTicketService(sample, clock, new TestNonceProvider());
+        var binding = TicketBinding(sample);
+        var ticket = service.TryIssue(binding).Ticket!;
+        using var barrier = new Barrier(2);
+        var results = await Task.WhenAll(
+            Task.Run(() => { barrier.SignalAndWait(); return service.TryRedeem(ticket, binding); }),
+            Task.Run(() => { barrier.SignalAndWait(); return service.TryRedeem(ticket, binding); }));
+        AssertEqual(1, results.Count(result => result.Kind == TicketServiceResultKind.Success));
+        AssertEqual(1, results.Count(result => result.ReasonCode == "ticket-replay"));
+        AssertEqual(1, service.Snapshot.ReplayTombstones);
+    }
+
+    private static Task TestOneTimeTicketCapacityAsync()
+    {
+        var sample = OutboundGateSamples();
+        var clock = new TestMonotonicClock(new ServiceMonotonicTimestamp(1, sample.Clock, 10_000));
+        using var subjectService = CreateTicketService(sample, clock, new TestNonceProvider());
+        var subjectTickets = new List<OneTimeTicket>();
+        for (var index = 0; index < OneTimeGateTicketService.MaximumOutstandingPerSubject; index++)
+            subjectTickets.Add(subjectService.TryIssue(TicketBinding(sample, intentId: Guid.NewGuid())).Ticket!);
+        var ninth = subjectService.TryIssue(TicketBinding(sample, intentId: Guid.NewGuid()));
+        AssertEqual(TicketServiceResultKind.FailOpenCritical, ninth.Kind);
+        AssertEqual(OneTimeGateTicketService.MaximumOutstandingPerSubject, subjectService.Snapshot.OutstandingGlobal);
+        AssertEqual(TicketServiceResultKind.Success, subjectService.TryRedeem(subjectTickets[0], TicketBinding(sample, intentId: subjectTickets[0].IntentId)).Kind);
+
+        using var globalService = CreateTicketService(sample, new TestMonotonicClock(new ServiceMonotonicTimestamp(1, sample.Clock, 10_000)), new TestNonceProvider());
+        for (var index = 0; index < OneTimeGateTicketService.MaximumOutstandingGlobal; index++)
+        {
+            var process = new ProcessIdentity(50_000 + index, sample.Start);
+            var subject = new GateSubject(1, process, $"sha256:global-{index}", null, [process]);
+            AssertEqual(TicketServiceResultKind.Success, globalService.TryIssue(TicketBinding(sample, intentId: Guid.NewGuid(), subject: subject)).Kind);
+        }
+        var overflowProcess = new ProcessIdentity(60_000, sample.Start);
+        var overflowSubject = new GateSubject(1, overflowProcess, "sha256:overflow", null, [overflowProcess]);
+        var globalOverflow = globalService.TryIssue(TicketBinding(sample, intentId: Guid.NewGuid(), subject: overflowSubject));
+        AssertEqual(TicketServiceResultKind.FailOpenCritical, globalOverflow.Kind);
+
+        var tombstoneClock = new TestMonotonicClock(new ServiceMonotonicTimestamp(1, sample.Clock, 10_000));
+        using var tombstoneService = CreateTicketService(sample, tombstoneClock, new TestNonceProvider());
+        OneTimeTicket? replayTicket = null;
+        var tombstonePolicyEpoch = 7L;
+        for (var index = 0; index < OneTimeGateTicketService.MaximumReplayTombstonesGlobal; index++)
+        {
+            var binding = TicketBinding(sample, intentId: Guid.NewGuid(), policyEpoch: tombstonePolicyEpoch);
+            var ticket = tombstoneService.TryIssue(binding).Ticket!;
+            replayTicket = ticket;
+            AssertEqual(TicketServiceResultKind.Success, tombstoneService.TryRedeem(ticket, binding).Kind);
+            if ((index + 1) % OneTimeGateTicketService.MaximumActiveGrantsGlobal == 0
+                && index + 1 < OneTimeGateTicketService.MaximumReplayTombstonesGlobal)
+            {
+                tombstonePolicyEpoch++;
+                tombstoneService.ApplyPolicyEpoch(tombstonePolicyEpoch);
+                AssertEqual(0, tombstoneService.Snapshot.ActiveGrantReservations);
+            }
+        }
+        AssertEqual(OneTimeGateTicketService.MaximumReplayTombstonesGlobal, tombstoneService.Snapshot.ReplayTombstones);
+        AssertEqual(TicketServiceResultKind.FailOpenCritical, tombstoneService.TryIssue(TicketBinding(sample, intentId: Guid.NewGuid(), policyEpoch: tombstonePolicyEpoch)).Kind);
+        AssertEqual("ticket-replay", tombstoneService.TryRedeem(replayTicket!, TicketBinding(sample, intentId: replayTicket!.IntentId, policyEpoch: tombstonePolicyEpoch)).ReasonCode);
+        tombstonePolicyEpoch++;
+        tombstoneService.ApplyPolicyEpoch(tombstonePolicyEpoch);
+        AssertEqual(0, tombstoneService.Snapshot.ActiveGrantReservations);
+        tombstoneClock.Set(new ServiceMonotonicTimestamp(1, sample.Clock, 14_999));
+        AssertEqual(0, tombstoneService.PruneExpired().TombstonesRemoved);
+        tombstoneClock.Set(new ServiceMonotonicTimestamp(1, sample.Clock, 15_000));
+        AssertEqual(OneTimeGateTicketService.MaximumReplayTombstonesGlobal, tombstoneService.PruneExpired().TombstonesRemoved);
+        AssertEqual(TicketServiceResultKind.Success, tombstoneService.TryIssue(TicketBinding(sample, intentId: Guid.NewGuid(), policyEpoch: tombstonePolicyEpoch)).Kind);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestOneTimeTicketCapacityFailOpenAsync()
+    {
+        var sample = OutboundGateSamples();
+        var clock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var nonces = new TestNonceProvider();
+        using var service = CreateTicketService(sample, clock, nonces);
+        for (var index = 0; index < OneTimeGateTicketService.MaximumOutstandingPerSubject; index++)
+            AssertEqual(TicketServiceResultKind.Success, service.TryIssue(TicketBinding(sample, intentId: Guid.NewGuid())).Kind);
+
+        using var machine = CreateOutboundGateMachine(sample, clock, nonces, ticketService: service);
+        var prepared = PrepareToChallenge(machine, sample, clock, nonces, IntentFor(sample, Guid.NewGuid(), sample.Subject, 900));
+        var failed = machine.ReceiveDecision(new UserDecision(1, nonces.NextNonce(), prepared.Challenge.ChallengeId, UserDecisionKind.AllowOnce, null, sample.Start, "test"));
+        AssertEqual(GateRuntimeState.FailedOpen, failed.Status.State);
+        AssertTrue(failed.CriticalAlert is not null, "Ticket capacity refusal did not create a Critical Alert.");
+        AssertTrue(failed.Status.TrafficFailedOpen, "Ticket capacity refusal did not fail open.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestOneTimeTicketInvalidationAsync()
+    {
+        var sample = OutboundGateSamples();
+        var clock = new TestMonotonicClock(new ServiceMonotonicTimestamp(1, sample.Clock, 10_000));
+        var nonces = new TestNonceProvider();
+        using var service = CreateTicketService(sample, clock, nonces);
+        var binding = TicketBinding(sample);
+        var ticket = service.TryIssue(binding).Ticket!;
+        AssertEqual(TicketServiceResultKind.Success, service.TryRedeem(ticket, binding).Kind);
+        AssertEqual(1, service.Snapshot.ActiveGrantReservations);
+        service.ApplyPolicyEpoch(7);
+        AssertEqual(1, service.Snapshot.ActiveGrantReservations);
+        service.ApplyPolicyEpoch(8);
+        AssertEqual(0, service.Snapshot.ActiveGrantReservations);
+        AssertEqual("ticket-policy-epoch-mismatch", service.TryRedeem(ticket, binding).ReasonCode);
+
+        var epochBinding = TicketBinding(sample, intentId: Guid.NewGuid(), policyEpoch: 8);
+        var epochTicket = service.TryIssue(epochBinding).Ticket!;
+        AssertEqual(TicketServiceResultKind.Success, service.TryRedeem(epochTicket, epochBinding).Kind);
+        AssertEqual(1, service.Snapshot.ActiveGrantReservations);
+        var newBoot = Guid.NewGuid();
+        service.ResetRuntime(newBoot, 9, new DeterministicTestTicketAuthenticator(newBoot));
+        AssertEqual(0, service.Snapshot.ActiveGrantReservations);
+        AssertEqual("ticket-boot-instance-mismatch", service.TryRedeem(ticket, binding).ReasonCode);
+        AssertEqual(0, service.Snapshot.OutstandingGlobal);
+
+        var resetBinding = TicketBinding(sample, intentId: Guid.NewGuid(), bootInstance: newBoot, policyEpoch: 9);
+        var resetTicket = service.TryIssue(resetBinding).Ticket!;
+        AssertEqual(TicketServiceResultKind.Success, service.TryRedeem(resetTicket, resetBinding).Kind);
+        AssertEqual(1, service.Snapshot.ActiveGrantReservations);
+        service.Dispose();
+        AssertEqual(0, service.Snapshot.ActiveGrantReservations);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestOneTimeTicketIdentifierCollisionAsync()
+    {
+        var sample = OutboundGateSamples();
+        var ticketId = Guid.Parse("e1000000-0000-0000-0000-000000000001");
+        var nonce = Guid.Parse("e1000000-0000-0000-0000-000000000002");
+        var grantId = Guid.Parse("e1000000-0000-0000-0000-000000000003");
+        var nextTicketId = Guid.Parse("e1000000-0000-0000-0000-000000000004");
+        var nextNonce = Guid.Parse("e1000000-0000-0000-0000-000000000005");
+
+        var consumedCollisionCases = new[]
+        {
+            (TicketId: ticketId, Nonce: nonce),
+            (TicketId: ticketId, Nonce: nextNonce),
+            (TicketId: nextTicketId, Nonce: ticketId),
+            (TicketId: nonce, Nonce: nextNonce),
+            (TicketId: nextTicketId, Nonce: nonce)
+        };
+        foreach (var candidate in consumedCollisionCases)
+        {
+            var clock = new TestMonotonicClock(new ServiceMonotonicTimestamp(1, sample.Clock, 10_000));
+            using var service = new OneTimeGateTicketService(
+                clock,
+                new TestAuditClock(sample.Start),
+                new ScriptedNonceProvider(ticketId, nonce, grantId, candidate.TicketId, candidate.Nonce),
+                new DeterministicTestTicketAuthenticator(sample.Boot),
+                7);
+            var binding = TicketBinding(sample);
+            var first = service.TryIssue(binding).Ticket!;
+            var redeemed = service.TryRedeem(first, binding);
+            AssertEqual(TicketServiceResultKind.Success, redeemed.Kind);
+            AssertTrue(redeemed.Grant is not null, "The first ticket did not produce a grant before collision testing.");
+            var collision = service.TryIssue(TicketBinding(sample, intentId: Guid.NewGuid()));
+            AssertEqual(TicketServiceResultKind.FailOpenCritical, collision.Kind);
+            AssertEqual("ticket-identifier-collision", collision.ReasonCode);
+            AssertTrue(collision.CapacityFailure, "Identifier collision was not surfaced as a reservation failure.");
+            AssertEqual(1, service.Snapshot.ReplayTombstones);
+            var replay = service.TryRedeem(first, binding);
+            AssertEqual("ticket-replay", replay.ReasonCode);
+            AssertTrue(replay.Grant is null, "A replay after identifier collision created a grant.");
+        }
+
+        var outstandingClock = new TestMonotonicClock(new ServiceMonotonicTimestamp(1, sample.Clock, 10_000));
+        using (var outstandingService = new OneTimeGateTicketService(
+            outstandingClock,
+            new TestAuditClock(sample.Start),
+            new ScriptedNonceProvider(ticketId, nonce, nonce, nextNonce),
+            new DeterministicTestTicketAuthenticator(sample.Boot),
+            7))
+        {
+            AssertEqual(TicketServiceResultKind.Success, outstandingService.TryIssue(TicketBinding(sample)).Kind);
+            var outstandingCollision = outstandingService.TryIssue(TicketBinding(sample, intentId: Guid.NewGuid()));
+            AssertEqual(TicketServiceResultKind.FailOpenCritical, outstandingCollision.Kind);
+            AssertEqual("ticket-identifier-collision", outstandingCollision.ReasonCode);
+            AssertEqual(1, outstandingService.Snapshot.OutstandingGlobal);
+        }
+
+        var stateClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var stateService = new OneTimeGateTicketService(stateClock, new TestAuditClock(sample.Start), new ScriptedNonceProvider(ticketId, nonce, grantId, ticketId, nextNonce), new DeterministicTestTicketAuthenticator(sample.Boot), 7);
+        var firstStateTicket = stateService.TryIssue(TicketBinding(sample)).Ticket!;
+        AssertEqual(TicketServiceResultKind.Success, stateService.TryRedeem(firstStateTicket, TicketBinding(sample)).Kind);
+        using var machine = CreateOutboundGateMachine(sample, stateClock, new TestNonceProvider(), ticketService: stateService);
+        var prepared = PrepareToChallenge(machine, sample, stateClock, new TestNonceProvider(), IntentFor(sample, Guid.NewGuid(), sample.Subject, 901));
+        var failed = machine.ReceiveDecision(new UserDecision(1, Guid.NewGuid(), prepared.Challenge.ChallengeId, UserDecisionKind.AllowOnce, null, sample.Start, "collision-test"));
+        AssertEqual(GateRuntimeState.FailedOpen, failed.Status.State);
+        AssertEqual("ticket-identifier-collision", failed.Status.ReasonCode);
+        AssertTrue(failed.CriticalAlert is not null, "State-machine ticket collision did not emit a Critical Alert.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestOneTimeTicketAuthenticatedFieldsAsync()
+    {
+        var sample = OutboundGateSamples();
+        var clock = new TestMonotonicClock(new ServiceMonotonicTimestamp(1, sample.Clock, 10_000));
+        using var service = CreateTicketService(sample, clock, new TestNonceProvider());
+        var binding = TicketBinding(sample);
+        var ticket = service.TryIssue(binding).Ticket!;
+        var alteredSubject = new GateSubject(1, new ProcessIdentity(sample.Process.ProcessId, sample.Start.AddSeconds(1)), sample.Subject.ApplicationIdentity, null, [new ProcessIdentity(sample.Process.ProcessId, sample.Start.AddSeconds(1))]);
+        var alteredFile = new FileVersionIdentity(1, sample.File.VolumeId, sample.File.FileId, sample.File.CreationTimeUtc, sample.File.SizeBytes + 1, sample.File.LastWriteTimeUtc, sample.File.ChangeTimeUtc, sample.File.Usn, "altered");
+        var alteredDestination = new DestinationBinding(1, IPAddress.Parse("127.0.0.2"), IpVersion.IPv4, sample.Destination.RemotePort, sample.Destination.Protocol, NetworkTrafficDirection.Outbound, sample.Destination.NetworkCompartmentId, sample.Destination.InterfaceLuid, sample.Destination.DomainEvidence, sample.Destination.DomainProvenance, sample.Destination.DomainObservedAtUtc);
+        var altered = new[]
+        {
+            CloneTicket(ticket, ticketId: Guid.NewGuid()),
+            CloneTicket(ticket, nonce: Guid.NewGuid()),
+            CloneTicket(ticket, intentId: Guid.NewGuid()),
+            CloneTicket(ticket, subject: alteredSubject),
+            CloneTicket(ticket, file: alteredFile),
+            CloneTicket(ticket, destination: alteredDestination),
+            CloneTicket(ticket, flowGeneration: 2),
+            CloneTicket(ticket, policyEpoch: 8),
+            CloneTicket(ticket, bootInstance: Guid.NewGuid()),
+            CloneTicket(ticket, issuedAtUtc: ticket.IssuedAtUtc.AddSeconds(1)),
+            CloneTicket(ticket, expiresAtUtc: ticket.ExpiresAtUtc.AddSeconds(-1)),
+            CloneTicket(ticket, validityWindow: ServiceRange(sample.Clock, 10_000, 4_000)),
+            CloneTicket(ticket, grantMaxBytes: 1),
+            CloneTicket(ticket, grantMaxDurationMilliseconds: 1)
+        };
+        foreach (var candidate in altered)
+        {
+            var result = service.TryRedeem(candidate, binding);
+            AssertEqual(TicketServiceResultKind.Rejected, result.Kind);
+            AssertEqual("ticket-proof-invalid", result.ReasonCode);
+            AssertTrue(result.Grant is null, "An authenticated-field alteration created a grant.");
+        }
+        AssertEqual(1, service.Snapshot.OutstandingGlobal);
+        var redeemed = service.TryRedeem(ticket, binding);
+        AssertEqual(TicketServiceResultKind.Success, redeemed.Kind);
+        AssertTrue(redeemed.Grant is not null, "The unaltered ticket did not redeem after field-alteration checks.");
+        AssertNotEqual(ticket.TicketId, redeemed.Grant!.GrantId);
+        AssertNotEqual(ticket.Nonce, redeemed.Grant.GrantId);
+
+        var activeGrantId = Guid.Parse("e2000000-0000-0000-0000-000000000003");
+        var scripted = new ScriptedNonceProvider(
+            Guid.Parse("e2000000-0000-0000-0000-000000000001"),
+            Guid.Parse("e2000000-0000-0000-0000-000000000002"),
+            activeGrantId,
+            Guid.Parse("e2000000-0000-0000-0000-000000000004"),
+            Guid.Parse("e2000000-0000-0000-0000-000000000005"),
+            activeGrantId);
+        var activeClock = new TestMonotonicClock(new ServiceMonotonicTimestamp(1, sample.Clock, 10_000));
+        using var activeService = new OneTimeGateTicketService(activeClock, new TestAuditClock(sample.Start), scripted, new DeterministicTestTicketAuthenticator(sample.Boot), 7);
+        var first = activeService.TryIssue(binding).Ticket!;
+        var firstGrant = activeService.TryRedeem(first, binding);
+        AssertEqual(TicketServiceResultKind.Success, firstGrant.Kind);
+        var second = activeService.TryIssue(TicketBinding(sample, intentId: Guid.NewGuid())).Ticket!;
+        var collision = activeService.TryRedeem(second, TicketBinding(sample, intentId: second.IntentId));
+        AssertEqual(TicketServiceResultKind.FailOpenCritical, collision.Kind);
+        AssertEqual("ticket-grant-identifier-collision", collision.ReasonCode);
+        AssertTrue(collision.Grant is null, "An active grant-ID collision created a second grant.");
+        AssertEqual(1, activeService.Snapshot.ActiveGrantReservations);
+        AssertEqual(OneTimeGateTicketService.MaximumActiveGrantsGlobal, activeService.Snapshot.ActiveGrantReservationCapacity);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestOneTimeTicketActiveGrantCapacityAsync()
+    {
+        var sample = OutboundGateSamples();
+        var clock = new TestMonotonicClock(new ServiceMonotonicTimestamp(1, sample.Clock, 10_000));
+        using var service = CreateTicketService(sample, clock, new TestNonceProvider());
+
+        for (var index = 0; index < OneTimeGateTicketService.MaximumActiveGrantsGlobal - 1; index++)
+        {
+            var binding = TicketBinding(sample, intentId: Guid.NewGuid());
+            var ticket = service.TryIssue(binding).Ticket!;
+            AssertEqual(TicketServiceResultKind.Success, service.TryRedeem(ticket, binding).Kind);
+        }
+        AssertEqual(OneTimeGateTicketService.MaximumActiveGrantsGlobal - 1, service.Snapshot.ActiveGrantReservations);
+
+        var capBinding = TicketBinding(sample, intentId: Guid.NewGuid());
+        var postCapBinding = TicketBinding(sample, intentId: Guid.NewGuid());
+        var capTicket = service.TryIssue(capBinding).Ticket!;
+        var postCapTicket = service.TryIssue(postCapBinding).Ticket!;
+        AssertEqual(TicketServiceResultKind.Success, service.TryRedeem(capTicket, capBinding).Kind);
+        AssertEqual(OneTimeGateTicketService.MaximumActiveGrantsGlobal, service.Snapshot.ActiveGrantReservations);
+
+        var consumedAtCapacity = service.TryRedeem(postCapTicket, postCapBinding);
+        AssertEqual(TicketServiceResultKind.FailOpenCritical, consumedAtCapacity.Kind);
+        AssertEqual("ticket-active-grant-capacity-exhausted", consumedAtCapacity.ReasonCode);
+        AssertTrue(consumedAtCapacity.TicketConsumed, "A ticket reaching active-grant capacity was not consumed.");
+        AssertTrue(consumedAtCapacity.Grant is null, "Active-grant capacity pressure created a grant.");
+        AssertEqual(OneTimeGateTicketService.MaximumActiveGrantsGlobal, service.Snapshot.ActiveGrantReservations);
+        AssertEqual("ticket-replay", service.TryRedeem(postCapTicket, postCapBinding).ReasonCode);
+
+        var issuanceAtCapacity = service.TryIssue(TicketBinding(sample, intentId: Guid.NewGuid()));
+        AssertEqual(TicketServiceResultKind.FailOpenCritical, issuanceAtCapacity.Kind);
+        AssertEqual("ticket-active-grant-capacity-exhausted", issuanceAtCapacity.ReasonCode);
+        AssertTrue(issuanceAtCapacity.CapacityFailure, "Active-grant issuance refusal was not marked as capacity pressure.");
+        AssertTrue(issuanceAtCapacity.Ticket is null, "Active-grant capacity pressure issued a ticket.");
+        AssertEqual(OneTimeGateTicketService.MaximumActiveGrantsGlobal, service.Snapshot.ActiveGrantReservations);
+
+        clock.Set(new ServiceMonotonicTimestamp(1, sample.Clock, 309_999));
+        service.PruneExpired();
+        AssertEqual(OneTimeGateTicketService.MaximumActiveGrantsGlobal, service.Snapshot.ActiveGrantReservations);
+        clock.Set(new ServiceMonotonicTimestamp(1, sample.Clock, 310_000));
+        service.PruneExpired();
+        AssertEqual(0, service.Snapshot.ActiveGrantReservations);
+
+        var afterExpiryBinding = TicketBinding(sample, intentId: Guid.NewGuid());
+        var afterExpiryTicket = service.TryIssue(afterExpiryBinding).Ticket!;
+        AssertEqual(TicketServiceResultKind.Success, service.TryRedeem(afterExpiryTicket, afterExpiryBinding).Kind);
+        AssertEqual(1, service.Snapshot.ActiveGrantReservations);
+        return Task.CompletedTask;
+    }
+
+    private static async Task TestOneTimeTicketAuthorityRaceAsync()
+    {
+        var sample = OutboundGateSamples();
+        await TestPolicyRaceAsync(sample).ConfigureAwait(false);
+        await TestRestartRaceAsync(sample).ConfigureAwait(false);
+    }
+
+    private static async Task TestPolicyRaceAsync(OutboundGateSample sample)
+    {
+        var clock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var nonces = new TestNonceProvider();
+        using var authenticator = new BlockingTestTicketAuthenticator(sample.Boot);
+        using var service = new OneTimeGateTicketService(clock, new TestAuditClock(sample.Start), nonces, authenticator, 7);
+        using var machine = CreateOutboundGateMachine(sample, clock, nonces, ticketService: service);
+        var prepared = PrepareToChallenge(machine, sample, clock, nonces, IntentFor(sample, Guid.NewGuid(), sample.Subject, 902));
+        var issued = machine.ReceiveDecision(new UserDecision(1, nonces.NextNonce(), prepared.Challenge.ChallengeId, UserDecisionKind.AllowOnce, null, sample.Start, "policy-race"));
+        authenticator.BlockVerification();
+        var redemptionTask = Task.Run(() => machine.RedeemTicket(issued.Ticket!));
+        authenticator.VerificationEntered.Wait();
+        var policyTask = Task.Run(() => machine.ApplyPolicyEpoch(8));
+        authenticator.ReleaseVerification();
+        var redeemed = await redemptionTask.ConfigureAwait(false);
+        var policyStatuses = await policyTask.ConfigureAwait(false);
+        AssertEqual(GateRuntimeState.Granted, redeemed.Status.State);
+        AssertEqual(1, policyStatuses.Count);
+        AssertEqual(GateRuntimeState.Blocked, policyStatuses[0].State);
+        AssertEqual(8L, machine.PolicyEpoch);
+    }
+
+    private static async Task TestRestartRaceAsync(OutboundGateSample sample)
+    {
+        var clock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var nonces = new TestNonceProvider();
+        using var authenticator = new BlockingTestTicketAuthenticator(sample.Boot);
+        using var service = new OneTimeGateTicketService(clock, new TestAuditClock(sample.Start), nonces, authenticator, 7);
+        using var machine = CreateOutboundGateMachine(sample, clock, nonces, ticketService: service);
+        var prepared = PrepareToChallenge(machine, sample, clock, nonces, IntentFor(sample, Guid.NewGuid(), sample.Subject, 903));
+        var issued = machine.ReceiveDecision(new UserDecision(1, nonces.NextNonce(), prepared.Challenge.ChallengeId, UserDecisionKind.AllowOnce, null, sample.Start, "restart-race"));
+        authenticator.BlockVerification();
+        var redemptionTask = Task.Run(() => machine.RedeemTicket(issued.Ticket!));
+        authenticator.VerificationEntered.Wait();
+        var newRuntime = new OutboundGateTrustedRuntimeState(Guid.NewGuid(), sample.DriverGeneration, sample.MinifilterGeneration);
+        var restartTask = Task.Run(() => machine.HandleServiceRestart(newRuntime));
+        authenticator.ReleaseVerification();
+        var redeemed = await redemptionTask.ConfigureAwait(false);
+        var restartStatuses = await restartTask.ConfigureAwait(false);
+        AssertEqual(GateRuntimeState.Granted, redeemed.Status.State);
+        AssertEqual(1, restartStatuses.Count);
+        AssertEqual(GateRuntimeState.Blocked, restartStatuses[0].State);
+        AssertEqual(newRuntime.BootInstance, machine.TrustedRuntime!.BootInstance);
+    }
+
+    private static OneTimeGateTicketService CreateTicketService(OutboundGateSample sample, TestMonotonicClock clock, TestNonceProvider nonces, long policyEpoch = 7) =>
+        new(clock, new TestAuditClock(sample.Start), nonces, new DeterministicTestTicketAuthenticator(sample.Boot), policyEpoch);
+
+    private static TicketAuthorizationBinding TicketBinding(OutboundGateSample sample, Guid? intentId = null, GateSubject? subject = null, FileVersionIdentity? file = null, DestinationBinding? destination = null, long flowGeneration = 1, Guid? bootInstance = null, long? policyEpoch = null) =>
+        new(1, intentId ?? sample.Intent.IntentId, subject ?? sample.Subject, file ?? sample.File, destination ?? sample.Destination, flowGeneration, bootInstance ?? sample.Boot, policyEpoch ?? 7, OutboundGateLimits.MaximumGrantBytes, (long)OutboundGateLimits.MaximumGrantDuration.TotalMilliseconds);
+
+    private static OneTimeTicket CloneTicket(OneTimeTicket ticket, Guid? ticketId = null, Guid? nonce = null, Guid? intentId = null, GateSubject? subject = null, FileVersionIdentity? file = null, DestinationBinding? destination = null, long? flowGeneration = null, long? policyEpoch = null, Guid? bootInstance = null, DateTimeOffset? issuedAtUtc = null, DateTimeOffset? expiresAtUtc = null, ServiceMonotonicTimeRange? validityWindow = null, long? grantMaxBytes = null, long? grantMaxDurationMilliseconds = null) =>
+        new(ticket.Version, ticketId ?? ticket.TicketId, nonce ?? ticket.Nonce, intentId ?? ticket.IntentId, subject ?? ticket.Subject, file ?? ticket.File, destination ?? ticket.Destination, flowGeneration ?? ticket.FlowGeneration, policyEpoch ?? ticket.PolicyEpoch, bootInstance ?? ticket.BootInstance, issuedAtUtc ?? ticket.IssuedAtUtc, expiresAtUtc ?? ticket.ExpiresAtUtc, validityWindow ?? ticket.ValidityWindow, grantMaxBytes ?? ticket.GrantMaxBytes, grantMaxDurationMilliseconds ?? ticket.GrantMaxDurationMilliseconds, ticket.AuthenticatorProof);
+
+    private static OutboundGateStateMachine CreateOutboundGateMachine(OutboundGateSample sample, TestMonotonicClock clock, TestNonceProvider nonces, long policyEpoch = 7, TestAuditClock? auditClock = null, OneTimeGateTicketService? ticketService = null) =>
+        new(clock, nonces, auditClock ?? new TestAuditClock(sample.Start), OutboundGateMode.Simulation, policyEpoch, new OutboundGateTrustedRuntimeState(sample.Boot, sample.DriverGeneration, sample.MinifilterGeneration), ticketService);
 
     private static PreparedRead PrepareToDisposition(OutboundGateStateMachine machine, OutboundGateSample sample, TestNonceProvider nonces, FileReadIntent? intent = null)
     {
@@ -2462,12 +2950,74 @@ internal static class Program
         public Guid NextNonce() => Guid.Parse($"{++_counter:x8}-0000-0000-0000-000000000000");
     }
 
+    private sealed class ScriptedNonceProvider : IOutboundGateNonceProvider
+    {
+        private readonly Queue<Guid> _values;
+
+        public ScriptedNonceProvider(params Guid[] values) => _values = new Queue<Guid>(values);
+
+        public Guid NextNonce()
+        {
+            if (_values.Count == 0)
+                throw new InvalidOperationException("The scripted nonce sequence was exhausted.");
+            return _values.Dequeue();
+        }
+    }
+
+    private sealed class BlockingTestTicketAuthenticator : IOneTimeTicketAuthenticator
+    {
+        private readonly DeterministicTestTicketAuthenticator _inner;
+        private readonly ManualResetEventSlim _verificationEntered = new(false);
+        private readonly ManualResetEventSlim _releaseVerification = new(false);
+        private int _blockVerification;
+        private int _disposed;
+
+        public BlockingTestTicketAuthenticator(Guid bootInstance) => _inner = new DeterministicTestTicketAuthenticator(bootInstance);
+
+        public Guid BootInstance => _inner.BootInstance;
+        public int ProofSizeBytes => _inner.ProofSizeBytes;
+        public ManualResetEventSlim VerificationEntered => _verificationEntered;
+        public byte[] CreateProof(ReadOnlySpan<byte> canonicalClaims) => _inner.CreateProof(canonicalClaims);
+
+        public bool VerifyProof(ReadOnlySpan<byte> canonicalClaims, ReadOnlySpan<byte> presentedProof)
+        {
+            if (Volatile.Read(ref _blockVerification) != 0)
+            {
+                _verificationEntered.Set();
+                _releaseVerification.Wait();
+            }
+            return _inner.VerifyProof(canonicalClaims, presentedProof);
+        }
+
+        public void BlockVerification() => Volatile.Write(ref _blockVerification, 1);
+        public void ReleaseVerification() => _releaseVerification.Set();
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+            _inner.Dispose();
+            _verificationEntered.Dispose();
+            _releaseVerification.Dispose();
+        }
+    }
+
     private sealed class TestAuditClock : IOutboundGateAuditClock
     {
         public TestAuditClock(DateTimeOffset current) => Current = current;
         public DateTimeOffset Current { get; private set; }
         public DateTimeOffset NowUtc() => Current;
         public void Set(DateTimeOffset timestamp) => Current = timestamp;
+    }
+
+    private sealed class FailingGrantFactory : IEphemeralFlowGrantFactory
+    {
+        public bool TryCreate(TicketGrantParameters parameters, out EphemeralFlowGrant? grant)
+        {
+            _ = parameters;
+            grant = null;
+            return false;
+        }
     }
 
     private static OutboundGateSample OutboundGateSamples()
@@ -2497,7 +3047,7 @@ internal static class Program
         var challenge = new NetworkGateChallenge(1, Guid.Parse("80000000-0000-0000-0000-000000000008"), intentId, subject, destination, 1, false, coverage, start, decisionWindow, null);
         var persistentScope = new RequestedPersistentScope(1, PersistentAllowPolicyKind.RememberFor30Days, file, subject.ApplicationIdentity, destination);
         var decision = new UserDecision(1, Guid.Parse("90000000-0000-0000-0000-000000000009"), challenge.ChallengeId, UserDecisionKind.AlwaysAllow, persistentScope, start, "interactive-user");
-        var ticket = new OneTimeTicket(1, Guid.Parse("a0000000-0000-0000-0000-00000000000a"), Guid.Parse("b0000000-0000-0000-0000-00000000000b"), intentId, subject, file, destination, 1, 7, boot, start, start.AddSeconds(5), ticketWindow, 512L * 1024 * 1024, 300_000, [1, 2, 3]);
+        var ticket = new OneTimeTicket(1, Guid.Parse("a0000000-0000-0000-0000-00000000000a"), Guid.Parse("b0000000-0000-0000-0000-00000000000b"), intentId, subject, file, destination, 1, 7, boot, start, start.AddSeconds(5), ticketWindow, 512L * 1024 * 1024, 300_000, Enumerable.Range(1, 32).Select(value => (byte)value).ToArray());
         var grant = new EphemeralFlowGrant(1, Guid.Parse("c0000000-0000-0000-0000-00000000000c"), ticket.TicketId, intentId, subject, destination, 1, 7, boot, ticket.GrantMaxBytes, grantWindow);
         var affectedScope = new GateAffectedScope(1, GateAffectedScopeKind.Intent, intentId, subject);
         var status = new GateStatus(1, OutboundGateMode.Simulation, GateRuntimeState.Armed, coverage, "simulation-armed", affectedScope, start, acknowledgedAt, 0, 0, false);

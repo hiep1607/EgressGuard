@@ -10,6 +10,7 @@ public static class OutboundGateLimits
     public const int MaximumDomainLength = 253;
     public const int MaximumGroupMembers = 32;
     public const int MaximumAuthenticatorBytes = 64;
+    public const int AuthenticatorProofBytes = 32;
     public const long MaximumFileSizeBytes = 1L << 50;
     public const long MaximumGrantBytes = 512L * 1024 * 1024;
     public const long MaximumDiagnosticCounter = uint.MaxValue;
@@ -224,6 +225,9 @@ public sealed record GateSubject
             OutboundGateLimits.Process(member);
         if (!members.Contains(processIdentity))
             throw new ArgumentException("Group members must contain the exact subject process identity.", nameof(groupMembers));
+        if (members.Distinct().Count() != members.Count
+            || members.Zip(members.Skip(1)).Any(pair => CompareProcessIdentity(pair.First, pair.Second) >= 0))
+            throw new ArgumentException("Group members must be unique and in canonical PID/start-time order.", nameof(groupMembers));
         if (processGroupId is null && members.Count != 1)
             throw new ArgumentException("Multiple process members require a process-group identity.", nameof(processGroupId));
         if (processGroupId == Guid.Empty)
@@ -233,6 +237,12 @@ public sealed record GateSubject
         ApplicationIdentity = canonicalApplicationIdentity;
         ProcessGroupId = processGroupId;
         GroupMembers = members;
+    }
+
+    private static int CompareProcessIdentity(ProcessIdentity left, ProcessIdentity right)
+    {
+        var pid = left.ProcessId.CompareTo(right.ProcessId);
+        return pid != 0 ? pid : left.StartTime.UtcTicks.CompareTo(right.StartTime.UtcTicks);
     }
 
     public bool Matches(GateSubject other) =>
@@ -277,6 +287,8 @@ public sealed record DestinationBinding
     {
         OutboundGateLimits.RequireVersion(version);
         ArgumentNullException.ThrowIfNull(address);
+        if (address.IsIPv4MappedToIPv6)
+            throw new ArgumentException("IPv4-mapped IPv6 addresses must be normalized before binding.", nameof(address));
         if (!Enum.IsDefined(ipVersion) || !Enum.IsDefined(protocol)
             || remotePort is < 1 or > 65535
             || (ipVersion == IpVersion.IPv4 && address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
@@ -716,7 +728,9 @@ public sealed record OneTimeTicket
             || grantMaxBytes is < 1 or > OutboundGateLimits.MaximumGrantBytes
             || grantMaxDurationMilliseconds < 1 || grantMaxDurationMilliseconds > OutboundGateLimits.MaximumGrantDuration.TotalMilliseconds)
             throw new ArgumentOutOfRangeException(nameof(flowGeneration), "Ticket bindings, expiry and grant bounds are invalid.");
-        var proof = OutboundGateLimits.CopyBounded(authenticatorProof, nameof(authenticatorProof), OutboundGateLimits.MaximumAuthenticatorBytes, requireAtLeastOne: true);
+        var proof = OutboundGateLimits.CopyBounded(authenticatorProof, nameof(authenticatorProof), OutboundGateLimits.AuthenticatorProofBytes, requireAtLeastOne: true);
+        if (proof.Count != OutboundGateLimits.AuthenticatorProofBytes)
+            throw new ArgumentException($"Authenticator proof must be exactly {OutboundGateLimits.AuthenticatorProofBytes} bytes.", nameof(authenticatorProof));
         Version = version;
         TicketId = ticketId;
         Nonce = nonce;

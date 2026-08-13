@@ -72,7 +72,7 @@ public sealed record GateTransitionResult
     }
 }
 
-public sealed class OutboundGateStateMachine
+public sealed class OutboundGateStateMachine : IDisposable
 {
     private const int MaximumPendingPerSubject = 4;
     private const int MaximumPendingGlobal = 64;
@@ -86,6 +86,8 @@ public sealed class OutboundGateStateMachine
     private readonly IOutboundGateNonceProvider _nonces;
     private readonly IOutboundGateAuditClock _auditClock;
     private readonly OutboundGateMode _mode;
+    private readonly OneTimeGateTicketService? _ticketService;
+    private readonly object _transitionSync = new();
     private readonly Dictionary<Guid, Context> _activeContexts = new();
     private readonly Dictionary<Guid, TerminalRecord> _terminalHistory = new();
     private readonly Queue<Guid> _terminalOrder = new();
@@ -103,7 +105,8 @@ public sealed class OutboundGateStateMachine
         IOutboundGateAuditClock auditClock,
         OutboundGateMode mode = OutboundGateMode.Disabled,
         long initialPolicyEpoch = 0,
-        OutboundGateTrustedRuntimeState? trustedRuntime = null)
+        OutboundGateTrustedRuntimeState? trustedRuntime = null,
+        OneTimeGateTicketService? ticketService = null)
     {
         _clock = clock ?? throw new ArgumentNullException(nameof(clock));
         _nonces = nonces ?? throw new ArgumentNullException(nameof(nonces));
@@ -116,6 +119,13 @@ public sealed class OutboundGateStateMachine
         _mode = mode;
         _policyEpoch = initialPolicyEpoch;
         _trustedRuntime = trustedRuntime;
+        _ticketService = mode == OutboundGateMode.Simulation
+            ? ticketService ?? new OneTimeGateTicketService(_clock, _auditClock, _nonces, new HmacSha256BootTicketAuthenticator(trustedRuntime!.BootInstance), initialPolicyEpoch)
+            : ticketService;
+        if (_ticketService is not null
+            && (_ticketService.PolicyEpoch != initialPolicyEpoch
+                || (trustedRuntime is not null && _ticketService.BootInstance != trustedRuntime.BootInstance)))
+            throw new ArgumentException("Ticket service runtime does not match the state-machine runtime.", nameof(ticketService));
     }
 
     public OutboundGateMode Mode => _mode;
@@ -332,6 +342,12 @@ public sealed class OutboundGateStateMachine
 
     public GateTransitionResult ReceiveDecision(UserDecision decision)
     {
+        lock (_transitionSync)
+            return ReceiveDecisionCore(decision);
+    }
+
+    private GateTransitionResult ReceiveDecisionCore(UserDecision decision)
+    {
         ArgumentNullException.ThrowIfNull(decision);
         var context = FindActiveContextForChallenge(decision.ChallengeId);
         if (context.Decision is not null)
@@ -350,7 +366,10 @@ public sealed class OutboundGateStateMachine
         if (decision.Decision == UserDecisionKind.Block)
             return CompleteBlocked(context, "user-blocked-current-flow", now);
 
-        var ticket = IssueTicket(context, now);
+        var issue = IssueTicket(context, now);
+        if (issue.Kind != TicketServiceResultKind.Success || issue.Ticket is null)
+            return FailOpen(context, issue.ReasonCode, now, overflow: issue.CapacityFailure);
+        var ticket = issue.Ticket;
         context.Ticket = ticket;
         context.Phase = ContextPhase.TicketIssued;
         context.PhaseDeadline = ticket.ValidityWindow.Deadline;
@@ -360,6 +379,12 @@ public sealed class OutboundGateStateMachine
 
     public GateTransitionResult RedeemTicket(OneTimeTicket ticket)
     {
+        lock (_transitionSync)
+            return RedeemTicketCore(ticket);
+    }
+
+    private GateTransitionResult RedeemTicketCore(OneTimeTicket ticket)
+    {
         ArgumentNullException.ThrowIfNull(ticket);
         var context = RequireActiveContext(ticket.IntentId, "Ticket");
         var now = RequireClock(_clock.Now());
@@ -367,22 +392,29 @@ public sealed class OutboundGateStateMachine
         {
             if (DeadlineReached(now, context.PhaseDeadline))
                 return RevokeGrant(context, "grant-expired", now);
-            if (TicketMatches(context.Ticket!, ticket))
-                return context.Result with { IsDuplicate = true };
-            throw new InvalidOperationException("A different ticket cannot redeem the same transition.");
+            throw new InvalidOperationException("A ticket cannot be redeemed after its one-time grant was created.");
         }
         RequirePhase(context, ContextPhase.TicketIssued, "Ticket redemption");
-        if (!TicketMatches(context.Ticket!, ticket))
-            throw new InvalidOperationException("Ticket binding does not match the issued ticket.");
         var runtime = RequireTrustedRuntime();
-        if (DeadlineReached(now, context.PhaseDeadline)
-            || ticket.PolicyEpoch != _policyEpoch
-            || ticket.BootInstance != runtime.BootInstance
-            || !ticket.ValidityWindow.Contains(now))
-            return FailOpen(context, "ticket-expired-or-runtime-invalid", now);
-
-        var grantWindow = NewWindow(now, OutboundGateLimits.MaximumGrantDuration);
-        var grant = new EphemeralFlowGrant(1, _nonces.NextNonce(), ticket.TicketId, ticket.IntentId, ticket.Subject, ticket.Destination, ticket.FlowGeneration, ticket.PolicyEpoch, ticket.BootInstance, ticket.GrantMaxBytes, grantWindow);
+        if (DeadlineReached(now, context.PhaseDeadline))
+            return FailOpen(context, "ticket-expired", now);
+        var binding = new TicketAuthorizationBinding(
+            ticket.Version,
+            context.Intent.IntentId,
+            context.Intent.Subject,
+            context.Intent.File,
+            context.Challenge!.Destination,
+            context.Challenge.FlowGeneration,
+            runtime.BootInstance,
+            _policyEpoch,
+            OutboundGateLimits.MaximumGrantBytes,
+            (long)OutboundGateLimits.MaximumGrantDuration.TotalMilliseconds);
+        var redemption = _ticketService!.TryRedeem(ticket, binding);
+        if (redemption.Kind == TicketServiceResultKind.Rejected)
+            throw new InvalidOperationException(redemption.ReasonCode);
+        if (redemption.Kind != TicketServiceResultKind.Success || redemption.Grant is null)
+            return FailOpen(context, redemption.ReasonCode, now, overflow: redemption.ReasonCode.Contains("capacity", StringComparison.Ordinal));
+        var grant = redemption.Grant;
         context.Grant = grant;
         context.Phase = ContextPhase.Granted;
         context.PhaseDeadline = grant.GrantWindow.Deadline;
@@ -392,7 +424,14 @@ public sealed class OutboundGateStateMachine
 
     public IReadOnlyList<GateStatus> ProcessExpired()
     {
+        lock (_transitionSync)
+            return ProcessExpiredCore();
+    }
+
+    private List<GateStatus> ProcessExpiredCore()
+    {
         var now = RequireClock(_clock.Now());
+        _ticketService?.PruneExpired();
         var statuses = new List<GateStatus>();
         foreach (var context in _activeContexts.Values.ToArray())
         {
@@ -407,14 +446,24 @@ public sealed class OutboundGateStateMachine
 
     public IReadOnlyList<GateStatus> HandleServiceRestart(Guid newBootInstance)
     {
-        var runtime = RequireTrustedRuntime();
-        return HandleServiceRestart(new OutboundGateTrustedRuntimeState(newBootInstance, runtime.WfpGeneration, runtime.MinifilterGeneration));
+        lock (_transitionSync)
+        {
+            var runtime = RequireTrustedRuntime();
+            return HandleServiceRestartCore(new OutboundGateTrustedRuntimeState(newBootInstance, runtime.WfpGeneration, runtime.MinifilterGeneration));
+        }
     }
 
     public IReadOnlyList<GateStatus> HandleServiceRestart(OutboundGateTrustedRuntimeState newRuntime)
     {
+        lock (_transitionSync)
+            return HandleServiceRestartCore(newRuntime);
+    }
+
+    private List<GateStatus> HandleServiceRestartCore(OutboundGateTrustedRuntimeState newRuntime)
+    {
         ArgumentNullException.ThrowIfNull(newRuntime);
         var now = RequireClock(_clock.Now());
+        _ticketService?.ResetRuntime(newRuntime.BootInstance, _policyEpoch, new HmacSha256BootTicketAuthenticator(newRuntime.BootInstance));
         _trustedRuntime = newRuntime;
         var statuses = new List<GateStatus>();
         foreach (var context in _activeContexts.Values.ToArray())
@@ -428,11 +477,18 @@ public sealed class OutboundGateStateMachine
 
     public IReadOnlyList<GateStatus> ApplyPolicyEpoch(long policyEpoch)
     {
+        lock (_transitionSync)
+            return ApplyPolicyEpochCore(policyEpoch);
+    }
+
+    private IReadOnlyList<GateStatus> ApplyPolicyEpochCore(long policyEpoch)
+    {
         ArgumentOutOfRangeException.ThrowIfNegative(policyEpoch);
         if (policyEpoch < _policyEpoch)
             throw new ArgumentOutOfRangeException(nameof(policyEpoch), "Policy epoch cannot move backwards.");
         if (policyEpoch == _policyEpoch)
             return Array.Empty<GateStatus>();
+        _ticketService?.ApplyPolicyEpoch(policyEpoch);
         _policyEpoch = policyEpoch;
         var now = RequireClock(_clock.Now());
         var statuses = new List<GateStatus>();
@@ -579,13 +635,29 @@ public sealed class OutboundGateStateMachine
         return alert;
     }
 
-    private OneTimeTicket IssueTicket(Context context, ServiceMonotonicTimestamp now)
+    private TicketIssueResult IssueTicket(Context context, ServiceMonotonicTimestamp now)
     {
-        var validity = NewWindow(now, OutboundGateLimits.MaximumTicketValidity);
-        var auditIssued = AuditUtc(now);
         var runtime = RequireTrustedRuntime();
-        return new OneTimeTicket(1, _nonces.NextNonce(), _nonces.NextNonce(), context.Intent.IntentId, context.Intent.Subject, context.Intent.File, context.Challenge!.Destination, context.Challenge.FlowGeneration, _policyEpoch, runtime.BootInstance, auditIssued, auditIssued.Add(OutboundGateLimits.MaximumTicketValidity), validity, OutboundGateLimits.MaximumGrantBytes, (long)OutboundGateLimits.MaximumGrantDuration.TotalMilliseconds, [1]);
+        var binding = new TicketAuthorizationBinding(
+            context.Intent.Version,
+            context.Intent.IntentId,
+            context.Intent.Subject,
+            context.Intent.File,
+            context.Challenge!.Destination,
+            context.Challenge.FlowGeneration,
+            runtime.BootInstance,
+            _policyEpoch,
+            OutboundGateLimits.MaximumGrantBytes,
+            (long)OutboundGateLimits.MaximumGrantDuration.TotalMilliseconds);
+        return _ticketService!.TryIssue(binding);
     }
+
+    public void Dispose()
+    {
+        lock (_transitionSync)
+            _ticketService?.Dispose();
+    }
+
 
     private GateStatus Status(GateSubject subject, Guid intentId, GateRuntimeState state, string reason, ServiceMonotonicTimestamp now, bool trafficFailedOpen, GateCoverage? coverage = null) =>
         new(1, _mode, state, coverage ?? new GateCoverage(1, GateCoverageFlags.NewTcp), reason, new GateAffectedScope(1, GateAffectedScopeKind.Intent, intentId, subject), AuditUtc(now), now, 0, _overflowCount, trafficFailedOpen);
@@ -650,24 +722,6 @@ public sealed class OutboundGateStateMachine
         && left.CreatedAtUtc == right.CreatedAtUtc
         && left.DecisionWindow == right.DecisionWindow
         && string.Equals(left.LimitationReason, right.LimitationReason, StringComparison.Ordinal);
-
-    private static bool TicketMatches(OneTimeTicket left, OneTimeTicket right) =>
-        left.Version == right.Version
-        && left.TicketId == right.TicketId
-        && left.Nonce == right.Nonce
-        && left.IntentId == right.IntentId
-        && left.Subject.Matches(right.Subject)
-        && left.File == right.File
-        && left.Destination == right.Destination
-        && left.FlowGeneration == right.FlowGeneration
-        && left.PolicyEpoch == right.PolicyEpoch
-        && left.BootInstance == right.BootInstance
-        && left.IssuedAtUtc == right.IssuedAtUtc
-        && left.ExpiresAtUtc == right.ExpiresAtUtc
-        && left.ValidityWindow == right.ValidityWindow
-        && left.GrantMaxBytes == right.GrantMaxBytes
-        && left.GrantMaxDurationMilliseconds == right.GrantMaxDurationMilliseconds
-        && left.AuthenticatorProof.SequenceEqual(right.AuthenticatorProof);
 
     private static bool DeadlineReached(ServiceMonotonicTimestamp now, ServiceMonotonicTimestamp deadline) =>
         !SameClock(now, deadline) || now.ElapsedMilliseconds >= deadline.ElapsedMilliseconds;
