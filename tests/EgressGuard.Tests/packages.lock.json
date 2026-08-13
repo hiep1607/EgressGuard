@@ -450,12 +450,6 @@
       "egressguard.core": {
         "type": "Project"
       },
-      "egressguard.outboundgatesimulator": {
-        "type": "Project",
-        "dependencies": {
-          "EgressGuard.Core": "[1.0.0, )"
-        }
-      },
       "egressguard.persistence": {
         "type": "Project",
         "dependencies": {

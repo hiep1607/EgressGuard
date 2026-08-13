@@ -4,6 +4,5 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\EgressGuard.Core\EgressGuard.Core.csproj" />
-    <InternalsVisibleTo Include="EgressGuard.Tests" />
   </ItemGroup>
 </Project>

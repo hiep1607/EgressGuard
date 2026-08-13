@@ -5,8 +5,9 @@ using System.Net.Sockets;
 using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Security.Principal;
+using System.Text.Json;
+using System.Text.RegularExpressions;
 using EgressGuard.Core;
-using SimulatorProgram = EgressGuard.OutboundGateSimulator.Program;
 using EgressGuard.Persistence;
 using EgressGuard.Protocol;
 using EgressGuard.Service;
@@ -2837,21 +2838,103 @@ internal static class Program
         await TestRestartRaceAsync(sample).ConfigureAwait(false);
     }
 
-    private static Task TestOutboundGateSimulatorAcceptanceAsync()
+    private static async Task TestOutboundGateSimulatorAcceptanceAsync()
     {
-        var suite = SimulatorProgram.RunAcceptanceSuite();
-        AssertEqual(34, suite.Total);
-        AssertEqual(34, suite.Passed);
-        AssertTrue(suite.Scenarios.All(scenario => scenario.Passed), "The simulator acceptance suite contained a failing scenario.");
-        AssertEqual(0, suite.FinalSnapshot.PendingReadCount);
-        AssertEqual(0, suite.FinalSnapshot.HeldFlowCount);
-        AssertEqual(0, suite.FinalSnapshot.ScheduledCount);
-
+        string[] expectedNames =
+        [
+            "disabled-default-zero-state", "happy-new-tcp", "happy-new-udp", "release-requires-full-ack", "completion-requires-exact-binding", "existing-tcp-reconnect-required", "existing-udp-reconnect-required", "existing-quic-reconnect-required", "delay-before-deadline-succeeds", "delay-at-deadline-fails-open", "drop-times-out-deterministically", "minifilter-crash-restart-cleans", "wfp-crash-restart-cleans", "service-restart-cleans", "stale-wfp-generation-rejected", "stale-minifilter-generation-rejected", "pending-read-subject-cap", "pending-read-global-cap", "challenge-subject-cap", "challenge-global-cap", "endpoint-channel-boundaries", "held-flow-entry-boundaries", "held-data-flow-cap", "held-data-global-cap", "scheduler-cap", "fault-plan-cap", "pump-dispatch-budget", "ticket-replay-through-endpoint", "ticket-capacity-through-endpoint", "grant-expiry-and-byte-count", "policy-change-cleans-endpoints", "privacy-metadata-only", "no-wall-clock-or-event-workers", "all-faults-finish-zero-owned-state"
+        ];
         var repositoryRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", ".."));
-        var simulatorSource = File.ReadAllText(Path.Combine(repositoryRoot, "tools", "EgressGuard.OutboundGateSimulator", "Program.cs"));
-        foreach (var forbidden in new[] { "RawPath", "PacketPayload", "FileContent", "byte[]", "typeof(Stream)", "Task.Delay", "Thread.Sleep", "DateTimeOffset.UtcNow" })
-            AssertTrue(!simulatorSource.Contains(forbidden, StringComparison.Ordinal), $"Simulator source contains forbidden data or timing token {forbidden}.");
-        return Task.CompletedTask;
+        var simulatorDirectory = Path.Combine(repositoryRoot, "tools", "EgressGuard.OutboundGateSimulator");
+        var simulatorExecutable = Path.Combine(simulatorDirectory, "bin", "Release", "net8.0-windows", "EgressGuard.OutboundGateSimulator.exe");
+        AssertTrue(File.Exists(simulatorExecutable), "The independently built simulator executable was not found.");
+
+        var disabled = await RunSimulatorAsync(simulatorExecutable).ConfigureAwait(false);
+        AssertEqual(0, disabled.ExitCode);
+        AssertTrue(string.IsNullOrEmpty(disabled.StandardError), "Disabled-default invocation wrote stderr.");
+        using (var disabledJson = JsonDocument.Parse(disabled.StandardOutput))
+        {
+            var root = disabledJson.RootElement;
+            AssertEqual(0, root.GetProperty("Mode").GetInt32());
+            AssertEqual(0, root.GetProperty("OwnedOperationCount").GetInt32());
+            AssertEqual(0, root.GetProperty("CoreActiveContextCount").GetInt32());
+            AssertEqual(0, root.GetProperty("InstalledGrantCount").GetInt32());
+        }
+
+        var firstSuite = await RunSimulatorAsync(simulatorExecutable, "--acceptance-suite", "--json").ConfigureAwait(false);
+        var secondSuite = await RunSimulatorAsync(simulatorExecutable, "--acceptance-suite", "--json").ConfigureAwait(false);
+        AssertEqual(0, firstSuite.ExitCode);
+        AssertEqual(0, secondSuite.ExitCode);
+        AssertTrue(string.IsNullOrEmpty(firstSuite.StandardError) && string.IsNullOrEmpty(secondSuite.StandardError), "Acceptance suite wrote stderr.");
+        AssertEqual(firstSuite.StandardOutput, secondSuite.StandardOutput);
+        using (var suiteJson = JsonDocument.Parse(firstSuite.StandardOutput))
+        {
+            var root = suiteJson.RootElement;
+            AssertEqual(expectedNames.Length, root.GetProperty("Total").GetInt32());
+            AssertEqual(expectedNames.Length, root.GetProperty("Passed").GetInt32());
+            var scenarios = root.GetProperty("Scenarios").EnumerateArray().ToArray();
+            AssertTrue(scenarios.Select(item => item.GetProperty("Name").GetString()).SequenceEqual(expectedNames), "Simulator scenario names/order differ from the 34 locked cases.");
+            AssertTrue(scenarios.All(item => item.GetProperty("Passed").GetBoolean()), "The simulator acceptance suite contained a failing scenario.");
+            var final = root.GetProperty("FinalSnapshot");
+            AssertEqual(0, final.GetProperty("PendingReadCount").GetInt32());
+            AssertEqual(0, final.GetProperty("HeldFlowCount").GetInt32());
+            AssertEqual(0, final.GetProperty("ScheduledCount").GetInt32());
+            AssertEqual(0, final.GetProperty("OwnedOperationCount").GetInt32());
+            AssertEqual(expectedNames.Length, final.GetProperty("AcceptanceResultCount").GetInt32());
+        }
+
+        foreach (var scenarioName in new[] { "happy-new-tcp", "privacy-metadata-only", "all-faults-finish-zero-owned-state" })
+        {
+            var scenario = await RunSimulatorAsync(simulatorExecutable, "--scenario", scenarioName, "--json").ConfigureAwait(false);
+            AssertEqual(0, scenario.ExitCode);
+            AssertTrue(string.IsNullOrEmpty(scenario.StandardError), $"Scenario {scenarioName} wrote stderr.");
+            using var scenarioJson = JsonDocument.Parse(scenario.StandardOutput);
+            AssertEqual(scenarioName, scenarioJson.RootElement.GetProperty("Name").GetString());
+            AssertTrue(scenarioJson.RootElement.GetProperty("Passed").GetBoolean(), $"Scenario {scenarioName} failed.");
+        }
+
+        var invalid = await RunSimulatorAsync(simulatorExecutable, "--invalid").ConfigureAwait(false);
+        AssertEqual(2, invalid.ExitCode);
+        AssertTrue(string.IsNullOrWhiteSpace(invalid.StandardOutput), "Invalid arguments wrote JSON/stdout.");
+        AssertTrue(invalid.StandardError.Contains("Usage:", StringComparison.Ordinal), "Invalid arguments omitted usage stderr.");
+
+        var simulatorSource = File.ReadAllText(Path.Combine(simulatorDirectory, "Program.cs"));
+        foreach (var forbiddenField in new[] { "Payload", "Content", "RawPath", "FilePath", "Packet", "Buffer", "TicketSecret" })
+        {
+            AssertTrue(!Regex.IsMatch(simulatorSource, $@"\b{Regex.Escape(forbiddenField)}\b", RegexOptions.CultureInvariant), $"Simulator source declares forbidden field {forbiddenField}.");
+            AssertTrue(!Regex.IsMatch(firstSuite.StandardOutput, $"\\\"{Regex.Escape(forbiddenField)}\\\"\\s*:", RegexOptions.CultureInvariant), $"Simulator JSON exposes forbidden field {forbiddenField}.");
+        }
+        AssertTrue(!firstSuite.StandardOutput.Contains("AuthenticatorProof", StringComparison.Ordinal), "Simulator JSON exposed ticket proof material.");
+        AssertTrue(!firstSuite.StandardOutput.Contains("SimulationStepResult", StringComparison.Ordinal), "Simulator JSON exposed internal transition results.");
+        AssertTrue(!firstSuite.StandardOutput.Contains("real enforcement", StringComparison.OrdinalIgnoreCase), "Simulator output claimed real enforcement.");
+        AssertTrue(!simulatorSource.Contains("Guid.NewGuid", StringComparison.Ordinal), "Simulator source uses nondeterministic identifiers.");
+        AssertTrue(!simulatorSource.Contains("Task.Delay", StringComparison.Ordinal) && !simulatorSource.Contains("Thread.Sleep", StringComparison.Ordinal) && !simulatorSource.Contains("DateTimeOffset.UtcNow", StringComparison.Ordinal), "Simulator source uses wall-clock scheduling.");
+    }
+
+    private static async Task<(int ExitCode, string StandardOutput, string StandardError)> RunSimulatorAsync(string executable, params string[] arguments)
+    {
+        var startInfo = new ProcessStartInfo(executable)
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+        foreach (var argument in arguments)
+            startInfo.ArgumentList.Add(argument);
+        using var process = Process.Start(startInfo) ?? throw new InvalidOperationException("Unable to start the simulator executable.");
+        var standardOutput = process.StandardOutput.ReadToEndAsync();
+        var standardError = process.StandardError.ReadToEndAsync();
+        try
+        {
+            await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(45)).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            process.Kill(entireProcessTree: true);
+            throw new InvalidOperationException("Simulator executable exceeded the safety timeout.");
+        }
+        return (process.ExitCode, await standardOutput.ConfigureAwait(false), await standardError.ConfigureAwait(false));
     }
 
     private static async Task TestPolicyRaceAsync(OutboundGateSample sample)
