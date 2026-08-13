@@ -6,6 +6,7 @@ using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Security.Principal;
 using EgressGuard.Core;
+using SimulatorProgram = EgressGuard.OutboundGateSimulator.Program;
 using EgressGuard.Persistence;
 using EgressGuard.Protocol;
 using EgressGuard.Service;
@@ -158,6 +159,7 @@ internal static class Program
             ("Phase 5B-03 authenticated ticket fields and grants remain distinct", TestOneTimeTicketAuthenticatedFieldsAsync),
             ("Phase 5B-03 active grant reservations are bounded and expire monotonically", TestOneTimeTicketActiveGrantCapacityAsync),
             ("Phase 5B-03 policy and restart transitions serialize with redemption", TestOneTimeTicketAuthorityRaceAsync),
+            ("Phase 5B-04 deterministic driver simulator acceptance suite", TestOutboundGateSimulatorAcceptanceAsync),
             ("Default UI clients honor configured pipe name", TestConfiguredPipeNameAsync),
             ("File correlation IPC stays compatible and bounded", TestFileCorrelationProtocolAsync),
             ("UI correlation refresh coalesces updates and cancels stale selection", TestUiCorrelationRefreshAsync),
@@ -2833,6 +2835,23 @@ internal static class Program
         var sample = OutboundGateSamples();
         await TestPolicyRaceAsync(sample).ConfigureAwait(false);
         await TestRestartRaceAsync(sample).ConfigureAwait(false);
+    }
+
+    private static Task TestOutboundGateSimulatorAcceptanceAsync()
+    {
+        var suite = SimulatorProgram.RunAcceptanceSuite();
+        AssertEqual(34, suite.Total);
+        AssertEqual(34, suite.Passed);
+        AssertTrue(suite.Scenarios.All(scenario => scenario.Passed), "The simulator acceptance suite contained a failing scenario.");
+        AssertEqual(0, suite.FinalSnapshot.PendingReadCount);
+        AssertEqual(0, suite.FinalSnapshot.HeldFlowCount);
+        AssertEqual(0, suite.FinalSnapshot.ScheduledCount);
+
+        var repositoryRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", ".."));
+        var simulatorSource = File.ReadAllText(Path.Combine(repositoryRoot, "tools", "EgressGuard.OutboundGateSimulator", "Program.cs"));
+        foreach (var forbidden in new[] { "RawPath", "PacketPayload", "FileContent", "byte[]", "typeof(Stream)", "Task.Delay", "Thread.Sleep", "DateTimeOffset.UtcNow" })
+            AssertTrue(!simulatorSource.Contains(forbidden, StringComparison.Ordinal), $"Simulator source contains forbidden data or timing token {forbidden}.");
+        return Task.CompletedTask;
     }
 
     private static async Task TestPolicyRaceAsync(OutboundGateSample sample)

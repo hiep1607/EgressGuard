@@ -9,5 +9,6 @@
     <ProjectReference Include="..\..\src\EgressGuard.Protocol\EgressGuard.Protocol.csproj" />
     <ProjectReference Include="..\..\src\EgressGuard.Service\EgressGuard.Service.csproj" />
     <ProjectReference Include="..\..\src\EgressGuard.UI\EgressGuard.UI.csproj" />
+    <ProjectReference Include="..\..\tools\EgressGuard.OutboundGateSimulator\EgressGuard.OutboundGateSimulator.csproj" />
   </ItemGroup>
 </Project>
