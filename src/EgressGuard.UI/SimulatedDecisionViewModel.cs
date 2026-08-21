@@ -16,6 +16,7 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(3);
     private readonly EgressGuardPipeClient _requestClient;
     private readonly EgressGuardSimulatedDecisionEventClient _eventClient;
+    private readonly bool _ownsRequestClient;
     private readonly CancellationTokenSource _lifetime = new();
     private readonly DispatcherTimer _timer;
     private readonly Dispatcher _dispatcher;
@@ -32,6 +33,7 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
     private string _simulationStatus = "Simulation decision service is disconnected.";
     private string _lastResult = "No Simulation decision has been submitted.";
     private long _lastSequence;
+    private long _queuedSequence;
     private long _selectedPromptTick;
     private bool _simulationEnabled;
     private bool _streamContinuous;
@@ -40,9 +42,18 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
     private Task? _subscriptionTask;
 
     public SimulatedDecisionViewModel(string? pipeName = null)
+        : this(new EgressGuardPipeClient(pipeName), pipeName, ownsRequestClient: true)
     {
-        _requestClient = new EgressGuardPipeClient(pipeName);
+    }
+
+    internal SimulatedDecisionViewModel(
+        EgressGuardPipeClient requestClient,
+        string? pipeName,
+        bool ownsRequestClient = false)
+    {
+        _requestClient = requestClient ?? throw new ArgumentNullException(nameof(requestClient));
         _eventClient = new EgressGuardSimulatedDecisionEventClient(pipeName);
+        _ownsRequestClient = ownsRequestClient;
         _dispatcher = Dispatcher.CurrentDispatcher;
         _timer = new DispatcherTimer(DispatcherPriority.Background)
         {
@@ -52,12 +63,14 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
         _allowOnceCommand = new SimulationCommand(() => SubmitAsync(SimulatedDecisionChoice.AllowOnce), () => CanSubmit(_authorization.CanAllowOnce));
         _rememberCommand = new SimulationCommand(() => SubmitAsync(SimulatedDecisionChoice.RememberFor30Days), () => CanSubmit(_authorization.CanRememberFor30Days));
         _blockCommand = new SimulationCommand(() => SubmitAsync(SimulatedDecisionChoice.BlockCurrent), () => CanSubmit(_authorization.CanBlockCurrent));
-        _revokeCommand = new SimulationCommand(RevokeAsync, () => _streamContinuous && _authorization.CanRevoke && SelectedRule is not null);
+        _revokeCommand = new SimulationCommand(RevokeAsync, () => Volatile.Read(ref _streamContinuous) && _authorization.CanRevoke && SelectedRule is not null);
         _refreshCommand = new SimulationCommand(RefreshAndReconnectAsync, () => !_disposed);
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
     internal event EventHandler? PromptTerminalized;
+    internal EgressGuardPipeClient RequestClient => _requestClient;
+    internal bool OwnsRequestClient => _ownsRequestClient;
 
     public ObservableCollection<SimulatedDecisionPromptProjection> ActivePrompts { get; } = [];
     public ObservableCollection<SimulatedReconnectRequiredProjection> ReconnectNotices { get; } = [];
@@ -178,7 +191,7 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
                 await _eventClient.SubscribeAsync(
                     sequence,
                     OnEventAsync,
-                    () => _streamContinuous = true,
+                    () => MarkStreamContinuous(sequence),
                     cancellationToken).ConfigureAwait(false);
                 throw new EndOfStreamException("Simulation decision event stream ended.");
             }
@@ -188,7 +201,7 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
             }
             catch (Exception exception) when (exception is IOException or InvalidDataException or TimeoutException or UnauthorizedAccessException or ObjectDisposedException)
             {
-                _streamContinuous = false;
+                DisableContinuity();
                 await _dispatcher.InvokeAsync(() =>
                 {
                     SimulationStatus = "Simulation event continuity lost. Commands are disabled while resyncing.";
@@ -209,18 +222,29 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
 
     private ValueTask OnEventAsync(SimulatedDecisionEventMessage streamEvent)
     {
+        var continuityLost = false;
         lock (_eventSync)
         {
-            if (_eventBuffer.Count >= EventBufferCapacity)
+            var appliedSequence = Interlocked.Read(ref _lastSequence);
+            if (streamEvent.Sequence <= appliedSequence)
+                return ValueTask.CompletedTask;
+            if (streamEvent.RequiresResync
+                || streamEvent.Sequence != _queuedSequence + 1
+                || _eventBuffer.Count >= EventBufferCapacity)
             {
                 _eventBuffer.Clear();
                 _bufferOverflowed = true;
-                _streamContinuous = false;
-                return ValueTask.CompletedTask;
+                _queuedSequence = appliedSequence;
+                continuityLost = true;
             }
-            if (!_bufferOverflowed)
+            else if (!_bufferOverflowed)
+            {
                 _eventBuffer.Enqueue(streamEvent);
+                _queuedSequence = streamEvent.Sequence;
+            }
         }
+        if (continuityLost)
+            DisableContinuity();
         return ValueTask.CompletedTask;
     }
 
@@ -235,7 +259,7 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
         }
         catch (Exception exception)
         {
-            _streamContinuous = false;
+            DisableContinuity();
             LastResult = exception.Message;
             RaiseCommandState();
         }
@@ -250,6 +274,7 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
             {
                 _bufferOverflowed = false;
                 _eventBuffer.Clear();
+                _queuedSequence = Interlocked.Read(ref _lastSequence);
                 return true;
             }
             while (batch.Count < MaximumBatchSize && _eventBuffer.TryDequeue(out var item))
@@ -260,7 +285,10 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
         foreach (var streamEvent in batch)
         {
             if (streamEvent.RequiresResync || streamEvent.Sequence != sequence + 1)
+            {
+                DisableContinuity();
                 return true;
+            }
             ApplyEvent(streamEvent);
             sequence = streamEvent.Sequence;
         }
@@ -297,7 +325,7 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
                 OnPropertyChanged(nameof(CriticalFailOpenBanner));
                 break;
             case SimulatedDecisionEventKind.ResyncRequired:
-                _streamContinuous = false;
+                DisableContinuity();
                 break;
         }
         if (SelectedPrompt is not null)
@@ -309,7 +337,7 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
 
     private async Task RefreshAndReconnectAsync()
     {
-        _streamContinuous = false;
+        DisableContinuity();
         RaiseCommandState();
         try
         {
@@ -359,6 +387,7 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
         {
             _eventBuffer.Clear();
             _bufferOverflowed = false;
+            _queuedSequence = snapshot.Sequence;
         }
         SelectedPrompt = ActivePrompts.FirstOrDefault();
         SelectedRule = RememberedRules.FirstOrDefault();
@@ -393,7 +422,7 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
         catch (Exception exception) when (exception is IOException or InvalidDataException or TimeoutException or UnauthorizedAccessException or ObjectDisposedException)
         {
             LastResult = exception.Message;
-            _streamContinuous = false;
+            DisableContinuity();
         }
         catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
         {
@@ -425,7 +454,7 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
         catch (Exception exception) when (exception is IOException or InvalidDataException or TimeoutException or UnauthorizedAccessException or ObjectDisposedException)
         {
             LastResult = exception.Message;
-            _streamContinuous = false;
+            DisableContinuity();
         }
         catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
         {
@@ -437,7 +466,7 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
     }
 
     private bool CanSubmit(bool authorized) => _simulationEnabled
-        && _streamContinuous
+        && Volatile.Read(ref _streamContinuous)
         && authorized
         && SelectedPrompt?.State == EgressGuard.Core.GateRuntimeState.AwaitingDecision
         && SelectedPrompt.Expiry.AcceptingDecisions
@@ -500,6 +529,26 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
         _refreshCommand.RaiseCanExecuteChanged();
     }
 
+    private void MarkStreamContinuous(long subscribedSequence)
+    {
+        lock (_eventSync)
+        {
+            if (_bufferOverflowed
+                || Interlocked.Read(ref _lastSequence) != subscribedSequence
+                || _queuedSequence != subscribedSequence)
+                return;
+            Volatile.Write(ref _streamContinuous, true);
+        }
+        _ = _dispatcher.BeginInvoke(RaiseCommandState);
+    }
+
+    private void DisableContinuity()
+    {
+        Volatile.Write(ref _streamContinuous, false);
+        if (!_dispatcher.HasShutdownStarted)
+            _ = _dispatcher.BeginInvoke(RaiseCommandState);
+    }
+
     private static void Replace<T>(ObservableCollection<T> target, IEnumerable<T> values)
     {
         target.Clear();
@@ -556,7 +605,8 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
         _timer.Stop();
         _lifetime.Cancel();
         await _eventClient.DisposeAsync().ConfigureAwait(false);
-        await _requestClient.DisposeAsync().ConfigureAwait(false);
+        if (_ownsRequestClient)
+            await _requestClient.DisposeAsync().ConfigureAwait(false);
         if (_subscriptionTask is not null)
         {
             try

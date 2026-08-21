@@ -21,6 +21,9 @@ public sealed partial class PipeServer : BackgroundService
     private readonly FirewallRuleCreateCoordinator _firewallRuleCreateCoordinator;
     private readonly SimulatedDecisionCoordinator _simulatedDecisionCoordinator;
     private readonly bool _ownsSimulatedDecisionCoordinator;
+    private readonly SemaphoreSlim _pipeSlots = new(
+        SimulatedDecisionProtocolLimits.PipeInstanceCapacity,
+        SimulatedDecisionProtocolLimits.PipeInstanceCapacity);
     private int _activePipeCount;
 
     internal int ActivePipeCount => Volatile.Read(ref _activePipeCount);
@@ -76,20 +79,35 @@ public sealed partial class PipeServer : BackgroundService
         var pipeName = ProtocolConstants.ResolvePipeName();
         while (!stoppingToken.IsCancellationRequested)
         {
-            var pipe = CreateServerPipe(pipeName);
             try
             {
-                await pipe.WaitForConnectionAsync(stoppingToken).ConfigureAwait(false);
-                _ = HandleClientAsync(pipe, stoppingToken);
+                await _pipeSlots.WaitAsync(stoppingToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
-                await pipe.DisposeAsync().ConfigureAwait(false);
+                break;
+            }
+
+            NamedPipeServerStream? pipe = null;
+            try
+            {
+                pipe = CreateServerPipe(pipeName);
+                await pipe.WaitForConnectionAsync(stoppingToken).ConfigureAwait(false);
+                _ = HandleClientAsync(pipe, stoppingToken);
+                pipe = null;
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                if (pipe is not null)
+                    await pipe.DisposeAsync().ConfigureAwait(false);
+                _pipeSlots.Release();
                 break;
             }
             catch (Exception exception)
             {
-                await pipe.DisposeAsync().ConfigureAwait(false);
+                if (pipe is not null)
+                    await pipe.DisposeAsync().ConfigureAwait(false);
+                _pipeSlots.Release();
                 LogAcceptFailed(_logger, exception);
             }
         }
@@ -102,7 +120,7 @@ public sealed partial class PipeServer : BackgroundService
         return NamedPipeServerStreamAcl.Create(
             pipeName,
             PipeDirection.InOut,
-            8,
+            SimulatedDecisionProtocolLimits.PipeInstanceCapacity,
             PipeTransmissionMode.Byte,
             PipeOptions.Asynchronous | PipeOptions.WriteThrough,
             0,
@@ -202,6 +220,7 @@ public sealed partial class PipeServer : BackgroundService
         finally
         {
             Interlocked.Decrement(ref _activePipeCount);
+            _pipeSlots.Release();
         }
     }
 
@@ -381,18 +400,30 @@ public sealed partial class PipeServer : BackgroundService
         var subscriptionRequest = request.ReadPayload<SubscribeEventsMessage>();
         await using var subscription = _eventHub.Subscribe(subscriptionRequest.LastSequence);
         await MessageFraming.WriteAsync(pipe, Success(request, "Event subscription active."), cancellationToken).ConfigureAwait(false);
-        await foreach (var streamEvent in subscription.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+        using var streamCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var disconnectMonitor = MonitorSubscriptionDisconnectAsync(pipe, streamCancellation);
+        try
         {
-            var messageType = streamEvent.Kind switch
+            await foreach (var streamEvent in subscription.Reader.ReadAllAsync(streamCancellation.Token).ConfigureAwait(false))
             {
-                StreamEventKind.AlertRaised => MessageTypes.AlertRaised,
-                StreamEventKind.ServiceStatusChanged => MessageTypes.ServiceStatusChanged,
-                _ => MessageTypes.FlowObserved
-            };
-            await MessageFraming.WriteAsync(
-                pipe,
-                MessageEnvelope.Create(messageType, streamEvent),
-                cancellationToken).ConfigureAwait(false);
+                var messageType = streamEvent.Kind switch
+                {
+                    StreamEventKind.AlertRaised => MessageTypes.AlertRaised,
+                    StreamEventKind.ServiceStatusChanged => MessageTypes.ServiceStatusChanged,
+                    _ => MessageTypes.FlowObserved
+                };
+                await MessageFraming.WriteAsync(
+                    pipe,
+                    MessageEnvelope.Create(messageType, streamEvent),
+                    streamCancellation.Token).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (streamCancellation.IsCancellationRequested)
+        {
+        }
+        finally
+        {
+            await StopDisconnectMonitorAsync(streamCancellation, disconnectMonitor).ConfigureAwait(false);
         }
     }
 
@@ -405,12 +436,57 @@ public sealed partial class PipeServer : BackgroundService
         var subscriptionRequest = request.ReadPayload<SubscribeSimulatedDecisionEventsMessage>();
         await using var subscription = _simulatedDecisionCoordinator.Subscribe(caller, subscriptionRequest.LastSequence);
         await MessageFraming.WriteAsync(pipe, Success(request, "Simulation decision event subscription active."), cancellationToken).ConfigureAwait(false);
-        await foreach (var streamEvent in subscription.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+        using var streamCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var disconnectMonitor = MonitorSubscriptionDisconnectAsync(pipe, streamCancellation);
+        try
         {
-            await MessageFraming.WriteAsync(
-                pipe,
-                MessageEnvelope.Create(OutboundGateMessageTypes.SimulatedDecisionEvent, streamEvent),
-                cancellationToken).ConfigureAwait(false);
+            await foreach (var streamEvent in subscription.Reader.ReadAllAsync(streamCancellation.Token).ConfigureAwait(false))
+            {
+                await MessageFraming.WriteAsync(
+                    pipe,
+                    MessageEnvelope.Create(OutboundGateMessageTypes.SimulatedDecisionEvent, streamEvent),
+                    streamCancellation.Token).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (streamCancellation.IsCancellationRequested)
+        {
+        }
+        finally
+        {
+            await StopDisconnectMonitorAsync(streamCancellation, disconnectMonitor).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task MonitorSubscriptionDisconnectAsync(
+        NamedPipeServerStream pipe,
+        CancellationTokenSource streamCancellation)
+    {
+        try
+        {
+            _ = await MessageFraming.ReadAsync(pipe, streamCancellation.Token).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is IOException or EndOfStreamException or OperationCanceledException or ObjectDisposedException)
+        {
+        }
+        finally
+        {
+            if (!streamCancellation.IsCancellationRequested)
+                await streamCancellation.CancelAsync().ConfigureAwait(false);
+        }
+    }
+
+    private static async Task StopDisconnectMonitorAsync(
+        CancellationTokenSource streamCancellation,
+        Task disconnectMonitor)
+    {
+        if (!streamCancellation.IsCancellationRequested)
+            await streamCancellation.CancelAsync().ConfigureAwait(false);
+        try
+        {
+            await disconnectMonitor.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
         }
     }
 

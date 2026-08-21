@@ -278,7 +278,9 @@ internal sealed class SimulatedDecisionCoordinator : IDisposable
             ThrowIfDisposed();
             if (!_authority.IsEnabled)
                 throw Error(SimulatedDecisionReasonCodes.Disabled, "The Simulation decision authority is disabled.");
-            return _eventHub.Subscribe(lastSequence, _sequence);
+            if (lastSequence != _sequence)
+                throw Error(SimulatedDecisionReasonCodes.ResyncRequired, "The Simulation decision event sequence requires a snapshot resync.");
+            return _eventHub.Subscribe();
         }
     }
 
@@ -392,6 +394,9 @@ internal sealed class SimulatedDecisionCoordinator : IDisposable
                     throw Error(retained.ErrorCode, retained.ErrorMessage!);
                 return Duplicate(retained.DecisionResult!);
             }
+
+            if (request.Choice == SimulatedDecisionChoice.RememberFor30Days)
+                SweepExpiredRules();
 
             if (!_prompts.TryGetValue(request.ChallengeId, out var context))
                 throw Error(SimulatedDecisionReasonCodes.ChallengeNotFound, "The Simulation challenge is not active or retained.");
@@ -544,7 +549,6 @@ internal sealed class SimulatedDecisionCoordinator : IDisposable
             return exactResult;
         }
 
-        SweepExpiredRules();
         if (_rules.Count >= SimulatedDecisionProtocolLimits.MaximumRememberedRuleCount
             || _rules.Values.Count(rule => string.Equals(rule.ApplicationIdentity, context.Challenge.Subject.ApplicationIdentity, StringComparison.Ordinal))
                 >= SimulatedDecisionProtocolLimits.MaximumRememberedRulesPerApplication)

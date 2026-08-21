@@ -106,7 +106,7 @@
                 <ListBox.ItemTemplate>
                     <DataTemplate>
                         <TextBlock TextWrapping="Wrap" Margin="4">
-                            <Run Text="{Binding AuditTimeUtc}"/><Run Text=" · "/><Run Text="{Binding State}"/><Run Text=" · "/><Run Text="{Binding ReasonCode}"/>
+                            <Run Text="{Binding AuditTimeUtc, Mode=OneWay}"/><Run Text=" · "/><Run Text="{Binding State, Mode=OneWay}"/><Run Text=" · "/><Run Text="{Binding ReasonCode, Mode=OneWay}"/>
                         </TextBlock>
                     </DataTemplate>
                 </ListBox.ItemTemplate>

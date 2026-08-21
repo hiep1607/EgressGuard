@@ -12,8 +12,9 @@ namespace EgressGuard.UI;
 
 public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposable
 {
-    private readonly EgressGuardPipeClient _client = new();
-    private readonly EgressGuardEventClient _eventClient = new();
+    private readonly EgressGuardPipeClient _client;
+    private readonly EgressGuardEventClient _eventClient;
+    private readonly bool _ownsRequestClient;
     private readonly SequencedEventBuffer _eventBuffer = new(4096);
     private readonly CancellationTokenSource _lifetimeCancellation = new();
     private readonly DispatcherTimer _batchTimer;
@@ -37,9 +38,21 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     private string _databasePath = "Unavailable until connected";
     private string _fileSensorStatus = "File correlation status unavailable";
     private bool _fileCorrelationEnabled;
+    private bool _disposed;
 
     public MainWindowViewModel()
+        : this(new EgressGuardPipeClient(), pipeName: null, ownsRequestClient: true)
     {
+    }
+
+    internal MainWindowViewModel(
+        EgressGuardPipeClient requestClient,
+        string? pipeName,
+        bool ownsRequestClient = false)
+    {
+        _client = requestClient ?? throw new ArgumentNullException(nameof(requestClient));
+        _eventClient = new EgressGuardEventClient(pipeName);
+        _ownsRequestClient = ownsRequestClient;
         FlowView = CollectionViewSource.GetDefaultView(Flows);
         FlowView.Filter = FilterFlow;
         _batchTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(_refreshIntervalMilliseconds) };
@@ -61,6 +74,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
+    internal EgressGuardPipeClient RequestClient => _client;
+    internal bool OwnsRequestClient => _ownsRequestClient;
     public ObservableCollection<FlowRow> Flows { get; } = [];
     public ObservableCollection<FirewallRule> Rules { get; } = [];
     public ObservableCollection<SecurityAlert> Alerts { get; } = [];
@@ -416,11 +431,15 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
 
     public async ValueTask DisposeAsync()
     {
+        if (_disposed)
+            return;
+        _disposed = true;
         _batchTimer.Stop();
         _lifetimeCancellation.Cancel();
         await _correlationRefresh.DisposeAsync().ConfigureAwait(false);
         await _eventClient.DisposeAsync().ConfigureAwait(false);
-        await _client.DisposeAsync().ConfigureAwait(false);
+        if (_ownsRequestClient)
+            await _client.DisposeAsync().ConfigureAwait(false);
         if (_subscriptionTask is not null)
         {
             try { await _subscriptionTask.ConfigureAwait(false); }

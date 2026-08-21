@@ -3,20 +3,20 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:local="clr-namespace:EgressGuard.UI"
         Title="EgressGuard" Width="1180" Height="640" MinWidth="640" MinHeight="480"
-        Background="{StaticResource BackgroundBrush}" WindowStartupLocation="CenterScreen">
+        Background="{DynamicResource BackgroundBrush}" WindowStartupLocation="CenterScreen">
     <Grid Margin="18">
         <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
         <DockPanel Margin="0,0,0,14">
             <StackPanel>
-                <TextBlock Text="EGRESSGUARD" FontSize="24" FontWeight="SemiBold" Foreground="{StaticResource AccentBrush}" />
+                <TextBlock Text="EGRESSGUARD" FontSize="24" FontWeight="SemiBold" Foreground="{DynamicResource AccentBrush}" />
                 <TextBlock Text="Local outbound visibility and control" Foreground="#8FA4B8" />
             </StackPanel>
-            <Border DockPanel.Dock="Right" Background="{StaticResource PanelBrush}" CornerRadius="6" Padding="12,7">
+            <Border DockPanel.Dock="Right" Background="{DynamicResource PanelBrush}" CornerRadius="6" Padding="12,7">
                 <TextBlock Text="{Binding ServiceStatus}" />
             </Border>
         </DockPanel>
 
-        <TabControl Grid.Row="1" Background="{StaticResource PanelBrush}" Foreground="#E8EEF5">
+        <TabControl Grid.Row="1" Background="{DynamicResource PanelBrush}" Foreground="#E8EEF5">
             <TabItem Header="Dashboard">
                 <Grid Margin="18">
                     <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>

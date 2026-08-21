@@ -29,10 +29,8 @@ internal sealed class SimulatedDecisionEventHub : IDisposable
         }
     }
 
-    internal SimulatedDecisionEventSubscription Subscribe(long lastSequence, long currentSequence)
+    internal SimulatedDecisionEventSubscription Subscribe()
     {
-        ArgumentOutOfRangeException.ThrowIfNegative(lastSequence);
-        ArgumentOutOfRangeException.ThrowIfNegative(currentSequence);
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -47,12 +45,6 @@ internal sealed class SimulatedDecisionEventHub : IDisposable
             var id = Guid.NewGuid();
             var subscriber = new Subscriber();
             _subscribers.Add(id, subscriber);
-            if (lastSequence != currentSequence)
-            {
-                subscriber.NeedsResync = true;
-                subscriber.Channel.Writer.TryWrite(Resync(currentSequence));
-            }
-
             return new SimulatedDecisionEventSubscription(id, subscriber.Channel.Reader, this);
         }
     }
@@ -122,7 +114,7 @@ internal sealed class SimulatedDecisionEventHub : IDisposable
             new BoundedChannelOptions(SubscriberChannelCapacity)
             {
                 FullMode = BoundedChannelFullMode.Wait,
-                SingleReader = true,
+                SingleReader = false,
                 SingleWriter = false
             });
 
