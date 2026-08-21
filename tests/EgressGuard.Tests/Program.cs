@@ -1985,7 +1985,7 @@ internal static class Program
         var maximumLimitation = new string('m', OutboundGateLimits.MaximumReasonLength);
         var maximumPresentationText = new string('p', OutboundGateLimits.MaximumReasonLength);
         var maximumFile = new SimulatedFileVersionProjection(1, maximumVersionToken, OutboundGateLimits.MaximumFileSizeBytes, maximumTime, maximumTime, long.MaxValue);
-        var maximumDestination = new SimulatedDestinationProjection(1, IPAddress.Parse("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), IpVersion.IPv6, 65535, TransportProtocol.Tcp, maximumDomain, DomainEvidenceProvenance.DnsObservation, maximumTime);
+        var maximumDestination = new SimulatedDestinationProjection(1, IPAddress.Parse("febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff%4294967295"), IpVersion.IPv6, 65535, TransportProtocol.Tcp, maximumDomain, DomainEvidenceProvenance.DnsObservation, maximumTime);
         var maximumAuthorization = new SimulatedDecisionAuthorizationProjection(false, false, false, false, false, maximumReason);
         var maximumExpiry = new SimulatedDecisionExpiryProjection(1, SimulatedDecisionProtocolLimits.MaximumDecisionRemainingMilliseconds, maximumTime, true);
         var groupSubjects = Enumerable.Range(0, SimulatedDecisionProtocolLimits.MaximumPromptCount / SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject)
@@ -2019,6 +2019,8 @@ internal static class Program
         AssertTrue(snapshot.SimulationEnabled, "A maximum snapshot with active prompts must keep simulation enabled.");
         AssertTrue(!snapshot.Authorization.CanView && !snapshot.Authorization.CanAllowOnce && !snapshot.Authorization.CanRememberFor30Days && !snapshot.Authorization.CanBlockCurrent && !snapshot.Authorization.CanRevoke, "Maximum authorization booleans must use the longer valid false representation.");
         AssertTrue(prompts.All(prompt => prompt.FileVersion.Usn is not null && prompt.Destination.DomainEvidence is not null && prompt.Destination.DomainObservedAtUtc is not null && prompt.LimitationReason?.Length == OutboundGateLimits.MaximumReasonLength), "Maximum prompts did not populate every optional bounded field.");
+        AssertEqual(4_294_967_295L, maximumDestination.Address.ScopeId);
+        AssertEqual(50, maximumDestination.Address.ToString().Length);
         AssertTrue(reconnectNotices.All(notice => notice.LimitationReason?.Length == OutboundGateLimits.MaximumReasonLength && notice.Revision >= long.MaxValue - SimulatedDecisionProtocolLimits.MaximumReconnectNoticeCount), "Maximum reconnect notices did not populate optional text and 19-digit revisions.");
         AssertTrue(statuses.All(status => !status.TrafficFailedOpen && status.State == GateRuntimeState.Blocked && status.IntentId is not null && status.Revision >= long.MaxValue - SimulatedDecisionProtocolLimits.MaximumStatusCount), "Maximum statuses must use a compatible non-fail-open state, present IntentId and 19-digit revisions.");
         AssertTrue(alerts.All(alert => !alert.TrafficFailedOpen && alert.PresentationText.Length == OutboundGateLimits.MaximumReasonLength && alert.IntentId is not null && alert.Subject is not null && alert.Revision >= long.MaxValue - SimulatedDecisionProtocolLimits.MaximumCriticalAlertCount), "Maximum alerts must use non-fail-open semantics, maximum presentation text, present optionals and 19-digit revisions.");
@@ -2026,7 +2028,7 @@ internal static class Program
         _ = new SimulatedDecisionAuthorizationProjection(true, false, false, false, false, allowedWireCharacters);
         AssertEqual(allowedWireCharacters.Length + 2, JsonSerializer.SerializeToUtf8Bytes(allowedWireCharacters, JsonDefaults.Options).Length);
         Console.WriteLine($"INFO  Phase 5B-05 maximum snapshot envelope bytes: {serialized.Length}");
-        AssertEqual(906_624, serialized.Length);
+        AssertEqual(908_824, serialized.Length);
         AssertTrue(serialized.Length < ProtocolConstants.MaximumMessageBytes, "Maximum simulated-decision snapshot exceeded the framing limit.");
         AssertTrue(ProtocolConstants.MaximumMessageBytes - serialized.Length >= 131_072, "Maximum simulated-decision snapshot did not retain the locked 128 KiB reserve.");
         return Task.CompletedTask;
