@@ -15,6 +15,14 @@ public static class OutboundGateMessageTypes
     public const string EphemeralFlowGrant = "Phase5B.EphemeralFlowGrant";
     public const string GateStatus = "Phase5B.GateStatus";
     public const string CriticalAlert = "Phase5B.CriticalAlert";
+    public const string GetSimulatedDecisionSnapshot = "Phase5B.Ui.GetSnapshot";
+    public const string SimulatedDecisionSnapshot = "Phase5B.Ui.Snapshot";
+    public const string SubscribeSimulatedDecisionEvents = "Phase5B.Ui.Subscribe";
+    public const string SimulatedDecisionEvent = "Phase5B.Ui.Event";
+    public const string SubmitSimulatedDecision = "Phase5B.Ui.SubmitDecision";
+    public const string SimulatedDecisionResult = "Phase5B.Ui.DecisionResult";
+    public const string RevokeSimulatedRememberedRule = "Phase5B.Ui.RevokeRememberedRule";
+    public const string SimulatedRuleMutationResult = "Phase5B.Ui.RuleMutationResult";
 }
 
 public sealed record FileReadIntentMessage(FileReadIntent Intent);
