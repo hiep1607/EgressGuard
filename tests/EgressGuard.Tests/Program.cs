@@ -1983,6 +1983,7 @@ internal static class Program
         var maximumDomain = MaximumCanonicalDomain();
         var maximumReason = new string('r', OutboundGateLimits.MaximumReasonLength);
         var maximumLimitation = new string('m', OutboundGateLimits.MaximumReasonLength);
+        var maximumPresentationText = new string('p', OutboundGateLimits.MaximumReasonLength);
         var maximumFile = new SimulatedFileVersionProjection(1, maximumVersionToken, OutboundGateLimits.MaximumFileSizeBytes, maximumTime, maximumTime, long.MaxValue);
         var maximumDestination = new SimulatedDestinationProjection(1, IPAddress.Parse("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), IpVersion.IPv6, 65535, TransportProtocol.Tcp, maximumDomain, DomainEvidenceProvenance.DnsObservation, maximumTime);
         var maximumAuthorization = new SimulatedDecisionAuthorizationProjection(false, false, false, false, false, maximumReason);
@@ -1998,13 +1999,13 @@ internal static class Program
             .Select(index => CreateRule(maximumTime, maximumFile, maximumDestination, index, MaximumApplicationIdentity(100 + index / SimulatedDecisionProtocolLimits.MaximumRememberedRulesPerApplication), maximumLabel, maximumReason))
             .ToArray();
         var reconnectNotices = Enumerable.Range(0, SimulatedDecisionProtocolLimits.MaximumReconnectNoticeCount)
-            .Select(index => new SimulatedReconnectRequiredProjection(1, StableGuid("41000000", index + 1), maximumLabel, maximumFile, MaximumApplicationIdentity(200 + index), groupSubjects[index % groupSubjects.Length], maximumDestination, maximumReason, maximumLimitation, maximumTime, index))
+            .Select(index => new SimulatedReconnectRequiredProjection(1, StableGuid("41000000", index + 1), maximumLabel, maximumFile, MaximumApplicationIdentity(200 + index), groupSubjects[index % groupSubjects.Length], maximumDestination, maximumReason, maximumLimitation, maximumTime, MaximumOrderedRevision(index, SimulatedDecisionProtocolLimits.MaximumReconnectNoticeCount)))
             .ToArray();
         var statuses = Enumerable.Range(0, SimulatedDecisionProtocolLimits.MaximumStatusCount)
-            .Select(index => new SimulatedGateStatusProjection(1, StableGuid("51000000", index + 1), GateRuntimeState.FailedOpen, maximumReason, maximumTime, true, OutboundGateLimits.MaximumDiagnosticCounter, OutboundGateLimits.MaximumDiagnosticCounter, index))
+            .Select(index => new SimulatedGateStatusProjection(1, StableGuid("51000000", index + 1), GateRuntimeState.Blocked, maximumReason, maximumTime, false, OutboundGateLimits.MaximumDiagnosticCounter, OutboundGateLimits.MaximumDiagnosticCounter, MaximumOrderedRevision(index, SimulatedDecisionProtocolLimits.MaximumStatusCount)))
             .ToArray();
         var alerts = Enumerable.Range(0, SimulatedDecisionProtocolLimits.MaximumCriticalAlertCount)
-            .Select(index => new SimulatedCriticalAlertProjection(1, StableGuid("61000000", index + 1), StableGuid("62000000", index + 1), groupSubjects[index % groupSubjects.Length], maximumReason, maximumTime, OutboundGateLimits.MaximumDiagnosticCounter, OutboundGateLimits.MaximumDiagnosticCounter, true, SimulatedDecisionProtocolLimits.FailOpenPresentationText, index))
+            .Select(index => new SimulatedCriticalAlertProjection(1, StableGuid("61000000", index + 1), StableGuid("62000000", index + 1), groupSubjects[index % groupSubjects.Length], maximumReason, maximumTime, OutboundGateLimits.MaximumDiagnosticCounter, OutboundGateLimits.MaximumDiagnosticCounter, false, maximumPresentationText, MaximumOrderedRevision(index, SimulatedDecisionProtocolLimits.MaximumCriticalAlertCount)))
             .ToArray();
         var capacity = new SimulatedDecisionCapacitySnapshot(2, 2, 8, 8, 2, 2, 256, 256);
         var snapshot = new SimulatedDecisionSnapshotMessage(1, long.MaxValue, true, maximumAuthorization, prompts, reconnectNotices, rules, statuses, alerts, capacity, new SimulatedDecisionCounterSnapshot(OutboundGateLimits.MaximumDiagnosticCounter, OutboundGateLimits.MaximumDiagnosticCounter, OutboundGateLimits.MaximumDiagnosticCounter, OutboundGateLimits.MaximumDiagnosticCounter));
@@ -2015,11 +2016,17 @@ internal static class Program
         AssertEqual(SimulatedDecisionProtocolLimits.MaximumReconnectNoticeCount, reconnectNotices.Length);
         AssertEqual(SimulatedDecisionProtocolLimits.MaximumStatusCount, statuses.Length);
         AssertEqual(SimulatedDecisionProtocolLimits.MaximumCriticalAlertCount, alerts.Length);
+        AssertTrue(snapshot.SimulationEnabled, "A maximum snapshot with active prompts must keep simulation enabled.");
+        AssertTrue(!snapshot.Authorization.CanView && !snapshot.Authorization.CanAllowOnce && !snapshot.Authorization.CanRememberFor30Days && !snapshot.Authorization.CanBlockCurrent && !snapshot.Authorization.CanRevoke, "Maximum authorization booleans must use the longer valid false representation.");
+        AssertTrue(prompts.All(prompt => prompt.FileVersion.Usn is not null && prompt.Destination.DomainEvidence is not null && prompt.Destination.DomainObservedAtUtc is not null && prompt.LimitationReason?.Length == OutboundGateLimits.MaximumReasonLength), "Maximum prompts did not populate every optional bounded field.");
+        AssertTrue(reconnectNotices.All(notice => notice.LimitationReason?.Length == OutboundGateLimits.MaximumReasonLength && notice.Revision >= long.MaxValue - SimulatedDecisionProtocolLimits.MaximumReconnectNoticeCount), "Maximum reconnect notices did not populate optional text and 19-digit revisions.");
+        AssertTrue(statuses.All(status => !status.TrafficFailedOpen && status.State == GateRuntimeState.Blocked && status.IntentId is not null && status.Revision >= long.MaxValue - SimulatedDecisionProtocolLimits.MaximumStatusCount), "Maximum statuses must use a compatible non-fail-open state, present IntentId and 19-digit revisions.");
+        AssertTrue(alerts.All(alert => !alert.TrafficFailedOpen && alert.PresentationText.Length == OutboundGateLimits.MaximumReasonLength && alert.IntentId is not null && alert.Subject is not null && alert.Revision >= long.MaxValue - SimulatedDecisionProtocolLimits.MaximumCriticalAlertCount), "Maximum alerts must use non-fail-open semantics, maximum presentation text, present optionals and 19-digit revisions.");
         const string allowedWireCharacters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ._():-";
         _ = new SimulatedDecisionAuthorizationProjection(true, false, false, false, false, allowedWireCharacters);
         AssertEqual(allowedWireCharacters.Length + 2, JsonSerializer.SerializeToUtf8Bytes(allowedWireCharacters, JsonDefaults.Options).Length);
         Console.WriteLine($"INFO  Phase 5B-05 maximum snapshot envelope bytes: {serialized.Length}");
-        AssertEqual(898_812, serialized.Length);
+        AssertEqual(906_624, serialized.Length);
         AssertTrue(serialized.Length < ProtocolConstants.MaximumMessageBytes, "Maximum simulated-decision snapshot exceeded the framing limit.");
         AssertTrue(ProtocolConstants.MaximumMessageBytes - serialized.Length >= 131_072, "Maximum simulated-decision snapshot did not retain the locked 128 KiB reserve.");
         return Task.CompletedTask;
@@ -2054,6 +2061,8 @@ internal static class Program
     }
 
     private static string MaximumCanonicalDomain() => string.Join('.', new string('d', 63), new string('d', 63), new string('d', 63), new string('d', 61));
+
+    private static long MaximumOrderedRevision(int index, int count) => long.MaxValue - count + 1 + index;
 
     private static SimulatedProtocolSample CreateSimulatedProtocolSample()
     {
