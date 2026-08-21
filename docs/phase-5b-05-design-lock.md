@@ -1072,14 +1072,18 @@ histories at 64 reproduces the exact **1,133,429 UTF-8 byte**
 framing maximum by **84,853 bytes**.
 
 The re-lock proof is deliberately stronger than that reproducer. It also uses
-10-digit positive PIDs, the longest canonical IPv6 address, seven fractional
+10-digit positive PIDs, the longest canonical scoped IPv6 wire value, seven fractional
 UTC timestamp digits, present optional fields, maximum accepted numeric values,
 and the longest serialized semantically valid boolean/conditional-string
 choices. The first re-lock calculation still undercounted the latter category:
 it used fail-open Critical Alerts with the fixed 71-code-unit presentation text,
 fail-open statuses with the shorter `true` literal, and small history revisions.
 The corrected proof is measured against the unchanged contracts at Protocol
-head `6014c48365dcdc1a574b5226fa6fc06ecb8c1d7c`.
+head `6014c48365dcdc1a574b5226fa6fc06ecb8c1d7c`. Final self-review also found
+that the 39-code-unit unscoped IPv6 fixture was not the largest accepted wire
+representation: a semantically valid link-local IPv6 address with the maximum
+10-digit scope ID serializes to 50 code units. That scoped address appears in
+all 200 prompt, rule, and reconnect destination projections at the locked caps.
 
 The corrected fixture keeps `SimulationEnabled == true` because active prompts
 cannot semantically coexist with disabled simulation. Exact-group collateral
@@ -1089,17 +1093,17 @@ the compatible `Blocked`/`TrafficFailedOpen == false` combination. Critical
 Alerts are non-fail-open and carry the maximum 256-code-unit ASCII
 `PresentationText`. Reconnect, status, and alert revisions are increasing
 19-digit values immediately below and including `long.MaxValue`. Under that
-canonical maximum, the old 64/64/64 snapshot is **1,284,376 bytes**, exceeding
-the frame by **235,800 bytes**.
+canonical maximum, the old 64/64/64 snapshot is **1,287,192 bytes**, exceeding
+the frame by **238,616 bytes**.
 
 Exact single-collection envelopes identify the source of the overflow:
 
 | Snapshot population | Exact UTF-8 bytes | Marginal bytes over the 1,117-byte empty envelope |
 |---|---:|---:|
 | Empty collections | 1,117 | 0 |
-| 128 maximum prompts, each group containing 32 members | 617,820 | 616,703 |
-| 64 maximum remembered rules | 102,748 | 101,631 |
-| 64 maximum reconnect notices | 298,908 | 297,791 |
+| 128 maximum prompts, each group containing 32 members | 619,228 | 618,111 |
+| 64 maximum remembered rules | 103,452 | 102,335 |
+| 64 maximum reconnect notices | 299,612 | 298,495 |
 | 64 maximum non-fail-open statuses | 33,884 | 32,767 |
 | 64 maximum non-fail-open Critical Alerts with 256-code-unit presentation text | 235,484 | 234,367 |
 
@@ -1107,17 +1111,17 @@ The exact candidate measurements are:
 
 | Reconnect / status / alert caps | Exact UTF-8 bytes | Margin to 1 MiB | Decision |
 |---|---:|---:|---|
-| 64 / 64 / 64 | 1,284,376 | -235,800 | Rejected; corrected canonical maximum overflow. |
-| 32 / 64 / 32 | 1,018,296 | 30,280 | Rejected; insufficient locked margin. |
-| 16 / 64 / 32 | 943,848 | 104,728 | Rejected; below the required 128 KiB margin. |
-| 16 / 64 / 24 | 914,552 | 134,024 | Safe, but rejected in favor of retaining more Critical Alerts. |
-| **8 / 64 / 32** | **906,624** | **141,952** | **Locked; preserves 32 Critical Alerts and all 64 statuses.** |
-| 16 / 16 / 32 | 919,272 | 129,304 | Rejected; 1,768 bytes below the required reserve. |
-| 16 / 64 / 16 | 885,256 | 163,320 | Safe, but rejected because it retains fewer Critical Alerts. |
+| 64 / 64 / 64 | 1,287,192 | -238,616 | Rejected; corrected canonical maximum overflow. |
+| 32 / 64 / 32 | 1,020,760 | 27,816 | Rejected; insufficient locked margin. |
+| 16 / 64 / 32 | 946,136 | 102,440 | Rejected; below the required 128 KiB margin. |
+| 16 / 64 / 24 | 916,840 | 131,736 | Safe by only 664 bytes, but rejected in favor of retaining more Critical Alerts and reserve. |
+| **8 / 64 / 32** | **908,824** | **139,752** | **Locked; preserves 32 Critical Alerts and all 64 statuses.** |
+| 16 / 16 / 32 | 921,560 | 127,016 | Rejected; 4,056 bytes below the required reserve. |
+| 16 / 64 / 16 | 887,544 | 161,032 | Safe, but rejected because it retains fewer Critical Alerts. |
 
 The framing reserve is locked at **at least 128 KiB (131,072 bytes)** for this
-exact version-1 shape. The selected bounds leave **141,952 bytes**
-(approximately 13.54% of the frame), 10,880 bytes more than that reserve, while
+exact version-1 shape. The selected bounds leave **139,752 bytes**
+(approximately 13.33% of the frame), 8,680 bytes more than that reserve, while
 preserving every safety/authority bound, 32 Critical Alerts, and the full 64-row
 status history. Reconnect notices are terminal presentation history only; the
 live event stream still publishes each notice and oldest-first eviction at eight
@@ -1135,7 +1139,7 @@ scope, prompt capacity, and rule capacity are unchanged.
 
 Acceptance serializes this exact maximum synthetic snapshot through
 `JsonDefaults.Options`, verifies every permitted alphabet character is emitted
-as one unescaped UTF-8 byte, asserts the exact **906,624-byte** envelope, and
+as one unescaped UTF-8 byte, asserts the exact **908,824-byte** envelope, and
 requires at least the locked 131,072-byte reserve below
 `ProtocolConstants.MaximumMessageBytes`. Any contract field, fixed literal,
 encoder, alphabet, collection cap, or envelope-shape change requires a new exact
@@ -1438,7 +1442,7 @@ or display-specific assumptions.
 | `sim-ui-rule-id-exact-reuse-at-registry-cap` | With the registry count at 256, an exact live-rule match is checked first, reuses its RuleId/revision through ordinary `ReceiveDecision`, takes no nonce or slot, and leaves registry count and PolicyEpoch unchanged. |
 | `sim-ui-rule-id-promotion-count-stable` | A new-rule success takes one nonce, creates one pending entry, receives `PolicyEpochAccepted == true`, and promotes that same entry to active; registry count is baseline + 1 before and after promotion, including when later current-ticket issuance fails open. |
 | `sim-ui-rule-id-tombstone-lifecycle` | Independently revoke, expire, file-version-invalidate, and policy-invalidate an active rule; each transition changes that exact registry entry to a tombstone without changing registry count, retains it through strictly less than five monotonic minutes, removes it at deadline equality, and never evicts another active or unexpired entry. |
-| `sim-ui-bounds-and-framing` | Preserve 4/exact-`GateSubject` prompts (ordinal application identity plus structural process/group) and 128/global prompts; cap+1 is rejected without live eviction. Rules stop at 8/application and 64/global; the combined pending + active + retained-tombstone RuleId registry remains 256 with five-minute tombstone retention. Snapshot histories stop at 8 reconnect, 64 status, and 32 Critical Alert rows. Construct every bounded variable string at its maximum code-unit length from the locked JSON-safe ASCII alphabet (label 96; VersionToken/ApplicationIdentity 128; domain 253; reason/limitation/presentation 256), every group at 32 exact members, and every collection at its cap. Use 10-digit positive PIDs, the longest canonical IPv6 address, seven fractional UTC timestamp digits, present optional fields, maximum accepted numeric values including increasing 19-digit history revisions, and the longest semantically valid boolean/conditional-string choices. Active prompts require `SimulationEnabled == true`; authorization booleans are all `false`; statuses are `Blocked` with `TrafficFailedOpen == false`; Critical Alerts are non-fail-open with 256-code-unit `PresentationText`; exact-group and prompt-expiry booleans retain their required values. Serialize the real `Phase5B.Ui.Snapshot` envelope with `JsonDefaults.Options`; assert every permitted alphabet character remains one unescaped UTF-8 byte, exact size is 906,624 bytes, size is below 1 MiB, and the exact 141,952-byte margin is at least the locked 131,072-byte reserve. A non-ASCII/unescaped-alphabet case must be constructor-rejected rather than admitted into the snapshot. |
+| `sim-ui-bounds-and-framing` | Preserve 4/exact-`GateSubject` prompts (ordinal application identity plus structural process/group) and 128/global prompts; cap+1 is rejected without live eviction. Rules stop at 8/application and 64/global; the combined pending + active + retained-tombstone RuleId registry remains 256 with five-minute tombstone retention. Snapshot histories stop at 8 reconnect, 64 status, and 32 Critical Alert rows. Construct every bounded variable string at its maximum code-unit length from the locked JSON-safe ASCII alphabet (label 96; VersionToken/ApplicationIdentity 128; domain 253; reason/limitation/presentation 256), every group at 32 exact members, and every collection at its cap. Use 10-digit positive PIDs, the 50-code-unit canonical link-local IPv6 address with maximum 10-digit scope ID, seven fractional UTC timestamp digits, present optional fields, maximum accepted numeric values including increasing 19-digit history revisions, and the longest semantically valid boolean/conditional-string choices. Active prompts require `SimulationEnabled == true`; authorization booleans are all `false`; statuses are `Blocked` with `TrafficFailedOpen == false`; Critical Alerts are non-fail-open with 256-code-unit `PresentationText`; exact-group and prompt-expiry booleans retain their required values. Serialize the real `Phase5B.Ui.Snapshot` envelope with `JsonDefaults.Options`; assert every permitted alphabet character remains one unescaped UTF-8 byte, exact size is 908,824 bytes, size is below 1 MiB, and the exact 139,752-byte margin is at least the locked 131,072-byte reserve. A non-ASCII/unescaped-alphabet case must be constructor-rejected rather than admitted into the snapshot. |
 | `sim-ui-pipe-subscriber-capacity` | Two full UI sessions use 6/8 pipe instances; the third decision subscriber is rejected with `sim-ui-subscriber-capacity-exhausted` and clean close, two live subscribers remain, and a normal request succeeds afterward. |
 | `sim-ui-small-window-dpi` | MainWindow and every tab remain reachable at the new 640 × 480 DIP minimum; deterministic 100/150/200% viewport models preserve wrapping, scrolling, focus, and reachable simulation commands. |
 | `sim-ui-keyboard-screen-reader` | Required AutomationIds, accessible names/help/live regions, tab order, invoke peers, and terminal focus behavior pass without coordinate clicks. |
@@ -1559,7 +1563,7 @@ Stop implementation and report a DESIGN BLOCKER if any of these becomes true:
 - Testing: real framing/PipeServer path, deterministic authority/clock, one STA
   Dispatcher, no coordinate click/display dependency, hard timeout/cleanup.
 - Framing: version/1 MiB unchanged; JSON-safe ASCII projection strings plus
-  8/64/32 presentation histories produce the exact 906,624-byte maximum
+  8/64/32 presentation histories produce the exact 908,824-byte maximum
   snapshot and preserve the locked 131,072-byte minimum reserve without
   weakening prompt, group, rule, registry, subscriber, or authority bounds.
 - Scope: documentation-only now; later allowed files are explicit; 5B-06 is not
