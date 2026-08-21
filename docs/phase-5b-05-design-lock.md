@@ -84,6 +84,20 @@ synthetic redacted basename and extension; it contains no directory. A missing o
 invalid label cannot enable `Remember for 30 days` and is a stop condition for
 the fixture that produced it.
 
+Every variable string projected onto the Phase 5B-05 wire is canonical
+single-byte JSON-safe ASCII. The exact permitted alphabet is letters, digits,
+space, period, underscore, colon, hyphen, and parentheses
+(`[A-Za-z0-9 ._():-]`). Domain evidence uses its narrower canonical ASCII
+DNS/A-label syntax; a redacted label also retains the stricter path checks above.
+The fixed collateral warning and fail-open presentation text remain their exact
+frozen literals. Non-ASCII source labels are represented by a synthetic ASCII
+redacted label, and internationalized domains are represented by their canonical
+IDNA A-label. UI localization belongs in trusted UI resources selected by stable
+reason codes, not in arbitrary wire text. This restriction keeps every permitted
+variable code unit to one UTF-8 byte with no `System.Text.Json` escaping; changing
+the alphabet, encoder, or a fixed literal requires a new framing proof and design
+re-lock.
+
 The Service retains the full `FileVersionIdentity` for exact matching. The UI
 receives only a safe display selector: the opaque metadata `VersionToken`, size,
 last-write/change audit times, and optional USN. `VolumeId` and `FileId` are not
@@ -450,13 +464,19 @@ Prompt invariants are:
 - `RedactedFileLabel` satisfies the 96-code-unit/path-separator rule above.
 - `VersionToken` and `ApplicationIdentity` are 1 through 128 code units;
   limitation/reason fields use the existing 256-code-unit bound; domain evidence
-  uses 253.
+  uses 253. Every variable string also satisfies the canonical JSON-safe ASCII
+  alphabet above; constructor validation rejects any other code unit before the
+  DTO can enter a snapshot or event.
 - Exact-process scope contains only `PrimaryProcess`, no group ID, no collateral
   warning, and `HasCollateralScope == false`.
 - Exact-group scope has a non-empty group ID, 2 through 32 unique canonical exact
   process generations including the primary process, `HasCollateralScope ==
   true`, and the fixed warning: `This decision affects the displayed browser
   process group and may delay unrelated activity in that group.`
+- The 4-prompt cap groups by the complete exact `GateSubject`: ordinal
+  `ApplicationIdentity` plus the structural subject projection (`Kind`, primary
+  process, optional group ID, ordered exact members, collateral flag, and fixed
+  warning). Collection reference identity never participates.
 - `ExistingFlow` is always `false` for a decision prompt in Phase 5B. Existing
   multiplexed flows never receive a fabricated challenge.
 - Only `AwaitingDecision` has `Expiry.AcceptingDecisions == true` and remaining
@@ -633,6 +653,26 @@ public sealed record SimulatedRuleMutationResultMessage(
     bool IsDuplicate,
     long Revision);
 ```
+
+The snapshot shape is unchanged by the framing re-lock. Its constructor and the
+Service/UI stores enforce these exact collection maxima: 128 active prompts, 8
+reconnect notices, 64 remembered rules, 64 recent statuses, and 32 Critical
+Alerts. The corresponding expected Protocol constants are:
+
+```csharp
+MaximumPromptCount = 128;
+MaximumPromptsPerSubject = 4;
+MaximumReconnectNoticeCount = 8;
+MaximumRememberedRuleCount = 64;
+MaximumRememberedRulesPerApplication = 8;
+MaximumStatusCount = 64;
+MaximumCriticalAlertCount = 32;
+MaximumGroupMembers = 32;
+```
+
+`MaximumReconnectNoticeCount` and `MaximumCriticalAlertCount` are presentation
+snapshot/history bounds only. They do not reduce Core authority, active prompt,
+remembered-rule, RuleId-registry, or authoritative Critical Alert retention.
 
 `SimulatedDecisionEventMessage` one-of validation rejects an event whose
 populated member does not match its kind. All sequences/revisions are
@@ -1003,28 +1043,90 @@ New 5B-05 bounds are:
 
 | Resource | Hard cap |
 |---|---:|
-| Service active prompt projections | 4 per subject; 128 global |
+| Service active prompt projections | 4 per exact `GateSubject`, including ordinal `ApplicationIdentity`; 128 global |
 | Service trusted intent/challenge joins | 128 global |
 | Remembered simulation rules | 8 per application; 64 global |
 | Decision terminal receipt dedupe | 256 global; five-minute monotonic retention |
 | RuleId registry entries: pending + active + retained tombstone | 256 global across all states; five-minute monotonic tombstone retention; expired-tombstone-only admission cleanup; pending, active, and unexpired tombstone entries are never evicted |
-| Reconnect-required presentation history | 64 terminal notices |
+| Reconnect-required presentation history | 8 terminal notices |
 | Recent gate-status presentation history | 64 terminal/current rows |
-| Critical-alert presentation history | 64 terminal alerts; Core/Service authoritative history remains 256 |
+| Critical-alert presentation history | 32 terminal alerts; Core/Service authoritative history remains 256 |
 | Decision event subscribers | 2 connections; existing PipeServer remains 8 total instances |
 | Per-subscriber event channel | 256 events |
 | UI sequenced decision event buffer | 512 events |
 | UI event dispatch per 250 ms batch | 128 events |
 | UI active prompts | 128 rows |
 | UI remembered rules | 64 rows |
-| UI reconnect/status/alert presentation | 64 rows for each kind |
+| UI reconnect/status/alert presentation | 8 reconnect rows, 64 status rows, and 32 Critical Alert rows |
 | Exact group members in one projection | 32 |
 
-The 64-rule global cap is intentionally lower than the 1 MiB framing limit and
-keeps a worst-case snapshot containing 128 prompts with 32-member scopes,
-64 rules, and bounded status/alert histories testably below the frame maximum.
-Acceptance serializes the maximum synthetic snapshot and requires it to remain
-below `ProtocolConstants.MaximumMessageBytes`.
+### Snapshot framing re-lock evidence
+
+The previous 64/64/64 reconnect/status/alert presentation caps were disproven
+against Protocol head `dcbda0c071896d79b93a554158cc986f3ba03abc`.
+The confirmed fixture with every bounded variable string at its maximum
+code-unit length, 128 prompts split four per exact subject, 32 exact members in
+every group, 64 rules split eight per application, and all three presentation
+histories at 64 reproduces the exact **1,133,429 UTF-8 byte**
+`Phase5B.Ui.Snapshot` envelope. That exceeds the unchanged 1,048,576-byte
+framing maximum by **84,853 bytes**.
+
+The re-lock proof is deliberately stronger than that reproducer. It also uses
+10-digit positive PIDs, the longest canonical IPv6 address, seven fractional
+UTC timestamp digits, present optional fields, maximum accepted numeric values,
+and the longest serialized valid boolean choices. Under that canonical maximum,
+the old 64/64/64 snapshot is **1,269,114 bytes**, exceeding the frame by
+**220,538 bytes**.
+
+Exact single-collection envelopes identify the source of the overflow:
+
+| Snapshot population | Exact UTF-8 bytes | Marginal bytes over the 1,117-byte empty envelope |
+|---|---:|---:|
+| Empty collections | 1,117 | 0 |
+| 128 maximum prompts, each group containing 32 members | 617,820 | 616,703 |
+| 64 maximum remembered rules | 102,748 | 101,631 |
+| 64 maximum reconnect notices | 297,810 | 296,693 |
+| 64 maximum statuses | 32,722 | 31,605 |
+| 64 maximum Critical Alerts | 222,482 | 221,365 |
+
+The exact candidate measurements are:
+
+| Reconnect / status / alert caps | Exact UTF-8 bytes | Margin to 1 MiB | Decision |
+|---|---:|---:|---|
+| 64 / 64 / 64 | 1,269,114 | -220,538 | Rejected; stronger canonical maximum overflow. |
+| 32 / 64 / 32 | 1,010,074 | 38,502 | Rejected; insufficient locked margin. |
+| 16 / 64 / 32 | 935,898 | 112,678 | Rejected; below the required 128 KiB margin. |
+| 16 / 64 / 24 | 908,226 | 140,350 | Safe, but rejected in favor of retaining more Critical Alerts. |
+| **8 / 64 / 32** | **898,812** | **149,764** | **Locked; preserves 32 Critical Alerts and all 64 statuses.** |
+| 16 / 16 / 32 | 912,186 | 136,390 | Safe, but rejected because reducing status history is unnecessary. |
+| 16 / 64 / 16 | 880,554 | 168,022 | Safe, but rejected because it retains fewer Critical Alerts. |
+
+The framing reserve is locked at **at least 128 KiB (131,072 bytes)** for this
+exact version-1 shape. The selected bounds leave **149,764 bytes**
+(approximately 14.28% of the frame), 18,692 bytes more than that reserve, while
+preserving every safety/authority bound, 32 Critical Alerts, and the full 64-row
+status history. Reconnect notices are terminal presentation history only; the
+live event stream still publishes each notice and oldest-first eviction at eight
+never changes authority or a decision outcome.
+
+History reduction alone is not a proof if arbitrary Unicode remains legal under
+code-unit-only validation. Repeating valid `U+0800` code units makes
+`System.Text.Json` emit six-byte `\uXXXX` escapes: prompts alone become
+1,261,143 bytes, the old full snapshot becomes 2,634,869 bytes, and even the
+earlier 32/64/32 history candidate becomes 2,189,397 bytes. The canonical
+JSON-safe ASCII alphabet above is therefore part of the framing bound, not an
+optional UI policy. The trade-off is deliberate: localized presentation text is produced by
+the UI from stable reason codes, non-ASCII filenames use synthetic redacted
+labels, and internationalized domains use IDNA A-labels. Authority identity,
+scope, prompt capacity, and rule capacity are unchanged.
+
+Acceptance serializes this exact maximum synthetic snapshot through
+`JsonDefaults.Options`, verifies every permitted alphabet character is emitted
+as one unescaped UTF-8 byte, asserts the exact **898,812-byte** envelope, and
+requires at least the locked 131,072-byte reserve below
+`ProtocolConstants.MaximumMessageBytes`. Any contract field, fixed literal,
+encoder, alphabet, collection cap, or envelope-shape change requires a new exact
+measurement and design re-lock; the framing limit is never raised implicitly.
 
 The Named Pipe instance budget is frozen independently of the decision-event
 channel cap: one full UI session uses at most one request connection, one
@@ -1242,6 +1344,9 @@ Acceptance must prove:
 - serialized prompt/snapshot/event/result output contains no `VolumeId`, `FileId`,
   caller SID, full executable path, ticket/grant, proof bytes, or raw path;
 - redacted labels reject directory separators, drive prefixes, and controls;
+- every variable projection string rejects code units outside the locked
+  JSON-safe ASCII alphabet; non-ASCII labels are synthetic-redacted and
+  internationalized domains are IDNA A-labels before DTO construction;
 - file-version tokens are described only as metadata selectors, never content
   hashes;
 - UI copy contains no “upload blocked”, “upload prevented”, “file protected”, or
@@ -1320,7 +1425,7 @@ or display-specific assumptions.
 | `sim-ui-rule-id-exact-reuse-at-registry-cap` | With the registry count at 256, an exact live-rule match is checked first, reuses its RuleId/revision through ordinary `ReceiveDecision`, takes no nonce or slot, and leaves registry count and PolicyEpoch unchanged. |
 | `sim-ui-rule-id-promotion-count-stable` | A new-rule success takes one nonce, creates one pending entry, receives `PolicyEpochAccepted == true`, and promotes that same entry to active; registry count is baseline + 1 before and after promotion, including when later current-ticket issuance fails open. |
 | `sim-ui-rule-id-tombstone-lifecycle` | Independently revoke, expire, file-version-invalidate, and policy-invalidate an active rule; each transition changes that exact registry entry to a tombstone without changing registry count, retains it through strictly less than five monotonic minutes, removes it at deadline equality, and never evicts another active or unexpired entry. |
-| `sim-ui-bounds-and-framing` | 4/subject and 128/global prompts preserved; cap+1 rejected without live eviction; rules stop at 8/application/64 global; the combined pending + active + retained-tombstone RuleId registry is bounded at 256 with five-minute tombstone retention; maximum snapshot stays below 1 MiB. |
+| `sim-ui-bounds-and-framing` | Preserve 4/exact-`GateSubject` prompts (ordinal application identity plus structural process/group) and 128/global prompts; cap+1 is rejected without live eviction. Rules stop at 8/application and 64/global; the combined pending + active + retained-tombstone RuleId registry remains 256 with five-minute tombstone retention. Snapshot histories stop at 8 reconnect, 64 status, and 32 Critical Alert rows. Construct every bounded variable string at its maximum code-unit length from the locked JSON-safe ASCII alphabet (label 96; VersionToken/ApplicationIdentity 128; domain 253; reason/limitation 256), every group at 32 exact members, and every collection at its cap. Use 10-digit positive PIDs, the longest canonical IPv6 address, seven fractional UTC timestamp digits, present optional fields, maximum accepted numeric values, the longest serialized valid boolean choices, and every fixed literal at its exact value. Serialize the real `Phase5B.Ui.Snapshot` envelope with `JsonDefaults.Options`; assert every permitted alphabet character remains one unescaped UTF-8 byte, exact size is 898,812 bytes, size is below 1 MiB, and the exact 149,764-byte margin is at least the locked 131,072-byte reserve. A non-ASCII/unescaped-alphabet case must be constructor-rejected rather than admitted into the snapshot. |
 | `sim-ui-pipe-subscriber-capacity` | Two full UI sessions use 6/8 pipe instances; the third decision subscriber is rejected with `sim-ui-subscriber-capacity-exhausted` and clean close, two live subscribers remain, and a normal request succeeds afterward. |
 | `sim-ui-small-window-dpi` | MainWindow and every tab remain reachable at the new 640 × 480 DIP minimum; deterministic 100/150/200% viewport models preserve wrapping, scrolling, focus, and reachable simulation commands. |
 | `sim-ui-keyboard-screen-reader` | Required AutomationIds, accessible names/help/live regions, tab order, invoke peers, and terminal focus behavior pass without coordinate clicks. |
@@ -1382,6 +1487,9 @@ Stop implementation and report a DESIGN BLOCKER if any of these becomes true:
 
 - a redacted label and full file-version context cannot be supplied together by
   a trusted in-process source without raw path/content;
+- a trusted projection cannot canonicalize every variable wire string into the
+  locked JSON-safe ASCII alphabet without changing authority selectors; do not
+  admit arbitrary Unicode or relax the 128 KiB framing reserve;
 - the Service cannot retain the trusted intent/challenge join and would require
   the UI to construct exact persistent scope;
 - UI input can supply caller, time, nonce, decision ID, persistent selector,
@@ -1437,6 +1545,10 @@ Stop implementation and report a DESIGN BLOCKER if any of these becomes true:
   Block is current-only and never firewall persistence.
 - Testing: real framing/PipeServer path, deterministic authority/clock, one STA
   Dispatcher, no coordinate click/display dependency, hard timeout/cleanup.
+- Framing: version/1 MiB unchanged; JSON-safe ASCII projection strings plus
+  8/64/32 presentation histories produce the exact 898,812-byte maximum
+  snapshot and preserve the locked 131,072-byte minimum reserve without
+  weakening prompt, group, rule, registry, subscriber, or authority bounds.
 - Scope: documentation-only now; later allowed files are explicit; 5B-06 is not
   started.
 
