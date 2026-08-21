@@ -1,0 +1,91 @@
+# Phase 5B-05 implementation evidence
+
+## Scope and lineage
+
+- Implementation branch: `feature/phase-5b-05-end-to-end`.
+- Exact parent: Protocol PR #12 head `403d16c58194a3508ef031545ebdcbccb3e7cadf`.
+- Locked design reviewed from PR #9 head `70b884a41e85b00e0e815ab0ab1d85487b34425e`.
+- Core prerequisite remains PR #10 head `150d7ee21e18ee879187394198932b8a43e3a4bb`.
+- Production registration uses `DisabledSimulatedDecisionAuthority`; no IPC or environment switch enables the trusted test authority.
+- No Core, persistence, Windows/firewall, simulator, project, lock, configuration, workflow, or design-lock file is changed.
+
+## Delivered behavior
+
+The Service now owns trusted intent/challenge joins, redacted prompt projections,
+RAM-only remembered rules, receipts, the bounded RuleId registry, snapshot
+construction, and stable result/error translation. The UI sends only the locked
+request DTOs. It cannot supply caller identity, time, nonce, scope, ticket, grant,
+raw path, or file content. Caller authorization is taken from the impersonated
+Named Pipe identity.
+
+New rules use the approved atomic persistent-decision transition. Exact live-rule
+reuse uses ordinary `AlwaysAllow` at the current epoch. Rule and current-traffic
+outcomes remain independent, including committed-rule/current-traffic fail-open.
+The event hub is bounded and non-blocking, has two subscribers, emits a resync
+marker on continuity loss, and leaves two request/reconnect pipe instances
+reserved within the fixed 8-instance budget.
+
+The WPF surface is one lifecycle-owned, scrollable Simulation tab. It uses one
+shared 250 ms presentation timer, drains at most 128 events per tick, restores
+focus after terminalization, and exposes the locked Automation IDs, names, help
+text, and polite/assertive live regions. It makes no real-enforcement claim.
+
+## Acceptance matrix evidence
+
+Each locked row maps one-to-one to a deterministic test with the same name:
+
+| Acceptance row | Evidence exercised |
+|---|---|
+| `sim-ui-disabled-default` | Production Disabled snapshot, zero owned authority, disabled commands. |
+| `sim-ui-projection-exact-and-redacted` | Trusted join and exact projection; hidden selectors absent. |
+| `sim-ui-allow-once` | Service-built nonce/audit/caller, one authority call, no rule/ticket/grant DTO. |
+| `sim-ui-remember-scope-preview` | Preview equals canonical projected file/application/destination/protocol selector. |
+| `sim-ui-remember-policy-transaction` | One epoch advance, old-context invalidation, selected transition retained. |
+| `sim-ui-rule-id-collision` | One empty/colliding candidate, no retry/Core/epoch mutation, one diagnostic. |
+| `sim-ui-remember-rule-committed-ticket-failed-open` | Remembered and failed-open outcomes coexist. |
+| `sim-ui-remember-and-auto-match` | Exact ordinary-decision reuse at current epoch; selector mismatch prompts. |
+| `sim-ui-revoke` | Exact RuleId/revision, stale conflict non-mutating, replay idempotent. |
+| `sim-ui-file-mutation-invalidates` | Trusted version mutation removes rule and advances epoch once. |
+| `sim-ui-policy-epoch-invalidates` | Rules, prompts, and authority state invalidate together. |
+| `sim-ui-block-current-only` | Current flow terminates without remembered deny/firewall state. |
+| `sim-ui-timeout-at-equality` | Equality is terminal fail-open and exact replay is idempotent. |
+| `sim-ui-reconnect-required` | Distinct TCP, UDP, and QUIC notices have no challenge/buttons. |
+| `sim-ui-critical-fail-open` | Stable reason/counter and fail-open presentation evidence. |
+| `sim-ui-exact-duplicate` | Original receipt returns with `IsDuplicate`; authority is not called again. |
+| `sim-ui-conflicting-replay` | Different terminal choice returns conflict without mutation. |
+| `sim-ui-caller-forgery-rejected` | Non-admin rejected; DTO/handshake cannot supply authority fields. |
+| `sim-ui-disconnect-reconnect-resync` | Gap, overflow, disconnect, snapshot replace, exact sequence resume. |
+| `sim-ui-projection-capacity-recovery` | Independent non-zero owner snapshots become proven all-zero before stable alert/counter. |
+| `sim-ui-rule-id-prevalidation-rollback` | Pending entry rolls back to baseline; malformed authority result disables reconciliation. |
+| `sim-ui-rule-id-registry-capacity` | 256-entry refusal preserves prompt/state and emits one non-fail-open diagnostic. |
+| `sim-ui-rule-id-exact-reuse-at-registry-cap` | Exact reuse takes neither RuleId nonce nor slot and does not advance epoch. |
+| `sim-ui-rule-id-promotion-count-stable` | One pending entry promotes in place, including traffic fail-open. |
+| `sim-ui-rule-id-tombstone-lifecycle` | Tombstone retention and equality expiry preserve registry invariants. |
+| `sim-ui-bounds-and-framing` | All locked maxima serialize to exactly 908,824 UTF-8 bytes. |
+| `sim-ui-pipe-subscriber-capacity` | Real PipeServer: two full sessions use 6/8; third subscriber rejected; request still succeeds. |
+| `sim-ui-small-window-dpi` | 640x480 DIP at 100/150/200% remains wrapped, scrollable, reachable. |
+| `sim-ui-keyboard-screen-reader` | Real STA WPF tree, IDs, peers, tab/reverse-tab, live regions, terminal focus. |
+| `sim-ui-privacy-scan` | Reflection, source, and serialized JSON reject prohibited data/types. |
+| `sim-ui-zero-false-enforcement-claims` | Source/rendered copy says Simulation and makes no upload-blocked claim. |
+| `sim-ui-cleanup-zero-owned-state` | Authority, Coordinator, pipes, subscribers, WPF lifecycle end at zero. |
+
+The canonical maximum snapshot envelope is **908,824 UTF-8 bytes**, leaving
+**139,752 bytes** below the unchanged 1,048,576-byte framing limit. This exceeds
+the locked 131,072-byte reserve by 8,680 bytes.
+
+## Local validation
+
+The final pre-commit validation ran the locked commands on Windows with the
+Release configuration. All **140/140** deterministic tests passed, including the
+real local-Administrator PipeServer branch (`6/8` instances). Restore and format
+verification passed; Release build completed with zero warnings and zero errors;
+the transitive vulnerability scan reported no vulnerable package; and
+`git diff --check` passed. GitHub `workflow_dispatch` evidence is recorded in the
+Draft PR checks and final implementation handoff.
+
+## Review posture
+
+This implementation remains Simulation-only and the PR remains Draft. It is not
+a merge verdict. A different Sol High reviewer must inspect the actual diff,
+local evidence, framing proof, ownership cleanup, and GitHub CI result before the
+stack may advance.
