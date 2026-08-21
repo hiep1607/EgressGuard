@@ -1781,18 +1781,30 @@ internal static class Program
         var observedAt = sample.Now.ToOffset(TimeSpan.FromHours(2));
         var observedDomain = new SimulatedDestinationProjection(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, "localhost", DomainEvidenceProvenance.DnsObservation, observedAt);
         AssertEqual(sample.Now, observedDomain.DomainObservedAtUtc);
+        _ = new SimulatedDestinationProjection(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, "xn--mnich-kva.example", DomainEvidenceProvenance.DnsObservation, sample.Now);
         AssertThrows<ArgumentException>(() => _ = new SimulatedDestinationProjection(1, IPAddress.IPv6Loopback, IpVersion.IPv6, 443, TransportProtocol.Tcp, null, DomainEvidenceProvenance.None, sample.Now));
         AssertThrows<ArgumentException>(() => _ = new SimulatedDestinationProjection(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, "localhost", DomainEvidenceProvenance.None, sample.Now));
         AssertThrows<ArgumentException>(() => _ = new SimulatedDestinationProjection(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, "localhost", DomainEvidenceProvenance.DnsObservation, null));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDestinationProjection(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, "m\u0800nich.example", DomainEvidenceProvenance.DnsObservation, sample.Now));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDestinationProjection(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, "MUNICH.example", DomainEvidenceProvenance.DnsObservation, sample.Now));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDestinationProjection(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, "bad_label.example", DomainEvidenceProvenance.DnsObservation, sample.Now));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDestinationProjection(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, $"{new string('a', 64)}.example", DomainEvidenceProvenance.DnsObservation, sample.Now));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDestinationProjection(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, "empty..label", DomainEvidenceProvenance.DnsObservation, sample.Now));
 
         AssertThrows<JsonException>(() => _ = JsonSerializer.Deserialize<GetSimulatedDecisionSnapshotMessage>("{\"version\":1,\"caller\":\"test\"}", JsonDefaults.Options));
+        AssertThrows<JsonException>(() => _ = JsonSerializer.Deserialize<GetSimulatedDecisionSnapshotMessage>("{\"version\":1,\"time\":\"2026-01-01T00:00:00Z\"}", JsonDefaults.Options));
         AssertThrows<JsonException>(() => _ = JsonSerializer.Deserialize<SubscribeSimulatedDecisionEventsMessage>("{\"version\":1,\"lastSequence\":0,\"scope\":\"all\"}", JsonDefaults.Options));
-        AssertThrows<JsonException>(() => _ = JsonSerializer.Deserialize<SubmitSimulatedDecisionMessage>($"{{\"version\":1,\"challengeId\":\"{sample.ChallengeId}\",\"choice\":\"AllowOnce\",\"nonce\":\"x\"}}", JsonDefaults.Options));
+        AssertThrows<JsonException>(() => _ = JsonSerializer.Deserialize<SubscribeSimulatedDecisionEventsMessage>("{\"version\":1,\"lastSequence\":0,\"decisionId\":\"00000000-0000-0000-0000-000000000001\"}", JsonDefaults.Options));
+        AssertThrows<JsonException>(() => _ = JsonSerializer.Deserialize<SubmitSimulatedDecisionMessage>($"{{\"version\":1,\"challengeId\":\"{sample.ChallengeId}\",\"choice\":1,\"nonce\":\"x\"}}", JsonDefaults.Options));
         AssertThrows<JsonException>(() => _ = JsonSerializer.Deserialize<RevokeSimulatedRememberedRuleMessage>($"{{\"version\":1,\"ruleId\":\"{sample.RuleId}\",\"expectedRevision\":0,\"ticket\":\"x\",\"grant\":\"x\"}}", JsonDefaults.Options));
 
         AssertThrows<ArgumentException>(() => _ = new SimulatedFileVersionProjection(1, new string('v', 129), 1, sample.Now, sample.Now, null));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedFileVersionProjection(1, "version\u0800token", 1, sample.Now, sample.Now, null));
         AssertThrows<ArgumentOutOfRangeException>(() => _ = new SimulatedFileVersionProjection(1, "v1", -1, sample.Now, sample.Now, null));
         AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionPromptProjection(1, sample.ChallengeId, sample.IntentId, "C:\\secret.txt", sample.File, "sha256:app", sample.ProcessSubject, sample.Destination, false, GateRuntimeState.AwaitingDecision, "awaiting", null, sample.ActiveExpiry, 1));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionPromptProjection(1, sample.ChallengeId, sample.IntentId, "report.txt", sample.File, "sha256/app", sample.ProcessSubject, sample.Destination, false, GateRuntimeState.AwaitingDecision, "awaiting", null, sample.ActiveExpiry, 1));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionPromptProjection(1, sample.ChallengeId, sample.IntentId, "report.txt", sample.File, "sha256:app", sample.ProcessSubject, sample.Destination, false, GateRuntimeState.AwaitingDecision, "bad@reason", null, sample.ActiveExpiry, 1));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionPromptProjection(1, sample.ChallengeId, sample.IntentId, "report\u0800.txt", sample.File, "sha256:app", sample.ProcessSubject, sample.Destination, false, GateRuntimeState.AwaitingDecision, "awaiting", null, sample.ActiveExpiry, 1));
         AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionPromptProjection(1, sample.ChallengeId, sample.IntentId, "report.txt", sample.File, "sha256:app", sample.ProcessSubject, sample.Destination, true, GateRuntimeState.AwaitingDecision, "awaiting", null, sample.ActiveExpiry, 1));
         AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionPromptProjection(1, sample.ChallengeId, sample.IntentId, "..", sample.File, "sha256:app", sample.ProcessSubject, sample.Destination, false, GateRuntimeState.AwaitingDecision, "awaiting", null, sample.ActiveExpiry, 1));
         AssertThrows<ArgumentOutOfRangeException>(() => _ = new SimulatedDecisionExpiryProjection(1, 15_001, sample.Now, true));
@@ -1817,6 +1829,9 @@ internal static class Program
         AssertEqual(SimulatedDecisionProtocolLimits.PipeInstanceCapacity, sample.Capacity.PipeInstanceCapacity);
         AssertEqual(SimulatedDecisionProtocolLimits.ReservedRequestReconnectCapacity, sample.Capacity.ReservedRequestReconnectCapacity);
         AssertEqual(SimulatedDecisionProtocolLimits.RuleIdRegistryEntryCapacity, sample.Capacity.RuleIdRegistryEntryCapacity);
+        AssertEqual(8, SimulatedDecisionProtocolLimits.MaximumReconnectNoticeCount);
+        AssertEqual(64, SimulatedDecisionProtocolLimits.MaximumStatusCount);
+        AssertEqual(32, SimulatedDecisionProtocolLimits.MaximumCriticalAlertCount);
         AssertThrows<ArgumentOutOfRangeException>(() => _ = new SimulatedDecisionCapacitySnapshot(3, 2, 0, 8, 0, 2, 0, 256));
         AssertThrows<ArgumentOutOfRangeException>(() => _ = new SimulatedDecisionCapacitySnapshot(0, 3, 0, 8, 0, 2, 0, 256));
         AssertThrows<ArgumentOutOfRangeException>(() => _ = new SimulatedDecisionCapacitySnapshot(0, 2, 0, 8, 0, 2, 257, 256));
@@ -1833,10 +1848,24 @@ internal static class Program
             .Select(index => CreatePrompt(sample, sample.ProcessSubject, index, "sha256:subject-bound"))
             .ToArray();
         AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionSnapshotMessage(1, 1, true, sample.Authorization, sameSubjectPrompts, [], [], [], [], sample.Capacity, sample.Counters));
+        var structuralSubjectCopy = new SimulatedSubjectProjection(1, SimulatedDecisionSubjectKind.ExactProcess, sample.Process, null, [sample.Process], false, null);
+        var structurallyEqualPrompts = sameSubjectPrompts
+            .Take(SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject)
+            .Append(CreatePrompt(sample, structuralSubjectCopy, SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject, "sha256:subject-bound"))
+            .ToArray();
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionSnapshotMessage(1, 1, true, sample.Authorization, structurallyEqualPrompts, [], [], [], [], sample.Capacity, sample.Counters));
+        var ordinalApplicationPrompts = sameSubjectPrompts
+            .Take(SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject)
+            .Append(CreatePrompt(sample, sample.ProcessSubject, SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject, "SHA256:SUBJECT-BOUND"))
+            .ToArray();
+        _ = new SimulatedDecisionSnapshotMessage(1, 1, true, sample.Authorization, ordinalApplicationPrompts, [], [], [], [], sample.Capacity, sample.Counters);
         var sameApplicationRules = Enumerable.Range(0, SimulatedDecisionProtocolLimits.MaximumRememberedRulesPerApplication + 1)
             .Select(index => CreateRule(sample, index, "sha256:one-application"))
             .ToArray();
         AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionSnapshotMessage(1, 1, true, sample.Authorization, [], [], sameApplicationRules, [], [], sample.Capacity, sample.Counters));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionSnapshotMessage(1, 1, true, sample.Authorization, [], Enumerable.Repeat(sample.Reconnect, SimulatedDecisionProtocolLimits.MaximumReconnectNoticeCount + 1).ToArray(), [], [], [], sample.Capacity, sample.Counters));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionSnapshotMessage(1, 1, true, sample.Authorization, [], [], [], Enumerable.Repeat(sample.Status, SimulatedDecisionProtocolLimits.MaximumStatusCount + 1).ToArray(), [], sample.Capacity, sample.Counters));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionSnapshotMessage(1, 1, true, sample.Authorization, [], [], [], [], Enumerable.Repeat(sample.Alert, SimulatedDecisionProtocolLimits.MaximumCriticalAlertCount + 1).ToArray(), sample.Capacity, sample.Counters));
         return Task.CompletedTask;
     }
 
@@ -1948,53 +1977,83 @@ internal static class Program
     private static Task TestSimulatedDecisionProtocolMaximumSnapshotAsync()
     {
         var sample = CreateSimulatedProtocolSample();
+        var maximumTime = sample.Now.AddTicks(1_234_567);
+        var maximumLabel = new string('l', SimulatedDecisionProtocolLimits.MaximumRedactedFileLabelLength);
+        var maximumVersionToken = new string('v', OutboundGateLimits.MaximumIdentifierLength);
+        var maximumDomain = MaximumCanonicalDomain();
+        var maximumReason = new string('r', OutboundGateLimits.MaximumReasonLength);
+        var maximumLimitation = new string('m', OutboundGateLimits.MaximumReasonLength);
+        var maximumFile = new SimulatedFileVersionProjection(1, maximumVersionToken, OutboundGateLimits.MaximumFileSizeBytes, maximumTime, maximumTime, long.MaxValue);
+        var maximumDestination = new SimulatedDestinationProjection(1, IPAddress.Parse("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), IpVersion.IPv6, 65535, TransportProtocol.Tcp, maximumDomain, DomainEvidenceProvenance.DnsObservation, maximumTime);
+        var maximumAuthorization = new SimulatedDecisionAuthorizationProjection(false, false, false, false, false, maximumReason);
+        var maximumExpiry = new SimulatedDecisionExpiryProjection(1, SimulatedDecisionProtocolLimits.MaximumDecisionRemainingMilliseconds, maximumTime, true);
         var groupSubjects = Enumerable.Range(0, SimulatedDecisionProtocolLimits.MaximumPromptCount / SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject)
-            .Select(index => CreateMaximumGroupSubject(sample.Now, index))
+            .Select(index => CreateMaximumGroupSubject(maximumTime, index))
             .ToArray();
         var prompts = groupSubjects
             .SelectMany((subject, groupIndex) => Enumerable.Range(0, SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject)
-                .Select(promptIndex => CreateMaximumPrompt(sample, subject, groupIndex * SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject + promptIndex, $"sha256:application-{groupIndex:D2}")))
+                .Select(promptIndex => CreateMaximumPrompt(maximumFile, maximumDestination, subject, maximumExpiry, groupIndex * SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject + promptIndex, MaximumApplicationIdentity(groupIndex), maximumLabel, maximumReason, maximumLimitation)))
             .ToArray();
         var rules = Enumerable.Range(0, SimulatedDecisionProtocolLimits.MaximumRememberedRuleCount)
-            .Select(index => CreateRule(sample, index, $"sha256:application-{index / SimulatedDecisionProtocolLimits.MaximumRememberedRulesPerApplication:D2}"))
+            .Select(index => CreateRule(maximumTime, maximumFile, maximumDestination, index, MaximumApplicationIdentity(100 + index / SimulatedDecisionProtocolLimits.MaximumRememberedRulesPerApplication), maximumLabel, maximumReason))
             .ToArray();
         var reconnectNotices = Enumerable.Range(0, SimulatedDecisionProtocolLimits.MaximumReconnectNoticeCount)
-            .Select(index => new SimulatedReconnectRequiredProjection(1, StableGuid("41000000", index + 1), "report.txt", sample.File, "sha256:application", groupSubjects[index % groupSubjects.Length], sample.Destination, "reconnect-required", "Simulation", sample.Now, index))
+            .Select(index => new SimulatedReconnectRequiredProjection(1, StableGuid("41000000", index + 1), maximumLabel, maximumFile, MaximumApplicationIdentity(200 + index), groupSubjects[index % groupSubjects.Length], maximumDestination, maximumReason, maximumLimitation, maximumTime, index))
             .ToArray();
         var statuses = Enumerable.Range(0, SimulatedDecisionProtocolLimits.MaximumStatusCount)
-            .Select(index => new SimulatedGateStatusProjection(1, StableGuid("51000000", index + 1), GateRuntimeState.FailedOpen, "ticket-failed-open", sample.Now, true, 0, 0, index))
+            .Select(index => new SimulatedGateStatusProjection(1, StableGuid("51000000", index + 1), GateRuntimeState.FailedOpen, maximumReason, maximumTime, true, OutboundGateLimits.MaximumDiagnosticCounter, OutboundGateLimits.MaximumDiagnosticCounter, index))
             .ToArray();
         var alerts = Enumerable.Range(0, SimulatedDecisionProtocolLimits.MaximumCriticalAlertCount)
-            .Select(index => new SimulatedCriticalAlertProjection(1, StableGuid("61000000", index + 1), StableGuid("62000000", index + 1), groupSubjects[index % groupSubjects.Length], "ticket-failed-open", sample.Now, 0, 0, true, SimulatedDecisionProtocolLimits.FailOpenPresentationText, index))
+            .Select(index => new SimulatedCriticalAlertProjection(1, StableGuid("61000000", index + 1), StableGuid("62000000", index + 1), groupSubjects[index % groupSubjects.Length], maximumReason, maximumTime, OutboundGateLimits.MaximumDiagnosticCounter, OutboundGateLimits.MaximumDiagnosticCounter, true, SimulatedDecisionProtocolLimits.FailOpenPresentationText, index))
             .ToArray();
         var capacity = new SimulatedDecisionCapacitySnapshot(2, 2, 8, 8, 2, 2, 256, 256);
-        var snapshot = new SimulatedDecisionSnapshotMessage(1, 1, true, sample.Authorization, prompts, reconnectNotices, rules, statuses, alerts, capacity, sample.Counters);
+        var snapshot = new SimulatedDecisionSnapshotMessage(1, long.MaxValue, true, maximumAuthorization, prompts, reconnectNotices, rules, statuses, alerts, capacity, new SimulatedDecisionCounterSnapshot(OutboundGateLimits.MaximumDiagnosticCounter, OutboundGateLimits.MaximumDiagnosticCounter, OutboundGateLimits.MaximumDiagnosticCounter, OutboundGateLimits.MaximumDiagnosticCounter));
         var envelope = MessageEnvelope.Create(OutboundGateMessageTypes.SimulatedDecisionSnapshot, snapshot, sample.CorrelationId);
         var serialized = JsonSerializer.SerializeToUtf8Bytes(envelope, JsonDefaults.Options);
         AssertTrue(prompts.Length == SimulatedDecisionProtocolLimits.MaximumPromptCount, "Maximum prompt snapshot was not constructed.");
         AssertTrue(rules.Length == SimulatedDecisionProtocolLimits.MaximumRememberedRuleCount, "Maximum remembered-rule snapshot was not constructed.");
+        AssertEqual(SimulatedDecisionProtocolLimits.MaximumReconnectNoticeCount, reconnectNotices.Length);
+        AssertEqual(SimulatedDecisionProtocolLimits.MaximumStatusCount, statuses.Length);
+        AssertEqual(SimulatedDecisionProtocolLimits.MaximumCriticalAlertCount, alerts.Length);
+        const string allowedWireCharacters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ._():-";
+        _ = new SimulatedDecisionAuthorizationProjection(true, false, false, false, false, allowedWireCharacters);
+        AssertEqual(allowedWireCharacters.Length + 2, JsonSerializer.SerializeToUtf8Bytes(allowedWireCharacters, JsonDefaults.Options).Length);
+        Console.WriteLine($"INFO  Phase 5B-05 maximum snapshot envelope bytes: {serialized.Length}");
+        AssertEqual(898_812, serialized.Length);
         AssertTrue(serialized.Length < ProtocolConstants.MaximumMessageBytes, "Maximum simulated-decision snapshot exceeded the framing limit.");
+        AssertTrue(ProtocolConstants.MaximumMessageBytes - serialized.Length >= 131_072, "Maximum simulated-decision snapshot did not retain the locked 128 KiB reserve.");
         return Task.CompletedTask;
     }
 
     private static SimulatedDecisionPromptProjection CreatePrompt(SimulatedProtocolSample sample, SimulatedSubjectProjection subject, int index, string applicationIdentity) =>
         new(1, StableGuid("13000000", index + 1), StableGuid("23000000", index + 1), "report.txt", sample.File, applicationIdentity, subject, sample.Destination, false, GateRuntimeState.AwaitingDecision, "awaiting-decision", "Simulation", sample.ActiveExpiry, index + 1);
 
-    private static SimulatedDecisionPromptProjection CreateMaximumPrompt(SimulatedProtocolSample sample, SimulatedSubjectProjection subject, int index, string applicationIdentity) =>
-        new(1, StableGuid("11000000", index + 1), StableGuid("12000000", index + 1), "report.txt", sample.File, applicationIdentity, subject, sample.Destination, false, GateRuntimeState.AwaitingDecision, "awaiting-decision", "Simulation", sample.ActiveExpiry, index + 1);
+    private static SimulatedDecisionPromptProjection CreateMaximumPrompt(SimulatedFileVersionProjection file, SimulatedDestinationProjection destination, SimulatedSubjectProjection subject, SimulatedDecisionExpiryProjection expiry, int index, string applicationIdentity, string label, string reason, string limitation) =>
+        new(1, StableGuid("11000000", index + 1), StableGuid("12000000", index + 1), label, file, applicationIdentity, subject, destination, false, GateRuntimeState.AwaitingDecision, reason, limitation, expiry, long.MaxValue - index);
 
     private static SimulatedRememberedRuleProjection CreateRule(SimulatedProtocolSample sample, int index, string applicationIdentity) =>
         new(1, StableGuid("31000000", index + 1), "report.txt", sample.File, applicationIdentity, sample.Destination, sample.Now, sample.Now.AddDays(30).AddSeconds(index), SimulatedDecisionItemState.Remembered, "remembered", index + 1);
 
+    private static SimulatedRememberedRuleProjection CreateRule(DateTimeOffset now, SimulatedFileVersionProjection file, SimulatedDestinationProjection destination, int index, string applicationIdentity, string label, string reason) =>
+        new(1, StableGuid("31000000", index + 1), label, file, applicationIdentity, destination, now, now.AddDays(30).AddSeconds(index), SimulatedDecisionItemState.Remembered, reason, long.MaxValue - index);
+
     private static SimulatedSubjectProjection CreateMaximumGroupSubject(DateTimeOffset now, int index)
     {
         var members = Enumerable.Range(0, SimulatedDecisionProtocolLimits.MaximumGroupMembers)
-            .Select(memberIndex => new ProcessIdentity(1000 + index * SimulatedDecisionProtocolLimits.MaximumGroupMembers + memberIndex, now.AddSeconds(index * 60 + memberIndex)))
+            .Select(memberIndex => new ProcessIdentity(1_000_000_000 + index * SimulatedDecisionProtocolLimits.MaximumGroupMembers + memberIndex, now.AddSeconds(index * 60 + memberIndex)))
             .ToArray();
         return new SimulatedSubjectProjection(1, SimulatedDecisionSubjectKind.ExactProcessGroup, members[0], StableGuid("71000000", index + 1), members, true, SimulatedDecisionProtocolLimits.GroupCollateralWarning);
     }
 
     private static Guid StableGuid(string prefix, int value) => Guid.Parse($"{prefix}-0000-0000-0000-{value:D12}");
+
+    private static string MaximumApplicationIdentity(int value)
+    {
+        var prefix = $"app-{value:D4}-";
+        return prefix + new string('a', OutboundGateLimits.MaximumIdentifierLength - prefix.Length);
+    }
+
+    private static string MaximumCanonicalDomain() => string.Join('.', new string('d', 63), new string('d', 63), new string('d', 63), new string('d', 61));
 
     private static SimulatedProtocolSample CreateSimulatedProtocolSample()
     {

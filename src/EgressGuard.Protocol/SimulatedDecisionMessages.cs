@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net;
 using EgressGuard.Core;
 using System.Text.Json.Serialization;
@@ -8,10 +9,10 @@ public static class SimulatedDecisionProtocolLimits
 {
     public const int MaximumRedactedFileLabelLength = 96;
     public const int MaximumPromptCount = 128;
-    public const int MaximumReconnectNoticeCount = 64;
+    public const int MaximumReconnectNoticeCount = 8;
     public const int MaximumRememberedRuleCount = 64;
     public const int MaximumStatusCount = 64;
-    public const int MaximumCriticalAlertCount = 64;
+    public const int MaximumCriticalAlertCount = 32;
     public const int MaximumGroupMembers = 32;
     public const int MaximumPromptsPerSubject = 4;
     public const int MaximumRememberedRulesPerApplication = 8;
@@ -33,6 +34,7 @@ public static class SimulatedDecisionProtocolLimits
     {
         if (value is null || string.IsNullOrWhiteSpace(value) || value.Length > maximumLength)
             throw new ArgumentException($"{name} must contain 1-{maximumLength} characters.", name);
+        RequireVariableWireCharacters(value, name);
         return value;
     }
 
@@ -40,7 +42,18 @@ public static class SimulatedDecisionProtocolLimits
     {
         if (value is not null && (string.IsNullOrWhiteSpace(value) || value.Length > maximumLength))
             throw new ArgumentException($"{name} must be null or contain 1-{maximumLength} characters.", name);
+        if (value is not null)
+            RequireVariableWireCharacters(value, name);
         return value;
+    }
+
+    private static void RequireVariableWireCharacters(string value, string name)
+    {
+        if (value.Any(character => character is not (' ' or '.' or '_' or '(' or ')' or ':' or '-')
+                && character is not (>= 'A' and <= 'Z')
+                && character is not (>= 'a' and <= 'z')
+                && character is not (>= '0' and <= '9')))
+            throw new ArgumentException($"{name} contains a character outside the canonical JSON-safe ASCII alphabet.", name);
     }
 
     internal static long NonNegative(long value, string name)
@@ -78,8 +91,46 @@ public static class SimulatedDecisionProtocolLimits
         OutboundGateLimits.Process(identity, name);
     }
 
-    internal static string Application(string value, string name) =>
-        OutboundGateLimits.ApplicationIdentity(value, name);
+    internal static string Application(string value, string name)
+    {
+        var applicationIdentity = OutboundGateLimits.ApplicationIdentity(value, name);
+        RequireVariableWireCharacters(applicationIdentity, name);
+        return applicationIdentity;
+    }
+
+    internal static string? DomainEvidence(string? value, string name)
+    {
+        var domain = Optional(value, name, OutboundGateLimits.MaximumDomainLength);
+        if (domain is null)
+            return null;
+        if (!string.Equals(domain, domain.ToLowerInvariant(), StringComparison.Ordinal))
+            throw new ArgumentException($"{name} must be canonical lowercase ASCII.", name);
+
+        var labels = domain.Split('.');
+        if (labels.Any(label => label.Length is < 1 or > 63
+                || label[0] == '-'
+                || label[^1] == '-'
+                || label.Any(character => character != '-'
+                    && character is not (>= 'a' and <= 'z')
+                    && character is not (>= '0' and <= '9'))))
+            throw new ArgumentException($"{name} must be a canonical ASCII DNS name.", name);
+
+        try
+        {
+            var idn = new IdnMapping { UseStd3AsciiRules = true };
+            var canonicalAscii = idn.GetAscii(domain);
+            var roundTrippedAscii = idn.GetAscii(idn.GetUnicode(domain));
+            if (!string.Equals(domain, canonicalAscii, StringComparison.Ordinal)
+                || !string.Equals(domain, roundTrippedAscii, StringComparison.Ordinal))
+                throw new ArgumentException($"{name} must contain valid canonical DNS/IDNA A-labels.", name);
+        }
+        catch (ArgumentException exception)
+        {
+            throw new ArgumentException($"{name} must contain valid canonical DNS/IDNA A-labels.", name, exception);
+        }
+
+        return domain;
+    }
 
     internal static string Reason(string value, string name = "reasonCode") =>
         Required(value, name, OutboundGateLimits.MaximumReasonLength);
@@ -333,7 +384,7 @@ public sealed record SimulatedDestinationProjection
         IpVersion = ipVersion;
         RemotePort = remotePort;
         Protocol = protocol;
-        DomainEvidence = SimulatedDecisionProtocolLimits.Optional(domainEvidence, nameof(domainEvidence), OutboundGateLimits.MaximumDomainLength);
+        DomainEvidence = SimulatedDecisionProtocolLimits.DomainEvidence(domainEvidence, nameof(domainEvidence));
         DomainProvenance = domainProvenance;
         DomainObservedAtUtc = domainObservedAtUtc is null ? null : SimulatedDecisionProtocolLimits.Utc(domainObservedAtUtc.Value, nameof(domainObservedAtUtc));
     }
@@ -688,12 +739,13 @@ public sealed record SimulatedDecisionSnapshotMessage
             var count = 1;
             for (var other = 0; other < index; other++)
             {
-                if (SimulatedDecisionProtocolLimits.StructuralSubjectEquals(prompts[index].Subject, prompts[other].Subject))
+                if (string.Equals(prompts[index].ApplicationIdentity, prompts[other].ApplicationIdentity, StringComparison.Ordinal)
+                    && SimulatedDecisionProtocolLimits.StructuralSubjectEquals(prompts[index].Subject, prompts[other].Subject))
                     count++;
             }
 
             if (count > SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject)
-                throw new ArgumentException($"A structural subject cannot have more than {SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject} active prompts.", nameof(prompts));
+                throw new ArgumentException($"An exact application/structural subject cannot have more than {SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject} active prompts.", nameof(prompts));
         }
     }
 
