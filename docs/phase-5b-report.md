@@ -87,8 +87,9 @@ real local-Administrator PipeServer branch (`6/8` normal instances, exact 8/8
 limit, then successful replacement accept). Restore and format verification
 passed; Release build completed with zero warnings and zero errors; the
 transitive vulnerability scan reported no vulnerable package; and
-`git diff --check` passed. GitHub `workflow_dispatch` evidence is recorded in the
-Draft PR checks and final implementation handoff.
+`git diff --check` passed. GitHub evidence is recorded in the completed
+`workflow_dispatch` run and final implementation handoff comment; GitHub did not
+attach that manually dispatched run to the PR status-check rollup.
 
 ## Review posture
 
