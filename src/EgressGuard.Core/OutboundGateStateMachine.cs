@@ -394,8 +394,6 @@ public sealed class OutboundGateStateMachine : IDisposable
     private GateTransitionResult ReceiveDecisionCore(UserDecision decision)
     {
         ArgumentNullException.ThrowIfNull(decision);
-        if (decision.Decision == UserDecisionKind.AlwaysAllow)
-            throw new InvalidOperationException("AlwaysAllow requires the atomic persistent decision transition.");
         var context = FindActiveContextForChallenge(decision.ChallengeId);
         if (context.Decision is not null)
         {
@@ -435,7 +433,24 @@ public sealed class OutboundGateStateMachine : IDisposable
         ArgumentNullException.ThrowIfNull(decision);
         if (_mode != OutboundGateMode.Simulation)
             throw new InvalidOperationException("Persistent decisions are supported only in Simulation mode.");
-        ArgumentOutOfRangeException.ThrowIfNegative(nextPolicyEpoch);
+
+        var terminalFailure = _terminalHistory.Values.FirstOrDefault(item =>
+            item.RejectedPersistentDecision?.Decision.ChallengeId == decision.ChallengeId);
+        if (terminalFailure?.RejectedPersistentDecision is { } rejectedPersistentDecision)
+        {
+            if (rejectedPersistentDecision.Decision == decision
+                && rejectedPersistentDecision.RequestedPolicyEpoch == nextPolicyEpoch)
+            {
+                var rejectedResult = rejectedPersistentDecision.Result;
+                return new PersistentDecisionTransitionResult(
+                    rejectedResult.Version,
+                    rejectedResult.DecisionResult with { IsDuplicate = true },
+                    rejectedResult.InvalidatedStatuses,
+                    rejectedResult.PolicyEpoch,
+                    policyEpochAccepted: false);
+            }
+            throw new InvalidOperationException("Duplicate rejected persistent decision has a different decision or policy epoch binding.");
+        }
 
         var context = FindActiveContextForChallenge(decision.ChallengeId);
         if (context.PersistentDecisionResult is { } acceptedPersistentDecision)
@@ -454,17 +469,27 @@ public sealed class OutboundGateStateMachine : IDisposable
         if (context.Decision is not null)
             throw new InvalidOperationException("Persistent decision cannot replace an accepted ordinary decision.");
 
+        RequirePhase(context, ContextPhase.AwaitingDecision, "Persistent decision");
+        var now = RequireClock(_clock.Now());
+        if (!SameClock(now, context.PhaseDeadline)
+            || !context.Challenge!.DecisionWindow.Contains(now)
+            || DeadlineReached(now, context.PhaseDeadline)
+            || DeadlineReached(now, context.Challenge.DecisionWindow.Deadline))
+        {
+            return FailOpenPersistentDecision(
+                context,
+                decision,
+                nextPolicyEpoch,
+                "persistent-decision-clock-or-deadline-invalid",
+                now);
+        }
+
+        ArgumentOutOfRangeException.ThrowIfNegative(nextPolicyEpoch);
         var expectedPolicyEpoch = checked(_policyEpoch + 1);
         if (nextPolicyEpoch != expectedPolicyEpoch)
             throw new ArgumentOutOfRangeException(nameof(nextPolicyEpoch), "Persistent decisions must advance the current policy epoch by exactly one.");
 
-        RequirePhase(context, ContextPhase.AwaitingDecision, "Persistent decision");
-        var now = RequireClock(_clock.Now());
-        if (!PersistentDecisionMatchesContext(decision, context)
-            || !SameClock(now, context.PhaseDeadline)
-            || !context.Challenge!.DecisionWindow.Contains(now)
-            || DeadlineReached(now, context.PhaseDeadline)
-            || DeadlineReached(now, context.Challenge.DecisionWindow.Deadline))
+        if (!PersistentDecisionMatchesContext(decision, context))
         {
             return new PersistentDecisionTransitionResult(
                 OutboundGateLimits.CurrentVersion,
@@ -716,6 +741,33 @@ public sealed class OutboundGateStateMachine : IDisposable
         return result;
     }
 
+    private PersistentDecisionTransitionResult FailOpenPersistentDecision(
+        Context context,
+        UserDecision decision,
+        long requestedPolicyEpoch,
+        string reason,
+        ServiceMonotonicTimestamp now)
+    {
+        _failedOpenCount++;
+        var alert = Alert(reason, new GateAffectedScope(1, GateAffectedScopeKind.Intent, context.Intent.IntentId, context.Intent.Subject), now);
+        var decisionResult = new GateTransitionResult(
+            Status(context.Intent.Subject, context.Intent.IntentId, GateRuntimeState.FailedOpen, reason, now, true, context.Request.RequiredCoverage),
+            criticalAlert: alert,
+            disposition: context.Disposition,
+            completion: context.Completion);
+        var persistentResult = new PersistentDecisionTransitionResult(
+            OutboundGateLimits.CurrentVersion,
+            decisionResult,
+            Array.Empty<GateStatus>(),
+            _policyEpoch,
+            policyEpochAccepted: false);
+        CompleteTerminal(
+            context,
+            decisionResult,
+            rejectedPersistentDecision: new RejectedPersistentDecision(decision, requestedPolicyEpoch, persistentResult));
+        return persistentResult;
+    }
+
     private GateTransitionResult CompleteBlocked(Context context, string reason, ServiceMonotonicTimestamp now)
     {
         var result = new GateTransitionResult(Status(context.Intent.Subject, context.Intent.IntentId, GateRuntimeState.Blocked, reason, now, false, context.Request.RequiredCoverage));
@@ -730,7 +782,11 @@ public sealed class OutboundGateStateMachine : IDisposable
         return result;
     }
 
-    private void CompleteTerminal(Context context, GateTransitionResult result, ChallengeAdmissionFailure? challengeAdmissionFailure = null)
+    private void CompleteTerminal(
+        Context context,
+        GateTransitionResult result,
+        ChallengeAdmissionFailure? challengeAdmissionFailure = null,
+        RejectedPersistentDecision? rejectedPersistentDecision = null)
     {
         RemoveChallengeMapping(context);
         _activeContexts.Remove(context.Intent.IntentId);
@@ -740,7 +796,13 @@ public sealed class OutboundGateStateMachine : IDisposable
             disposition: context.Disposition,
             criticalAlert: result.CriticalAlert,
             completion: context.Completion ?? context.CompletionAttempt);
-        RememberTerminal(context.Intent, replayResult, context.Disposition, context.Completion ?? context.CompletionAttempt, challengeAdmissionFailure);
+        RememberTerminal(
+            context.Intent,
+            replayResult,
+            context.Disposition,
+            context.Completion ?? context.CompletionAttempt,
+            challengeAdmissionFailure,
+            rejectedPersistentDecision);
         context.Ack = null;
         context.Disposition = null;
         context.Completion = null;
@@ -752,11 +814,17 @@ public sealed class OutboundGateStateMachine : IDisposable
         context.PersistentDecisionResult = null;
     }
 
-    private void RememberTerminal(FileReadIntent intent, GateTransitionResult result, FileReadDisposition? disposition = null, FileReadCompletionAck? completion = null, ChallengeAdmissionFailure? challengeAdmissionFailure = null)
+    private void RememberTerminal(
+        FileReadIntent intent,
+        GateTransitionResult result,
+        FileReadDisposition? disposition = null,
+        FileReadCompletionAck? completion = null,
+        ChallengeAdmissionFailure? challengeAdmissionFailure = null,
+        RejectedPersistentDecision? rejectedPersistentDecision = null)
     {
         if (_terminalHistory.ContainsKey(intent.IntentId))
             return;
-        _terminalHistory.Add(intent.IntentId, new TerminalRecord(intent, result, disposition, completion, challengeAdmissionFailure));
+        _terminalHistory.Add(intent.IntentId, new TerminalRecord(intent, result, disposition, completion, challengeAdmissionFailure, rejectedPersistentDecision));
         _terminalOrder.Enqueue(intent.IntentId);
         while (_terminalHistory.Count > MaximumTerminalHistory)
         {
@@ -992,5 +1060,13 @@ public sealed class OutboundGateStateMachine : IDisposable
         && string.Equals(left.ReasonCode, right.ReasonCode, StringComparison.Ordinal)
         && left.Sequence == right.Sequence;
 
-    private sealed record TerminalRecord(FileReadIntent Intent, GateTransitionResult ReplayResult, FileReadDisposition? Disposition, FileReadCompletionAck? Completion, ChallengeAdmissionFailure? ChallengeAdmissionFailure);
+    private sealed record RejectedPersistentDecision(UserDecision Decision, long RequestedPolicyEpoch, PersistentDecisionTransitionResult Result);
+
+    private sealed record TerminalRecord(
+        FileReadIntent Intent,
+        GateTransitionResult ReplayResult,
+        FileReadDisposition? Disposition,
+        FileReadCompletionAck? Completion,
+        ChallengeAdmissionFailure? ChallengeAdmissionFailure,
+        RejectedPersistentDecision? RejectedPersistentDecision);
 }

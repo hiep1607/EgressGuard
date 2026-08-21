@@ -163,6 +163,8 @@ internal static class Program
             ("Phase 5B-04 challenge admission failure is targeted and bounded", TestChallengeAdmissionFailureAsync),
             ("Phase 5B-05 persistent result contracts are bounded and defensive", TestPersistentDecisionResultContractAsync),
             ("Phase 5B-05 persistent decision prevalidation is non-mutating", TestPersistentDecisionPrevalidationAsync),
+            ("Phase 5B-05 persistent deadline failure is terminal and idempotent", TestPersistentDecisionDeadlineFailureAsync),
+            ("Phase 5B-05 remembered decisions reuse the current policy epoch", TestRememberedDecisionCurrentEpochAsync),
             ("Phase 5B-05 persistent decision atomically advances policy", TestPersistentDecisionAtomicSuccessAsync),
             ("Phase 5B-05 effective epoch preserves selected authority only", TestPersistentDecisionEffectiveEpochAsync),
             ("Phase 5B-05 ticket capacity fails open after epoch acceptance", TestPersistentDecisionTicketCapacityAsync),
@@ -3013,9 +3015,6 @@ internal static class Program
 
         AssertThrows<ArgumentException>(() => _ = new UserDecision(1, Guid.NewGuid(), prepared.Challenge.ChallengeId, UserDecisionKind.AlwaysAllow, null, sample.Start, "test"));
         AssertThrows<ArgumentException>(() => _ = new RequestedPersistentScope(1, (PersistentAllowPolicyKind)99, sample.File, sample.Subject.ApplicationIdentity, sample.Destination));
-        var beforeOrdinaryBypass = PersistentState(machine, ticketService);
-        AssertThrows<InvalidOperationException>(() => machine.ReceiveDecision(valid));
-        AssertEqual(beforeOrdinaryBypass, PersistentState(machine, ticketService));
         AssertPersistentPrevalidationRejected(machine, ticketService, new UserDecision(1, nonces.NextNonce(), prepared.Challenge.ChallengeId, UserDecisionKind.AllowOnce, null, sample.Start, "test"), 8);
 
         var wrongFile = new FileVersionIdentity(1, sample.File.VolumeId, "other-file", sample.File.CreationTimeUtc, sample.File.SizeBytes, sample.File.LastWriteTimeUtc, sample.File.ChangeTimeUtc, sample.File.Usn, "other-version");
@@ -3054,9 +3053,6 @@ internal static class Program
             AssertEqual(beforeEpoch, PersistentState(machine, ticketService));
         }
 
-        clock.Set(prepared.Challenge.DecisionWindow.Deadline);
-        AssertPersistentPrevalidationRejected(machine, ticketService, valid, 8);
-        AssertEqual(GateRuntimeState.AwaitingDecision, machine.ReceiveIntent(sample.Intent).Status.State);
         machine.ApplyPolicyEpoch(8);
         AssertEqual(0, machine.Storage.ActiveContextCount);
 
@@ -3081,6 +3077,156 @@ internal static class Program
         AssertEqual(overflowBefore, PersistentState(overflowMachine, overflowService));
         overflowMachine.HandleServiceRestart(Guid.NewGuid());
         AssertEqual(0, overflowMachine.Storage.ActiveContextCount);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestPersistentDecisionDeadlineFailureAsync()
+    {
+        var sample = OutboundGateSamples();
+
+        foreach (var offset in new[] { -1L, 0L, 1L })
+        {
+            var clock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+            var nonces = new TestNonceProvider();
+            using var service = CreateTicketService(sample, clock, nonces);
+            using var machine = CreateOutboundGateMachine(sample, clock, nonces, ticketService: service);
+            var selectedIntent = IntentFor(sample, Guid.NewGuid(), sample.Subject, 5_000 + offset);
+            var selected = PrepareToChallenge(machine, sample, clock, nonces, selectedIntent);
+            var decision = PersistentDecisionFor(sample, selected.Challenge, nonces.NextNonce());
+
+            if (offset < 0)
+            {
+                clock.Set(new ServiceMonotonicTimestamp(
+                    1,
+                    selected.Challenge.DecisionWindow.Deadline.ClockInstanceId,
+                    selected.Challenge.DecisionWindow.Deadline.ElapsedMilliseconds + offset));
+                var accepted = machine.ReceivePersistentDecision(decision, 8);
+                AssertTrue(accepted.PolicyEpochAccepted, "A persistent decision immediately before the deadline was rejected.");
+                AssertEqual(8L, accepted.PolicyEpoch);
+                AssertEqual(8L, accepted.DecisionResult.Ticket!.PolicyEpoch);
+                AssertEqual(8L, machine.PolicyEpoch);
+                AssertEqual(0L, machine.Counters.FailedOpenCount);
+                machine.ApplyPolicyEpoch(9);
+                continue;
+            }
+
+            var unrelatedIntent = IntentFor(sample, Guid.NewGuid(), sample.Subject, 6_000 + offset);
+            clock.Advance(2);
+            PrepareToChallenge(machine, sample, clock, nonces, unrelatedIntent);
+            clock.Set(new ServiceMonotonicTimestamp(
+                1,
+                selected.Challenge.DecisionWindow.Deadline.ClockInstanceId,
+                selected.Challenge.DecisionWindow.Deadline.ElapsedMilliseconds + offset));
+            var beforeEpoch = machine.PolicyEpoch;
+            var beforeServiceEpoch = service.PolicyEpoch;
+            var failed = machine.ReceivePersistentDecision(decision, 8);
+
+            AssertTrue(!failed.PolicyEpochAccepted, "A persistent decision at or after the deadline accepted its epoch.");
+            AssertEqual(GateRuntimeState.FailedOpen, failed.DecisionResult.Status.State);
+            AssertEqual("persistent-decision-clock-or-deadline-invalid", failed.DecisionResult.Status.ReasonCode);
+            AssertTrue(failed.DecisionResult.CriticalAlert is not null, "Deadline failure did not publish a critical alert.");
+            AssertTrue(failed.DecisionResult.Ticket is null && failed.DecisionResult.Grant is null, "Deadline failure created authority.");
+            AssertEqual(beforeEpoch, failed.PolicyEpoch);
+            AssertEqual(beforeEpoch, machine.PolicyEpoch);
+            AssertEqual(beforeServiceEpoch, service.PolicyEpoch);
+            AssertEqual(1L, machine.Counters.FailedOpenCount);
+            AssertEqual(1, machine.CriticalAlerts.Count);
+            AssertEqual(1, machine.Storage.ActiveContextCount);
+            AssertEqual(1, machine.Storage.ChallengeMappingCount);
+            AssertEqual(GateRuntimeState.AwaitingDecision, machine.ReceiveIntent(unrelatedIntent).Status.State);
+            AssertEqual(GateRuntimeState.FailedOpen, machine.ReceiveIntent(selectedIntent).Status.State);
+            AssertEqual(0, service.Snapshot.OutstandingGlobal);
+
+            var stateAfterFailure = PersistentState(machine, service);
+            var duplicate = machine.ReceivePersistentDecision(decision, 8);
+            AssertTrue(duplicate.DecisionResult.IsDuplicate, "Repeated deadline failure was not identified as a duplicate.");
+            AssertTrue(!duplicate.PolicyEpochAccepted, "Repeated deadline failure accepted its epoch.");
+            AssertEqual(GateRuntimeState.FailedOpen, duplicate.DecisionResult.Status.State);
+            AssertEqual(stateAfterFailure, PersistentState(machine, service));
+            machine.ApplyPolicyEpoch(8);
+        }
+
+        var invalidClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var invalidNonces = new TestNonceProvider();
+        using var invalidService = CreateTicketService(sample, invalidClock, invalidNonces);
+        using var invalidMachine = CreateOutboundGateMachine(sample, invalidClock, invalidNonces, ticketService: invalidService);
+        var invalidPrepared = PrepareToChallenge(invalidMachine, sample, invalidClock, invalidNonces);
+        var invalidDecision = PersistentDecisionFor(sample, invalidPrepared.Challenge, invalidNonces.NextNonce());
+        invalidClock.Set(new ServiceMonotonicTimestamp(1, Guid.NewGuid(), invalidClock.Now().ElapsedMilliseconds));
+        var invalidResult = invalidMachine.ReceivePersistentDecision(invalidDecision, 8);
+        AssertTrue(!invalidResult.PolicyEpochAccepted, "A clock-invalid persistent decision accepted its epoch.");
+        AssertEqual(GateRuntimeState.FailedOpen, invalidResult.DecisionResult.Status.State);
+        AssertEqual(7L, invalidMachine.PolicyEpoch);
+        AssertEqual(7L, invalidService.PolicyEpoch);
+        AssertEqual(0, invalidMachine.Storage.ActiveContextCount);
+        AssertEqual(0, invalidMachine.Storage.ChallengeMappingCount);
+        AssertEqual(1L, invalidMachine.Counters.FailedOpenCount);
+        AssertEqual(1, invalidMachine.CriticalAlerts.Count);
+        AssertEqual(0, invalidService.Snapshot.OutstandingGlobal);
+        var invalidState = PersistentState(invalidMachine, invalidService);
+        AssertTrue(invalidMachine.ReceivePersistentDecision(invalidDecision, 8).DecisionResult.IsDuplicate, "Clock-invalid replay was not idempotent.");
+        AssertEqual(invalidState, PersistentState(invalidMachine, invalidService));
+        return Task.CompletedTask;
+    }
+
+    private static Task TestRememberedDecisionCurrentEpochAsync()
+    {
+        var sample = OutboundGateSamples();
+        var clock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var nonces = new TestNonceProvider();
+        using var service = CreateTicketService(sample, clock, nonces);
+        using var machine = CreateOutboundGateMachine(sample, clock, nonces, ticketService: service);
+        var prepared = PrepareToChallenge(machine, sample, clock, nonces);
+        var rememberedDecision = PersistentDecisionFor(sample, prepared.Challenge, nonces.NextNonce());
+        var issued = machine.ReceiveDecision(rememberedDecision);
+
+        AssertTrue(issued.Ticket is not null, "An exact remembered AlwaysAllow decision did not issue a ticket.");
+        AssertEqual(7L, issued.Ticket!.PolicyEpoch);
+        AssertEqual(7L, machine.PolicyEpoch);
+        AssertEqual(7L, service.PolicyEpoch);
+        AssertEqual(1, service.Snapshot.OutstandingGlobal);
+        AssertEqual(0, machine.Storage.ChallengeMappingCount);
+        var duplicate = machine.ReceiveDecision(rememberedDecision);
+        AssertTrue(duplicate.IsDuplicate, "An exact remembered decision duplicate was not detected.");
+        AssertEqual(issued.Ticket.TicketId, duplicate.Ticket!.TicketId);
+        AssertEqual(1, service.Snapshot.OutstandingGlobal);
+        AssertThrows<InvalidOperationException>(() => machine.ReceiveDecision(PersistentDecisionFor(sample, prepared.Challenge, nonces.NextNonce())));
+        AssertEqual(1, service.Snapshot.OutstandingGlobal);
+
+        var bindingClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var bindingNonces = new TestNonceProvider();
+        using var bindingService = CreateTicketService(sample, bindingClock, bindingNonces);
+        using var bindingMachine = CreateOutboundGateMachine(sample, bindingClock, bindingNonces, ticketService: bindingService);
+        var bindingPrepared = PrepareToChallenge(bindingMachine, sample, bindingClock, bindingNonces);
+        var wrongFile = new FileVersionIdentity(1, sample.File.VolumeId, "wrong-file", sample.File.CreationTimeUtc, sample.File.SizeBytes, sample.File.LastWriteTimeUtc, sample.File.ChangeTimeUtc, sample.File.Usn, "wrong-version");
+        var beforeBinding = PersistentState(bindingMachine, bindingService);
+        AssertThrows<InvalidOperationException>(() => bindingMachine.ReceiveDecision(PersistentDecisionFor(sample, bindingPrepared.Challenge, bindingNonces.NextNonce(), file: wrongFile)));
+        AssertEqual(beforeBinding, PersistentState(bindingMachine, bindingService));
+        AssertEqual(7L, bindingMachine.ReceiveDecision(PersistentDecisionFor(sample, bindingPrepared.Challenge, bindingNonces.NextNonce())).Ticket!.PolicyEpoch);
+
+        var allowClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var allowNonces = new TestNonceProvider();
+        using var allowMachine = CreateOutboundGateMachine(sample, allowClock, allowNonces);
+        var allowPrepared = PrepareToChallenge(allowMachine, sample, allowClock, allowNonces);
+        var allowOnce = allowMachine.ReceiveDecision(new UserDecision(1, allowNonces.NextNonce(), allowPrepared.Challenge.ChallengeId, UserDecisionKind.AllowOnce, null, sample.Start, "test"));
+        AssertEqual(7L, allowOnce.Ticket!.PolicyEpoch);
+
+        var blockClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var blockNonces = new TestNonceProvider();
+        using var blockMachine = CreateOutboundGateMachine(sample, blockClock, blockNonces);
+        var blockPrepared = PrepareToChallenge(blockMachine, sample, blockClock, blockNonces);
+        var blocked = blockMachine.ReceiveDecision(new UserDecision(1, blockNonces.NextNonce(), blockPrepared.Challenge.ChallengeId, UserDecisionKind.Block, null, sample.Start, "test"));
+        AssertEqual(GateRuntimeState.Blocked, blocked.Status.State);
+        AssertTrue(blocked.Ticket is null, "Block created a ticket.");
+
+        var persistentClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var persistentNonces = new TestNonceProvider();
+        using var persistentService = CreateTicketService(sample, persistentClock, persistentNonces);
+        using var persistentMachine = CreateOutboundGateMachine(sample, persistentClock, persistentNonces, ticketService: persistentService);
+        var persistentPrepared = PrepareToChallenge(persistentMachine, sample, persistentClock, persistentNonces);
+        var persistent = persistentMachine.ReceivePersistentDecision(PersistentDecisionFor(sample, persistentPrepared.Challenge, persistentNonces.NextNonce()), 8);
+        AssertTrue(persistent.PolicyEpochAccepted, "The persistent transition regressed.");
+        AssertEqual(8L, persistent.DecisionResult.Ticket!.PolicyEpoch);
         return Task.CompletedTask;
     }
 
