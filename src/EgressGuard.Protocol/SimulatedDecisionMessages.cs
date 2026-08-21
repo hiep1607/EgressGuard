@@ -1,5 +1,6 @@
 using System.Net;
 using EgressGuard.Core;
+using System.Text.Json.Serialization;
 
 namespace EgressGuard.Protocol;
 
@@ -12,6 +13,8 @@ public static class SimulatedDecisionProtocolLimits
     public const int MaximumStatusCount = 64;
     public const int MaximumCriticalAlertCount = 64;
     public const int MaximumGroupMembers = 32;
+    public const int MaximumPromptsPerSubject = 4;
+    public const int MaximumRememberedRulesPerApplication = 8;
     public const long MaximumDecisionRemainingMilliseconds = 15_000;
     public const int DecisionSubscriberCapacity = 2;
     public const int PipeInstanceCapacity = 8;
@@ -67,7 +70,7 @@ public static class SimulatedDecisionProtocolLimits
         var copy = values.ToArray();
         if (copy.Any(item => item is null))
             throw new ArgumentException($"{name} cannot contain null items.", name);
-        return copy;
+        return Array.AsReadOnly(copy);
     }
 
     internal static void Process(ProcessIdentity identity, string name)
@@ -126,6 +129,15 @@ public static class SimulatedDecisionProtocolLimits
         if (values.Distinct().Count() != values.Count)
             throw new ArgumentException($"{name} must contain unique values.", name);
     }
+
+    internal static bool StructuralSubjectEquals(SimulatedSubjectProjection left, SimulatedSubjectProjection right) =>
+        left.Version == right.Version
+        && left.Kind == right.Kind
+        && left.PrimaryProcess == right.PrimaryProcess
+        && left.ProcessGroupId == right.ProcessGroupId
+        && left.HasCollateralScope == right.HasCollateralScope
+        && string.Equals(left.CollateralWarning, right.CollateralWarning, StringComparison.Ordinal)
+        && left.ExactMembers.SequenceEqual(right.ExactMembers);
 }
 
 public enum SimulatedDecisionChoice
@@ -136,6 +148,7 @@ public enum SimulatedDecisionChoice
     BlockCurrent
 }
 
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record GetSimulatedDecisionSnapshotMessage
 {
     public int Version { get; }
@@ -147,6 +160,7 @@ public sealed record GetSimulatedDecisionSnapshotMessage
     }
 }
 
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record SubscribeSimulatedDecisionEventsMessage
 {
     public int Version { get; }
@@ -160,6 +174,7 @@ public sealed record SubscribeSimulatedDecisionEventsMessage
     }
 }
 
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record SubmitSimulatedDecisionMessage
 {
     public int Version { get; }
@@ -178,6 +193,7 @@ public sealed record SubmitSimulatedDecisionMessage
     }
 }
 
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record RevokeSimulatedRememberedRuleMessage
 {
     public int Version { get; }
@@ -294,8 +310,9 @@ public sealed record SimulatedDestinationProjection
     public TransportProtocol Protocol { get; }
     public string? DomainEvidence { get; }
     public DomainEvidenceProvenance DomainProvenance { get; }
+    public DateTimeOffset? DomainObservedAtUtc { get; }
 
-    public SimulatedDestinationProjection(int version, IPAddress address, IpVersion ipVersion, int remotePort, TransportProtocol protocol, string? domainEvidence, DomainEvidenceProvenance domainProvenance)
+    public SimulatedDestinationProjection(int version, IPAddress address, IpVersion ipVersion, int remotePort, TransportProtocol protocol, string? domainEvidence, DomainEvidenceProvenance domainProvenance, DateTimeOffset? domainObservedAtUtc)
     {
         SimulatedDecisionProtocolLimits.RequireVersion(version);
         ArgumentNullException.ThrowIfNull(address);
@@ -308,9 +325,9 @@ public sealed record SimulatedDestinationProjection
             throw new ArgumentOutOfRangeException(nameof(remotePort), "Destination address family, port and protocol must be valid.");
         if (!Enum.IsDefined(domainProvenance))
             throw new ArgumentOutOfRangeException(nameof(domainProvenance));
-        if ((domainEvidence is null && domainProvenance != DomainEvidenceProvenance.None)
-            || (domainEvidence is not null && domainProvenance == DomainEvidenceProvenance.None))
-            throw new ArgumentException("Domain evidence and provenance must be present together.", nameof(domainEvidence));
+        if ((domainEvidence is null && (domainProvenance != DomainEvidenceProvenance.None || domainObservedAtUtc is not null))
+            || (domainEvidence is not null && (domainProvenance == DomainEvidenceProvenance.None || domainObservedAtUtc is null)))
+            throw new ArgumentException("Domain evidence requires both provenance and observation time; absent evidence requires neither.", nameof(domainEvidence));
         Version = version;
         Address = address;
         IpVersion = ipVersion;
@@ -318,6 +335,7 @@ public sealed record SimulatedDestinationProjection
         Protocol = protocol;
         DomainEvidence = SimulatedDecisionProtocolLimits.Optional(domainEvidence, nameof(domainEvidence), OutboundGateLimits.MaximumDomainLength);
         DomainProvenance = domainProvenance;
+        DomainObservedAtUtc = domainObservedAtUtc is null ? null : SimulatedDecisionProtocolLimits.Utc(domainObservedAtUtc.Value, nameof(domainObservedAtUtc));
     }
 }
 
@@ -654,11 +672,45 @@ public sealed record SimulatedDecisionSnapshotMessage
         RememberedRules = SimulatedDecisionProtocolLimits.Copy(rememberedRules, nameof(rememberedRules), SimulatedDecisionProtocolLimits.MaximumRememberedRuleCount);
         RecentStatuses = SimulatedDecisionProtocolLimits.Copy(recentStatuses, nameof(recentStatuses), SimulatedDecisionProtocolLimits.MaximumStatusCount);
         CriticalAlerts = SimulatedDecisionProtocolLimits.Copy(criticalAlerts, nameof(criticalAlerts), SimulatedDecisionProtocolLimits.MaximumCriticalAlertCount);
+        RequirePromptSubjectBound(ActivePrompts);
+        RequireRememberedRuleApplicationBound(RememberedRules);
         SimulatedDecisionProtocolLimits.RequireUnique(ActivePrompts.Select(item => item.ChallengeId).ToArray(), nameof(activePrompts));
         SimulatedDecisionProtocolLimits.RequireUnique(ReconnectNotices.Select(item => item.IntentId).ToArray(), nameof(reconnectNotices));
         SimulatedDecisionProtocolLimits.RequireUnique(RememberedRules.Select(item => item.RuleId).ToArray(), nameof(rememberedRules));
         Capacity = capacity;
         Counters = counters;
+    }
+
+    private static void RequirePromptSubjectBound(IReadOnlyList<SimulatedDecisionPromptProjection> prompts)
+    {
+        for (var index = 0; index < prompts.Count; index++)
+        {
+            var count = 1;
+            for (var other = 0; other < index; other++)
+            {
+                if (SimulatedDecisionProtocolLimits.StructuralSubjectEquals(prompts[index].Subject, prompts[other].Subject))
+                    count++;
+            }
+
+            if (count > SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject)
+                throw new ArgumentException($"A structural subject cannot have more than {SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject} active prompts.", nameof(prompts));
+        }
+    }
+
+    private static void RequireRememberedRuleApplicationBound(IReadOnlyList<SimulatedRememberedRuleProjection> rules)
+    {
+        for (var index = 0; index < rules.Count; index++)
+        {
+            var count = 1;
+            for (var other = 0; other < index; other++)
+            {
+                if (string.Equals(rules[index].ApplicationIdentity, rules[other].ApplicationIdentity, StringComparison.Ordinal))
+                    count++;
+            }
+
+            if (count > SimulatedDecisionProtocolLimits.MaximumRememberedRulesPerApplication)
+                throw new ArgumentException($"An application cannot have more than {SimulatedDecisionProtocolLimits.MaximumRememberedRulesPerApplication} remembered rules.", nameof(rules));
+        }
     }
 }
 
