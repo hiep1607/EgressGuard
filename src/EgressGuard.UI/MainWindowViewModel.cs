@@ -39,8 +39,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     private int _retentionDays = 30;
     private string _databasePath = "Unavailable until connected";
     private string _fileSensorStatus = "File correlation status unavailable";
+    private string _observedFileSensorStatus = "File correlation status unavailable";
     private FileSensorState? _fileSensorState;
     private bool _fileCorrelationEnabled;
+    private bool _fileCorrelationLoading;
+    private bool _fileCorrelationLoadFailed;
     private bool _disposed;
 
     public MainWindowViewModel()
@@ -51,7 +54,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     internal MainWindowViewModel(
         MainWindowRequestSession requestSession,
         string? pipeName,
-        bool ownsRequestSession = false)
+        bool ownsRequestSession = false,
+        Func<string, CancellationToken, Task<FileCorrelationsMessage>>? fileCorrelationFetcher = null,
+        TimeSpan? fileCorrelationMinimumInterval = null)
     {
         _requestSession = requestSession ?? throw new ArgumentNullException(nameof(requestSession));
         _eventClient = new EgressGuardEventClient(pipeName);
@@ -62,10 +67,10 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         FileCorrelationView.Filter = FilterFileCorrelation;
         _batchTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(_refreshIntervalMilliseconds) };
         _correlationRefresh = new BoundedSelectionRefresh<FileCorrelationsMessage>(
-            FetchFileCorrelationsAsync,
+            fileCorrelationFetcher ?? FetchFileCorrelationsAsync,
             ApplyFileCorrelations,
             HandleFileCorrelationFailure,
-            TimeSpan.FromSeconds(1));
+            fileCorrelationMinimumInterval ?? TimeSpan.FromSeconds(1));
         _batchTimer.Tick += OnBatchTimerTick;
         RefreshCommand = new AsyncCommand(RefreshAsync);
         AllowCommand = new AsyncCommand(() => CreateRuleAsync(FirewallAction.Allow));
@@ -81,6 +86,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     public event PropertyChangedEventHandler? PropertyChanged;
     internal MainWindowRequestSession RequestSession => _requestSession;
     internal bool OwnsRequestSession => _ownsRequestSession;
+    internal bool FileCorrelationLoading => _fileCorrelationLoading;
+    internal bool FileCorrelationLoadFailed => _fileCorrelationLoadFailed;
     public ObservableCollection<FlowRow> Flows { get; } = [];
     public ObservableCollection<FirewallRule> Rules { get; } = [];
     public ObservableCollection<SecurityAlert> Alerts { get; } = [];
@@ -114,6 +121,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     {
         get
         {
+            if (_fileCorrelationLoading) return "Loading file activity for this connection…";
+            if (_fileCorrelationLoadFailed) return "File activity is unavailable for this connection.";
             if (!FileCorrelationEnabled) return "File activity tracking is disabled.";
             if (!FileCorrelationView.IsEmpty) return string.Empty;
             if (FileCorrelations.Count > 0) return "No related file activity matches the selected filter.";
@@ -137,11 +146,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         {
             if (Set(ref _selectedFlow, value))
             {
-                if (value is null)
-                {
-                    Replace(FileCorrelations, []);
-                    OnPropertyChanged(nameof(FileCorrelationEmptyState));
-                }
+                Replace(FileCorrelations, []);
+                FileCorrelationView.Refresh();
+                _fileCorrelationLoading = value is not null;
+                _fileCorrelationLoadFailed = false;
+                RefreshFileCorrelationPresentation();
 
                 _correlationRefresh.Select(value?.Flow.Id);
             }
@@ -352,29 +361,57 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
 
     private void ApplyFileCorrelations(string flowId, FileCorrelationsMessage payload)
     {
-        if (SelectedFlow?.Flow.Id != flowId) return;
+        var selectedFlowId = SelectedFlow?.Flow.Id;
+        var identifiersMatch = string.Equals(flowId, selectedFlowId, StringComparison.Ordinal)
+            && string.Equals(selectedFlowId, payload.FlowId, StringComparison.Ordinal)
+            && string.Equals(payload.FlowId, flowId, StringComparison.Ordinal);
+        if (!identifiersMatch)
+        {
+            if (string.Equals(flowId, selectedFlowId, StringComparison.Ordinal))
+            {
+                HandleFileCorrelationFailure(
+                    flowId,
+                    new InvalidDataException("File correlation response did not match the selected connection."));
+            }
+            return;
+        }
+
         Replace(FileCorrelations, payload.Correlations.Select(item => new FileCorrelationRow(item)));
         _fileSensorState = payload.SensorStatus.State;
-        FileSensorStatus = FormatFileSensor(payload.SensorStatus);
+        _observedFileSensorStatus = FormatFileSensor(payload.SensorStatus);
+        _fileCorrelationLoading = false;
+        _fileCorrelationLoadFailed = false;
         FileCorrelationView.Refresh();
-        OnPropertyChanged(nameof(FileCorrelationEmptyState));
+        RefreshFileCorrelationPresentation();
     }
 
-    private void HandleFileCorrelationFailure(Exception exception)
+    private void HandleFileCorrelationFailure(string flowId, Exception exception)
     {
         if (exception is not (IOException or TimeoutException or InvalidDataException)) return;
+        if (!string.Equals(SelectedFlow?.Flow.Id, flowId, StringComparison.Ordinal)) return;
         Replace(FileCorrelations, []);
         FileCorrelationView.Refresh();
-        FileSensorStatus = "File correlation unavailable";
+        _fileCorrelationLoading = false;
+        _fileCorrelationLoadFailed = true;
         LastOperation = exception.Message;
-        OnPropertyChanged(nameof(FileCorrelationEmptyState));
+        RefreshFileCorrelationPresentation();
     }
 
-    private void UpdateFileSensor(ServiceStatusMessage status)
+    internal void UpdateFileSensor(ServiceStatusMessage status)
     {
         FileCorrelationEnabled = status.FileCorrelationEnabled;
         _fileSensorState = status.FileSensor?.State;
-        FileSensorStatus = status.FileSensor is null ? "File correlation status unavailable" : FormatFileSensor(status.FileSensor);
+        _observedFileSensorStatus = status.FileSensor is null ? "File correlation status unavailable" : FormatFileSensor(status.FileSensor);
+        RefreshFileCorrelationPresentation();
+    }
+
+    private void RefreshFileCorrelationPresentation()
+    {
+        FileSensorStatus = _fileCorrelationLoading
+            ? "File activity for this connection is loading…"
+            : _fileCorrelationLoadFailed
+                ? "File activity is unavailable for this connection."
+                : _observedFileSensorStatus;
         OnPropertyChanged(nameof(FileCorrelationEmptyState));
     }
 
