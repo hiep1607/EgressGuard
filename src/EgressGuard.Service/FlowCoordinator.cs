@@ -102,7 +102,7 @@ public sealed partial class FlowCoordinator : BackgroundService
         if (_state.FileCorrelationEnabled)
         {
             await _fileSensor.StartAsync(stoppingToken).ConfigureAwait(false);
-            _state.SetFileSensorStatus(_fileSensor.Status);
+            _state.SetFileSensorStatus(CurrentFileSensorStatus());
             filePumpTask = PumpFileActivityAsync(stoppingToken);
         }
         else
@@ -237,6 +237,11 @@ public sealed partial class FlowCoordinator : BackgroundService
             {
                 _eventHub.PublishAlert(CreateAlert(change.Flow));
             }
+        }
+
+        if (_state.FileCorrelationEnabled)
+        {
+            _state.SetFileSensorStatus(CurrentFileSensorStatus());
         }
 
         _eventHub.PublishStatus(new ServiceStatusMessage(
@@ -376,12 +381,43 @@ public sealed partial class FlowCoordinator : BackgroundService
         }
         catch (Exception exception)
         {
-            _state.SetFileSensorStatus(new FileSensorStatus(FileSensorState.Failed, _fileSensor.Status.DroppedEvents, "File activity processing failed.", DateTimeOffset.UtcNow));
+            _state.SetFileSensorStatus(CombineFileSensorStatus(
+                new FileSensorStatus(FileSensorState.Failed, _fileSensor.Status.DroppedEvents, null, DateTimeOffset.UtcNow),
+                _fileCorrelationEngine.DroppedEvents));
             LogFileSensorFailed(_logger, exception);
         }
     }
 
-    private void OnFileSensorStatusChanged(object? sender, FileSensorStatus status) => _state.SetFileSensorStatus(status);
+    private FileSensorStatus CurrentFileSensorStatus() =>
+        CombineFileSensorStatus(_fileSensor.Status, _fileCorrelationEngine.DroppedEvents);
+
+    internal static FileSensorStatus CombineFileSensorStatus(FileSensorStatus sensorStatus, long correlationDroppedEvents)
+    {
+        ArgumentNullException.ThrowIfNull(sensorStatus);
+        ArgumentOutOfRangeException.ThrowIfNegative(sensorStatus.DroppedEvents);
+        ArgumentOutOfRangeException.ThrowIfNegative(correlationDroppedEvents);
+
+        var droppedEvents = sensorStatus.DroppedEvents > long.MaxValue - correlationDroppedEvents
+            ? long.MaxValue
+            : sensorStatus.DroppedEvents + correlationDroppedEvents;
+        var state = correlationDroppedEvents > 0 && sensorStatus.State == FileSensorState.Running
+            ? FileSensorState.OverflowDegraded
+            : sensorStatus.State;
+        var detail = state switch
+        {
+            FileSensorState.Disabled => "File correlation is disabled by configuration.",
+            FileSensorState.AccessDenied => "ETW file activity tracking requires an elevated service token.",
+            FileSensorState.ProviderUnavailable => "Windows ETW file activity tracking is unavailable.",
+            FileSensorState.OverflowDegraded => "Bounded file activity buffers dropped events.",
+            FileSensorState.Failed => "File activity tracking failed; network monitoring remains active.",
+            _ => null
+        };
+
+        return sensorStatus with { State = state, DroppedEvents = droppedEvents, Detail = detail };
+    }
+
+    private void OnFileSensorStatusChanged(object? sender, FileSensorStatus status) =>
+        _state.SetFileSensorStatus(CombineFileSensorStatus(status, _fileCorrelationEngine.DroppedEvents));
 
     private static bool IsSystemProtected(NetworkFlow flow) =>
         flow.Executable is not null && OwnedFirewallRuleManager.IsProtectedSystemExecutable(flow.Executable.Path);

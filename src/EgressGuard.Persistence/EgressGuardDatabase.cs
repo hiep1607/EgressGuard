@@ -246,8 +246,9 @@ public sealed class EgressGuardDatabase
         ArgumentNullException.ThrowIfNull(correlations);
         await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-        foreach (var item in correlations)
+        foreach (var correlation in correlations)
         {
+            var item = FileCorrelationPrivacy.ProtectForBoundary(correlation);
             var command = connection.CreateCommand();
             command.Transaction = transaction;
             command.CommandText = """
@@ -291,12 +292,12 @@ public sealed class EgressGuardDatabase
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            result.Add(new FileCorrelation(
+            result.Add(FileCorrelationPrivacy.ProtectForBoundary(new FileCorrelation(
                 Guid.Parse(reader.GetString(0)), reader.GetString(1),
                 new ProcessIdentity(reader.GetInt32(2), new DateTimeOffset(reader.GetInt64(3), TimeSpan.Zero)),
                 reader.GetString(4), Enum.Parse<FileActivityOperation>(reader.GetString(5)), reader.GetString(6), reader.GetString(7), reader.GetString(8),
                 DateTimeOffset.Parse(reader.GetString(9), CultureInfo.InvariantCulture), reader.GetDouble(10),
-                Enum.Parse<CorrelationConfidence>(reader.GetString(11)), reader.GetString(12), DateTimeOffset.Parse(reader.GetString(13), CultureInfo.InvariantCulture)));
+                Enum.Parse<CorrelationConfidence>(reader.GetString(11)), reader.GetString(12), DateTimeOffset.Parse(reader.GetString(13), CultureInfo.InvariantCulture))));
         }
 
         return result;

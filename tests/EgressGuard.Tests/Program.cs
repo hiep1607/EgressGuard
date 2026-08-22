@@ -110,6 +110,9 @@ internal static class Program
             ("Promoted correlation cleanup work is bounded", TestPromotedCorrelationCleanupAsync),
             ("ETW ownership reclaims only an exact verified orphan", TestEtwOwnershipAsync),
             ("AccessDenied file sensor does not crash network service", TestFileSensorDegradedServiceAsync),
+            ("File activity UI presents operations filters status and limitation", TestFileActivityUiPresentationAsync),
+            ("File activity drop totals include every bounded observation buffer", TestFileActivityDropAggregationAsync),
+            ("File activity evidence stays redacted through protocol persistence and UI", TestFileActivityPrivacyBoundariesAsync),
             ("Native port conversion", TestPortConversionAsync),
             ("Endpoint formatting", TestEndpointFormattingAsync),
             ("Executable metadata hashes and caches", TestExecutableMetadataAsync),
@@ -1014,6 +1017,171 @@ internal static class Program
         {
             SqliteConnection.ClearAllPools();
             Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    private static async Task TestFileActivityUiPresentationAsync()
+    {
+        var flow = SampleFlow();
+        FileActivityOperation[] operations =
+        [
+            FileActivityOperation.Read,
+            FileActivityOperation.OpenCreate,
+            FileActivityOperation.Write,
+            FileActivityOperation.Rename,
+            FileActivityOperation.Delete
+        ];
+        var correlations = operations.Select((operation, index) => new FileCorrelation(
+            Guid.NewGuid(), flow.Id, flow.ProcessIdentity!.Value, flow.ProcessName, operation,
+            $"{index:X64}", $"file-{index:X12}.egfixture", ".egfixture",
+            flow.FirstSeen.AddSeconds(index - 2), index - 2,
+            CorrelationConfidence.Medium,
+            $"Same process identity; file {operation} near outbound flow first-seen.",
+            flow.FirstSeen)).ToArray();
+        var rows = correlations.Select(item => new FileCorrelationRow(item)).ToArray();
+
+        AssertTrue(
+            rows.Select(row => row.OperationLabel).SequenceEqual(["Read", "Open / create", "Write", "Rename", "Delete"]),
+            "File activity operations were not presented with the expected labels.");
+        AssertEqual("2 s before connection", rows[0].RelativeTiming);
+        AssertEqual("At connection time", rows[2].RelativeTiming);
+        AssertEqual("2 s after connection", rows[4].RelativeTiming);
+        AssertTrue(rows.All(row => row.RedactedFileLabel.StartsWith("file-", StringComparison.Ordinal)), "A UI row did not use a redacted file label.");
+
+        var pipeName = $"{ProtocolConstants.PipeName}.FileUi.{Guid.NewGuid():N}";
+        await RunStaAsync(async () =>
+        {
+            await using var requestSession = new MainWindowRequestSession(pipeName);
+            await using var viewModel = new MainWindowViewModel(requestSession, pipeName);
+            foreach (var row in rows) viewModel.FileCorrelations.Add(row);
+
+            viewModel.FileActivityFilter = MainWindowViewModel.FileActivityFilterReadOpen;
+            AssertTrue(
+                viewModel.FileCorrelationView.Cast<FileCorrelationRow>().Select(row => row.Operation)
+                    .SequenceEqual([FileActivityOperation.Read, FileActivityOperation.OpenCreate]),
+                "Read/open filter included the wrong operations.");
+            viewModel.FileActivityFilter = MainWindowViewModel.FileActivityFilterModify;
+            AssertTrue(
+                viewModel.FileCorrelationView.Cast<FileCorrelationRow>().Select(row => row.Operation)
+                    .SequenceEqual([FileActivityOperation.Write, FileActivityOperation.Rename, FileActivityOperation.Delete]),
+                "Write/rename/delete filter included the wrong operations.");
+            viewModel.FileActivityFilter = MainWindowViewModel.FileActivityFilterAll;
+            AssertEqual(5, viewModel.FileCorrelationView.Cast<FileCorrelationRow>().Count());
+            AssertEqual(0, requestSession.PendingOperationCount);
+            AssertTrue(!requestSession.IsConnected, "A presentation-only UI test opened a request connection.");
+        }).ConfigureAwait(false);
+
+        AssertEqual(
+            "File activity tracker: active · dropped 0",
+            MainWindowViewModel.FormatFileSensor(new FileSensorStatus(FileSensorState.Running, 0, null, flow.FirstSeen)));
+        AssertTrue(
+            MainWindowViewModel.FormatFileSensor(new FileSensorStatus(FileSensorState.AccessDenied, 2, null, flow.FirstSeen)).Contains("permission denied · dropped 2", StringComparison.Ordinal),
+            "AccessDenied was not presented truthfully.");
+        AssertTrue(
+            MainWindowViewModel.FormatFileSensor(new FileSensorStatus(FileSensorState.ProviderUnavailable, 3, null, flow.FirstSeen)).Contains("unavailable · dropped 3", StringComparison.Ordinal),
+            "ProviderUnavailable was not presented truthfully.");
+        AssertTrue(
+            MainWindowViewModel.FormatFileSensor(new FileSensorStatus(FileSensorState.Stopped, 4, null, flow.FirstSeen)).Contains("stopped · dropped 4", StringComparison.Ordinal),
+            "Stopped was not presented truthfully.");
+
+        var repositoryRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", ".."));
+        var xaml = await File.ReadAllTextAsync(Path.Combine(repositoryRoot, "src", "EgressGuard.UI", "MainWindow.xaml")).ConfigureAwait(false);
+        AssertTrue(xaml.Contains("AutomationProperties.AutomationId=\"FileActivityFilter\"", StringComparison.Ordinal), "File activity filter was not exposed in the connection detail UI.");
+        AssertTrue(xaml.Contains("Related activity does not prove that file contents were transmitted.", StringComparison.Ordinal), "The file-correlation limitation is not always present in the UI markup.");
+        AssertTrue(!xaml.Contains("file was uploaded", StringComparison.OrdinalIgnoreCase), "The UI makes an unsupported upload claim.");
+    }
+
+    private static Task TestFileActivityDropAggregationAsync()
+    {
+        var changedAt = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var rawPath = "C:\\Synthetic\\private-observed-file.egfixture";
+        var combined = FlowCoordinator.CombineFileSensorStatus(
+            new FileSensorStatus(FileSensorState.Running, 7, rawPath, changedAt),
+            5);
+        AssertEqual(FileSensorState.OverflowDegraded, combined.State);
+        AssertEqual(12L, combined.DroppedEvents);
+        AssertTrue(!combined.Detail!.Contains(rawPath, StringComparison.OrdinalIgnoreCase), "Provider detail crossed the service boundary without sanitization.");
+
+        var saturated = FlowCoordinator.CombineFileSensorStatus(
+            new FileSensorStatus(FileSensorState.OverflowDegraded, long.MaxValue - 1, rawPath, changedAt),
+            10);
+        AssertEqual(long.MaxValue, saturated.DroppedEvents);
+        AssertEqual(FileSensorState.OverflowDegraded, saturated.State);
+
+        var denied = FlowCoordinator.CombineFileSensorStatus(
+            new FileSensorStatus(FileSensorState.AccessDenied, 3, rawPath, changedAt),
+            0);
+        AssertEqual(FileSensorState.AccessDenied, denied.State);
+        AssertEqual(3L, denied.DroppedEvents);
+        AssertTrue(!denied.Detail!.Contains(rawPath, StringComparison.OrdinalIgnoreCase), "AccessDenied detail leaked an observed path.");
+        return Task.CompletedTask;
+    }
+
+    private static async Task TestFileActivityPrivacyBoundariesAsync()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "EgressGuard-FilePrivacy-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var privateToken = "private-observed-" + Guid.NewGuid().ToString("N");
+        var observedPath = Path.Combine(directory, privateToken + ".egfixture");
+        var databasePath = Path.Combine(directory, "test.db");
+        try
+        {
+            await File.WriteAllTextAsync(observedPath, "synthetic non-sensitive fixture").ConfigureAwait(false);
+            var flow = SampleFlow();
+            var engine = NewCorrelationEngine();
+            AssertTrue(engine.Add(FileEvent(flow, 1, -1, FileActivityOperation.Read, observedPath)), "Synthetic privacy event was rejected.");
+            var correlation = engine.Correlate(flow, flow.FirstSeen).Single();
+            var malformed = correlation with
+            {
+                Id = Guid.NewGuid(),
+                ProtectedFileIdentifier = observedPath,
+                DisplayPath = observedPath,
+                Extension = "." + privateToken,
+                Reason = observedPath
+            };
+            var protectedMalformed = FileCorrelationPrivacy.ProtectForBoundary(malformed);
+            AssertEqual(string.Empty, protectedMalformed.Extension);
+            AssertTrue(!protectedMalformed.DisplayPath.Contains(privateToken, StringComparison.OrdinalIgnoreCase), "A filename-like extension survived boundary protection.");
+            AssertTrue(!protectedMalformed.Reason.Contains(observedPath, StringComparison.OrdinalIgnoreCase), "A path-bearing reason survived boundary protection.");
+            var status = FlowCoordinator.CombineFileSensorStatus(
+                new FileSensorStatus(FileSensorState.Running, 0, observedPath, flow.FirstSeen),
+                engine.DroppedEvents);
+            var envelope = MessageEnvelope.Create(
+                MessageTypes.GetFileCorrelations,
+                new FileCorrelationsMessage(flow.Id, [correlation, protectedMalformed], status));
+            var serialized = JsonSerializer.Serialize(envelope, JsonDefaults.Options);
+            AssertTrue(!serialized.Contains(observedPath, StringComparison.OrdinalIgnoreCase), "Named Pipe payload contained the observed path.");
+            AssertTrue(!serialized.Contains(privateToken, StringComparison.OrdinalIgnoreCase), "Named Pipe payload contained the observed file name.");
+
+            var row = new FileCorrelationRow(malformed);
+            var uiText = string.Join('|', row.OperationLabel, row.RedactedFileLabel, row.ActivityTime, row.RelativeTiming, row.Confidence, row.Reason, MainWindowViewModel.FormatFileSensor(status));
+            AssertTrue(!uiText.Contains(observedPath, StringComparison.OrdinalIgnoreCase), "UI projection contained the observed path.");
+            AssertTrue(!uiText.Contains(privateToken, StringComparison.OrdinalIgnoreCase), "UI projection contained the observed file name.");
+            AssertTrue(typeof(FileCorrelationRow).GetProperty("Path") is null, "UI projection exposed a raw Path property.");
+
+            var database = new EgressGuardDatabase(databasePath);
+            await database.InitializeAsync().ConfigureAwait(false);
+            await database.SaveFlowsAsync([flow]).ConfigureAwait(false);
+            await database.SaveFileCorrelationsAsync([correlation, malformed]).ConfigureAwait(false);
+            await using var connection = new SqliteConnection($"Data Source={databasePath};Pooling=False");
+            await connection.OpenAsync().ConfigureAwait(false);
+            var command = connection.CreateCommand();
+            command.CommandText = "SELECT protected_file_id,display_path,extension,reason FROM file_correlations;";
+            await using var reader = await command.ExecuteReaderAsync().ConfigureAwait(false);
+            var persistedValues = new List<string>();
+            while (await reader.ReadAsync().ConfigureAwait(false))
+            {
+                persistedValues.Add(string.Join('|', reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.GetString(3)));
+            }
+            AssertEqual(2, persistedValues.Count);
+            var persistedText = string.Join('|', persistedValues);
+            AssertTrue(!persistedText.Contains(observedPath, StringComparison.OrdinalIgnoreCase), "Persistence contained the observed path.");
+            AssertTrue(!persistedText.Contains(privateToken, StringComparison.OrdinalIgnoreCase), "Persistence contained the observed file name.");
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
         }
     }
 
