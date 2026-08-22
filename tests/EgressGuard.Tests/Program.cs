@@ -5,6 +5,8 @@ using System.Net.Sockets;
 using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Security.Principal;
+using System.Text.Json;
+using System.Text.RegularExpressions;
 using EgressGuard.Core;
 using EgressGuard.Persistence;
 using EgressGuard.Protocol;
@@ -158,6 +160,8 @@ internal static class Program
             ("Phase 5B-03 authenticated ticket fields and grants remain distinct", TestOneTimeTicketAuthenticatedFieldsAsync),
             ("Phase 5B-03 active grant reservations are bounded and expire monotonically", TestOneTimeTicketActiveGrantCapacityAsync),
             ("Phase 5B-03 policy and restart transitions serialize with redemption", TestOneTimeTicketAuthorityRaceAsync),
+            ("Phase 5B-04 challenge admission failure is targeted and bounded", TestChallengeAdmissionFailureAsync),
+            ("Phase 5B-04 deterministic driver simulator acceptance suite", TestOutboundGateSimulatorAcceptanceAsync),
             ("Default UI clients honor configured pipe name", TestConfiguredPipeNameAsync),
             ("File correlation IPC stays compatible and bounded", TestFileCorrelationProtocolAsync),
             ("UI correlation refresh coalesces updates and cancels stale selection", TestUiCorrelationRefreshAsync),
@@ -2835,6 +2839,309 @@ internal static class Program
         await TestRestartRaceAsync(sample).ConfigureAwait(false);
     }
 
+    private static Task TestChallengeAdmissionFailureAsync()
+    {
+        var sample = OutboundGateSamples();
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new ChallengeAdmissionFailure(1, Guid.NewGuid(), sample.Intent.IntentId, sample.Subject, sample.DriverGeneration, ChallengeAdmissionFailureKind.Unspecified, sample.ReadWindow.StartedAt));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new ChallengeAdmissionFailure(1, Guid.NewGuid(), sample.Intent.IntentId, sample.Subject, sample.DriverGeneration, (ChallengeAdmissionFailureKind)99, sample.ReadWindow.StartedAt));
+        AssertThrows<ArgumentException>(() => _ = new ChallengeAdmissionFailure(1, Guid.Empty, sample.Intent.IntentId, sample.Subject, sample.DriverGeneration, ChallengeAdmissionFailureKind.HeldFlowCapacityExhausted, sample.ReadWindow.StartedAt));
+        AssertThrows<ArgumentException>(() => _ = new ChallengeAdmissionFailure(1, Guid.NewGuid(), Guid.Empty, sample.Subject, sample.DriverGeneration, ChallengeAdmissionFailureKind.HeldFlowCapacityExhausted, sample.ReadWindow.StartedAt));
+        AssertThrows<ArgumentException>(() => _ = new ChallengeAdmissionFailure(1, Guid.NewGuid(), sample.Intent.IntentId, sample.Subject, Guid.Empty, ChallengeAdmissionFailureKind.HeldFlowCapacityExhausted, sample.ReadWindow.StartedAt));
+
+        var clock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var nonces = new TestNonceProvider();
+        using var machine = CreateOutboundGateMachine(sample, clock, nonces);
+        var liveIntent = IntentFor(sample, Guid.NewGuid(), sample.Subject, 1_001);
+        var live = PrepareToChallenge(machine, sample, clock, nonces, liveIntent);
+        var rejectedIntent = IntentFor(sample, Guid.NewGuid(), sample.Subject, 1_002);
+        PrepareAwaitingChallenge(machine, sample, nonces, rejectedIntent);
+        var before = machine.Counters;
+        var alertCount = machine.CriticalAlerts.Count;
+        var failure = ChallengeAdmissionFailureFor(sample, clock, nonces.NextNonce(), rejectedIntent);
+        AssertEqual(1, failure.Version);
+        AssertEqual(rejectedIntent.IntentId, failure.IntentId);
+        AssertEqual(sample.DriverGeneration, failure.WfpGeneration);
+        AssertEqual(ChallengeAdmissionFailureKind.HeldFlowCapacityExhausted, failure.FailureKind);
+        AssertEqual(clock.Now(), failure.ObservedAt);
+
+        var rejected = machine.ReceiveChallengeAdmissionFailure(failure);
+        AssertEqual(GateRuntimeState.FailedOpen, rejected.Status.State);
+        AssertEqual("challenge-admission-held-flow-capacity-exhausted", rejected.Status.ReasonCode);
+        AssertTrue(rejected.CriticalAlert is not null, "Targeted challenge admission failure omitted its Core Critical Alert.");
+        AssertTrue(rejected.Challenge is null && rejected.Ticket is null && rejected.Grant is null, "Targeted challenge admission failure created authority.");
+        AssertEqual(before.FailedOpenCount + 1, machine.Counters.FailedOpenCount);
+        AssertEqual(before.OverflowCount + 1, machine.Counters.OverflowCount);
+        AssertEqual(alertCount + 1, machine.CriticalAlerts.Count);
+        AssertEqual(1, machine.Storage.ActiveContextCount);
+        AssertEqual(1, machine.Storage.ChallengeMappingCount);
+        AssertEqual(GateRuntimeState.AwaitingDecision, machine.ReceiveIntent(liveIntent).Status.State);
+        var rejectedReplay = machine.ReceiveIntent(rejectedIntent);
+        AssertTrue(rejectedReplay.IsDuplicate && rejectedReplay.Status.State == GateRuntimeState.FailedOpen, "Rejected intent was not terminal after targeted failure.");
+        AssertTrue(rejectedReplay.Challenge is null && rejectedReplay.Ticket is null && rejectedReplay.Grant is null, "Rejected intent replay exposed authority.");
+
+        var afterFirst = machine.Counters;
+        var alertsAfterFirst = machine.CriticalAlerts.Count;
+        var duplicate = machine.ReceiveChallengeAdmissionFailure(new ChallengeAdmissionFailure(failure.Version, failure.FailureId, failure.IntentId, failure.Subject, failure.WfpGeneration, failure.FailureKind, failure.ObservedAt));
+        AssertTrue(duplicate.IsDuplicate, "Exact challenge admission failure duplicate was not idempotent.");
+        AssertEqual(afterFirst, machine.Counters);
+        AssertEqual(alertsAfterFirst, machine.CriticalAlerts.Count);
+
+        var differentSubject = new GateSubject(1, new ProcessIdentity(90_001, sample.Start), "sha256:failure-mismatch", null, [new ProcessIdentity(90_001, sample.Start)]);
+        AssertThrows<InvalidOperationException>(() => machine.ReceiveChallengeAdmissionFailure(new ChallengeAdmissionFailure(1, failure.FailureId, failure.IntentId, differentSubject, failure.WfpGeneration, failure.FailureKind, failure.ObservedAt)));
+        AssertThrows<InvalidOperationException>(() => machine.ReceiveChallengeAdmissionFailure(ChallengeAdmissionFailureFor(sample, clock, nonces.NextNonce(), rejectedIntent)));
+        AssertEqual(afterFirst, machine.Counters);
+        AssertEqual(alertsAfterFirst, machine.CriticalAlerts.Count);
+
+        var pendingIntent = IntentFor(sample, Guid.NewGuid(), sample.Subject, 1_003);
+        PrepareAwaitingChallenge(machine, sample, nonces, pendingIntent);
+        AssertThrows<InvalidOperationException>(() => machine.ReceiveChallengeAdmissionFailure(new ChallengeAdmissionFailure(1, failure.FailureId, pendingIntent.IntentId, pendingIntent.Subject, sample.DriverGeneration, failure.FailureKind, clock.Now())));
+        AssertThrows<InvalidOperationException>(() => machine.ReceiveChallengeAdmissionFailure(ChallengeAdmissionFailureFor(sample, clock, nonces.NextNonce(), pendingIntent, wfpGeneration: Guid.NewGuid())));
+        AssertThrows<InvalidOperationException>(() => machine.ReceiveChallengeAdmissionFailure(ChallengeAdmissionFailureFor(sample, clock, nonces.NextNonce(), pendingIntent, subject: differentSubject)));
+        var unknownIntent = IntentFor(sample, Guid.NewGuid(), sample.Subject, 1_004);
+        AssertThrows<InvalidOperationException>(() => machine.ReceiveChallengeAdmissionFailure(ChallengeAdmissionFailureFor(sample, clock, nonces.NextNonce(), unknownIntent)));
+        AssertEqual(afterFirst.FailedOpenCount, machine.Counters.FailedOpenCount);
+        AssertEqual(afterFirst.OverflowCount, machine.Counters.OverflowCount);
+        AssertEqual(alertsAfterFirst, machine.CriticalAlerts.Count);
+        AssertEqual(2, machine.Storage.ActiveContextCount);
+        AssertEqual(1, machine.Storage.ChallengeMappingCount);
+
+        var wrongPhaseClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var wrongPhaseNonces = new TestNonceProvider();
+        using var wrongPhaseMachine = CreateOutboundGateMachine(sample, wrongPhaseClock, wrongPhaseNonces);
+        var wrongPhaseIntent = IntentFor(sample, Guid.NewGuid(), sample.Subject, 1_100);
+        wrongPhaseMachine.ReceiveIntent(wrongPhaseIntent);
+        AssertThrows<InvalidOperationException>(() => wrongPhaseMachine.ReceiveChallengeAdmissionFailure(ChallengeAdmissionFailureFor(sample, wrongPhaseClock, wrongPhaseNonces.NextNonce(), wrongPhaseIntent)));
+
+        var authorityClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var authorityNonces = new TestNonceProvider();
+        using var authorityMachine = CreateOutboundGateMachine(sample, authorityClock, authorityNonces);
+        var authorityIntent = IntentFor(sample, Guid.NewGuid(), sample.Subject, 1_101);
+        var challenged = PrepareToChallenge(authorityMachine, sample, authorityClock, authorityNonces, authorityIntent);
+        AssertThrows<InvalidOperationException>(() => authorityMachine.ReceiveChallengeAdmissionFailure(ChallengeAdmissionFailureFor(sample, authorityClock, authorityNonces.NextNonce(), authorityIntent)));
+        var ticket = authorityMachine.ReceiveDecision(new UserDecision(1, authorityNonces.NextNonce(), challenged.Challenge.ChallengeId, UserDecisionKind.AllowOnce, null, sample.Start, "test")).Ticket!;
+        AssertThrows<InvalidOperationException>(() => authorityMachine.ReceiveChallengeAdmissionFailure(ChallengeAdmissionFailureFor(sample, authorityClock, authorityNonces.NextNonce(), authorityIntent)));
+        authorityMachine.RedeemTicket(ticket);
+        AssertThrows<InvalidOperationException>(() => authorityMachine.ReceiveChallengeAdmissionFailure(ChallengeAdmissionFailureFor(sample, authorityClock, authorityNonces.NextNonce(), authorityIntent)));
+
+        using var disabled = new OutboundGateStateMachine(clock, nonces, new TestAuditClock(sample.Start));
+        AssertThrows<InvalidOperationException>(() => disabled.ReceiveChallengeAdmissionFailure(ChallengeAdmissionFailureFor(sample, clock, nonces.NextNonce(), sample.Intent)));
+        AssertEqual(new GateStateMachineCounters(0, 0, 0, 0), disabled.Counters);
+
+        var boundedClock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
+        var boundedNonces = new TestNonceProvider();
+        using var boundedMachine = CreateOutboundGateMachine(sample, boundedClock, boundedNonces);
+        const int terminalAttempts = 300;
+        for (var index = 0; index < terminalAttempts; index++)
+        {
+            var intent = IntentFor(sample, Guid.NewGuid(), sample.Subject, 2_000 + index);
+            PrepareAwaitingChallenge(boundedMachine, sample, boundedNonces, intent);
+            var result = boundedMachine.ReceiveChallengeAdmissionFailure(ChallengeAdmissionFailureFor(sample, boundedClock, boundedNonces.NextNonce(), intent));
+            AssertEqual("challenge-admission-held-flow-capacity-exhausted", result.Status.ReasonCode);
+        }
+        AssertEqual(terminalAttempts, boundedMachine.Counters.FailedOpenCount);
+        AssertEqual(terminalAttempts, boundedMachine.Counters.OverflowCount);
+        AssertEqual(0, boundedMachine.Storage.ActiveContextCount);
+        AssertEqual(0, boundedMachine.Storage.ChallengeMappingCount);
+        AssertEqual(boundedMachine.Storage.TerminalHistoryCapacity, boundedMachine.Storage.TerminalHistoryCount);
+        AssertEqual(boundedMachine.Storage.CriticalAlertCapacity, boundedMachine.Storage.CriticalAlertCount);
+        return Task.CompletedTask;
+    }
+
+    private static async Task TestOutboundGateSimulatorAcceptanceAsync()
+    {
+        string[] expectedNames =
+        [
+            "disabled-default-zero-state", "happy-new-tcp", "happy-new-udp", "release-requires-full-ack", "completion-requires-exact-binding", "existing-tcp-reconnect-required", "existing-udp-reconnect-required", "existing-quic-reconnect-required", "delay-before-deadline-succeeds", "delay-at-deadline-fails-open", "drop-times-out-deterministically", "minifilter-crash-restart-cleans", "wfp-crash-restart-cleans", "service-restart-cleans", "stale-wfp-generation-rejected", "stale-minifilter-generation-rejected", "pending-read-subject-cap", "pending-read-global-cap", "challenge-subject-cap", "challenge-global-cap", "endpoint-channel-boundaries", "held-flow-entry-boundaries", "held-data-flow-cap", "held-data-global-cap", "scheduler-cap", "fault-plan-cap", "pump-dispatch-budget", "ticket-replay-through-endpoint", "ticket-capacity-through-endpoint", "grant-expiry-and-byte-count", "policy-change-cleans-endpoints", "privacy-metadata-only", "no-wall-clock-or-event-workers", "all-faults-finish-zero-owned-state"
+        ];
+        var repositoryRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", ".."));
+        var simulatorDirectory = Path.Combine(repositoryRoot, "tools", "EgressGuard.OutboundGateSimulator");
+        var simulatorExecutable = Path.Combine(simulatorDirectory, "bin", "Release", "net8.0-windows", "EgressGuard.OutboundGateSimulator.exe");
+        AssertTrue(File.Exists(simulatorExecutable), "The independently built simulator executable was not found.");
+
+        var disabled = await RunSimulatorAsync(simulatorExecutable).ConfigureAwait(false);
+        AssertEqual(0, disabled.ExitCode);
+        AssertTrue(string.IsNullOrEmpty(disabled.StandardError), "Disabled-default invocation wrote stderr.");
+        using (var disabledJson = JsonDocument.Parse(disabled.StandardOutput))
+        {
+            var root = disabledJson.RootElement;
+            AssertEqual(0, root.GetProperty("Mode").GetInt32());
+            AssertEqual(0, root.GetProperty("OwnedOperationCount").GetInt32());
+            AssertEqual(0, root.GetProperty("CoreActiveContextCount").GetInt32());
+            AssertEqual(0, root.GetProperty("InstalledGrantCount").GetInt32());
+        }
+
+        var firstSuite = await RunSimulatorAsync(simulatorExecutable, "--acceptance-suite", "--json").ConfigureAwait(false);
+        var secondSuite = await RunSimulatorAsync(simulatorExecutable, "--acceptance-suite", "--json").ConfigureAwait(false);
+        AssertEqual(0, firstSuite.ExitCode);
+        AssertEqual(0, secondSuite.ExitCode);
+        AssertTrue(string.IsNullOrEmpty(firstSuite.StandardError) && string.IsNullOrEmpty(secondSuite.StandardError), "Acceptance suite wrote stderr.");
+        AssertEqual(firstSuite.StandardOutput, secondSuite.StandardOutput);
+        using (var suiteJson = JsonDocument.Parse(firstSuite.StandardOutput))
+        {
+            var root = suiteJson.RootElement;
+            AssertEqual(expectedNames.Length, root.GetProperty("Total").GetInt32());
+            AssertEqual(expectedNames.Length, root.GetProperty("Passed").GetInt32());
+            var scenarios = root.GetProperty("Scenarios").EnumerateArray().ToArray();
+            AssertTrue(scenarios.Select(item => item.GetProperty("Name").GetString()).SequenceEqual(expectedNames), "Simulator scenario names/order differ from the 34 locked cases.");
+            AssertTrue(scenarios.All(item => item.GetProperty("Passed").GetBoolean()), "The simulator acceptance suite contained a failing scenario.");
+            var snapshots = scenarios.ToDictionary(
+                item => item.GetProperty("Name").GetString() ?? throw new InvalidOperationException("Simulator scenario omitted its name."),
+                item => item.GetProperty("Snapshot"),
+                StringComparer.Ordinal);
+
+            var challengeSubject = snapshots["challenge-subject-cap"];
+            AssertEqual(1L, challengeSubject.GetProperty("OverflowCount").GetInt64());
+            AssertTrue(challengeSubject.GetProperty("CriticalAlertCount").GetInt64() > 0, "Subject challenge cap omitted Critical Alert evidence.");
+            AssertEqual(5L, challengeSubject.GetProperty("AcceptedReadCount").GetInt64());
+            AssertEqual(5L, challengeSubject.GetProperty("ReleasedReadCount").GetInt64());
+            AssertEqual(4L, challengeSubject.GetProperty("AcceptedFlowCount").GetInt64());
+            AssertEqual(4L, challengeSubject.GetProperty("ReleasedFlowCount").GetInt64());
+            AssertEqual(4L, challengeSubject.GetProperty("ChallengeCreatedCount").GetInt64());
+            AssertEqual(4L, challengeSubject.GetProperty("ChallengeDeliveredCount").GetInt64());
+            AssertEqual(1L, challengeSubject.GetProperty("ServiceRestartCount").GetInt64());
+            AssertSimulatorSnapshotClean(challengeSubject, "subject challenge cap cleanup");
+
+            var challengeGlobal = snapshots["challenge-global-cap"];
+            AssertEqual(1L, challengeGlobal.GetProperty("OverflowCount").GetInt64());
+            AssertTrue(challengeGlobal.GetProperty("CriticalAlertCount").GetInt64() > 0, "Global challenge cap omitted Critical Alert evidence.");
+            AssertEqual(129L, challengeGlobal.GetProperty("AcceptedReadCount").GetInt64());
+            AssertEqual(129L, challengeGlobal.GetProperty("ReleasedReadCount").GetInt64());
+            AssertEqual(128L, challengeGlobal.GetProperty("AcceptedFlowCount").GetInt64());
+            AssertEqual(128L, challengeGlobal.GetProperty("ReleasedFlowCount").GetInt64());
+            AssertEqual(128L, challengeGlobal.GetProperty("ChallengeCreatedCount").GetInt64());
+            AssertEqual(128L, challengeGlobal.GetProperty("ChallengeDeliveredCount").GetInt64());
+            AssertEqual(1L, challengeGlobal.GetProperty("ServiceRestartCount").GetInt64());
+            AssertSimulatorSnapshotClean(challengeGlobal, "global challenge cap cleanup");
+
+            var serviceRestart = snapshots["service-restart-cleans"];
+            AssertEqual(0, serviceRestart.GetProperty("FaultPlanCount").GetInt32());
+            AssertEqual(8L, serviceRestart.GetProperty("ServiceRestartCount").GetInt64());
+            AssertEqual(2L, serviceRestart.GetProperty("AcceptedReadCount").GetInt64());
+            AssertEqual(2L, serviceRestart.GetProperty("ReleasedReadCount").GetInt64());
+            AssertSimulatorSnapshotClean(serviceRestart, "service restart cleanup");
+
+            var endpointChannels = snapshots["endpoint-channel-boundaries"];
+            AssertEqual(1L, endpointChannels.GetProperty("OverflowCount").GetInt64());
+            AssertTrue(endpointChannels.GetProperty("CriticalAlertCount").GetInt64() > 0, "Endpoint channel cap omitted Critical Alert evidence.");
+            AssertEqual(1L, endpointChannels.GetProperty("ServiceRestartCount").GetInt64());
+            AssertSimulatorSnapshotClean(endpointChannels, "endpoint channel cleanup");
+
+            var scheduler = snapshots["scheduler-cap"];
+            AssertEqual(1L, scheduler.GetProperty("OverflowCount").GetInt64());
+            AssertTrue(scheduler.GetProperty("CriticalAlertCount").GetInt64() > 0, "Scheduler cap omitted Critical Alert evidence.");
+            AssertEqual(1L, scheduler.GetProperty("ServiceRestartCount").GetInt64());
+            AssertSimulatorSnapshotClean(scheduler, "scheduler cap cleanup");
+
+            var faultPlan = snapshots["fault-plan-cap"];
+            AssertEqual(0, faultPlan.GetProperty("FaultPlanCount").GetInt32());
+            AssertEqual(1L, faultPlan.GetProperty("OverflowCount").GetInt64());
+            AssertTrue(faultPlan.GetProperty("CriticalAlertCount").GetInt64() > 0, "Fault-plan cap omitted Critical Alert evidence.");
+            AssertEqual(1L, faultPlan.GetProperty("ServiceRestartCount").GetInt64());
+            AssertSimulatorSnapshotClean(faultPlan, "fault-plan cleanup");
+
+            var ticketCapacity = snapshots["ticket-capacity-through-endpoint"];
+            AssertEqual(1L, ticketCapacity.GetProperty("AcceptedReadCount").GetInt64());
+            AssertEqual(1L, ticketCapacity.GetProperty("ReleasedReadCount").GetInt64());
+            AssertEqual(1L, ticketCapacity.GetProperty("AcceptedFlowCount").GetInt64());
+            AssertEqual(1L, ticketCapacity.GetProperty("ReleasedFlowCount").GetInt64());
+            AssertEqual(1L, ticketCapacity.GetProperty("FailedOpenOperationCount").GetInt64());
+            AssertTrue(ticketCapacity.GetProperty("CriticalAlertCount").GetInt64() > 0, "Ticket capacity omitted Critical Alert evidence.");
+            AssertEqual(1L, ticketCapacity.GetProperty("ServiceRestartCount").GetInt64());
+            AssertSimulatorSnapshotClean(ticketCapacity, "ticket/grant capacity cleanup");
+
+            var allFaults = snapshots["all-faults-finish-zero-owned-state"];
+            AssertEqual(300L, allFaults.GetProperty("OverflowCount").GetInt64());
+            AssertEqual(300L, allFaults.GetProperty("FailedOpenOperationCount").GetInt64());
+            AssertTrue(allFaults.GetProperty("CriticalAlertCount").GetInt64() > 0, "All-fault fixture omitted Critical Alert evidence.");
+            AssertSimulatorSnapshotClean(allFaults, "all-fault common cleanup");
+
+            var final = root.GetProperty("FinalSnapshot");
+            AssertEqual(0, final.GetProperty("PendingReadCount").GetInt32());
+            AssertEqual(0, final.GetProperty("HeldFlowCount").GetInt32());
+            AssertEqual(0, final.GetProperty("ScheduledCount").GetInt32());
+            AssertEqual(0, final.GetProperty("OwnedOperationCount").GetInt32());
+            AssertEqual(expectedNames.Length, final.GetProperty("AcceptanceResultCount").GetInt32());
+        }
+
+        foreach (var scenarioName in new[] { "happy-new-tcp", "challenge-subject-cap", "challenge-global-cap", "privacy-metadata-only", "all-faults-finish-zero-owned-state" })
+        {
+            var scenario = await RunSimulatorAsync(simulatorExecutable, "--scenario", scenarioName, "--json").ConfigureAwait(false);
+            AssertEqual(0, scenario.ExitCode);
+            AssertTrue(string.IsNullOrEmpty(scenario.StandardError), $"Scenario {scenarioName} wrote stderr.");
+            using var scenarioJson = JsonDocument.Parse(scenario.StandardOutput);
+            AssertEqual(scenarioName, scenarioJson.RootElement.GetProperty("Name").GetString());
+            AssertTrue(scenarioJson.RootElement.GetProperty("Passed").GetBoolean(), $"Scenario {scenarioName} failed.");
+        }
+
+        var invalid = await RunSimulatorAsync(simulatorExecutable, "--invalid").ConfigureAwait(false);
+        AssertEqual(2, invalid.ExitCode);
+        AssertTrue(string.IsNullOrWhiteSpace(invalid.StandardOutput), "Invalid arguments wrote JSON/stdout.");
+        AssertTrue(invalid.StandardError.Contains("Usage:", StringComparison.Ordinal), "Invalid arguments omitted usage stderr.");
+
+        var simulatorSource = File.ReadAllText(Path.Combine(simulatorDirectory, "Program.cs"));
+        foreach (var forbiddenField in new[] { "Payload", "Content", "RawPath", "FilePath", "Packet", "Buffer", "TicketSecret" })
+        {
+            AssertTrue(!Regex.IsMatch(simulatorSource, $@"\b{Regex.Escape(forbiddenField)}\b", RegexOptions.CultureInvariant), $"Simulator source declares forbidden field {forbiddenField}.");
+            AssertTrue(!Regex.IsMatch(firstSuite.StandardOutput, $"\\\"{Regex.Escape(forbiddenField)}\\\"\\s*:", RegexOptions.CultureInvariant), $"Simulator JSON exposes forbidden field {forbiddenField}.");
+        }
+        AssertTrue(!firstSuite.StandardOutput.Contains("AuthenticatorProof", StringComparison.Ordinal), "Simulator JSON exposed ticket proof material.");
+        AssertTrue(!firstSuite.StandardOutput.Contains("SimulationStepResult", StringComparison.Ordinal), "Simulator JSON exposed internal transition results.");
+        AssertTrue(!firstSuite.StandardOutput.Contains("real enforcement", StringComparison.OrdinalIgnoreCase), "Simulator output claimed real enforcement.");
+        AssertTrue(!simulatorSource.Contains("Guid.NewGuid", StringComparison.Ordinal), "Simulator source uses nondeterministic identifiers.");
+        AssertTrue(!simulatorSource.Contains("Task.Delay", StringComparison.Ordinal) && !simulatorSource.Contains("Thread.Sleep", StringComparison.Ordinal) && !simulatorSource.Contains("DateTimeOffset.UtcNow", StringComparison.Ordinal), "Simulator source uses wall-clock scheduling.");
+        var submitFlowStart = simulatorSource.IndexOf("private SimulationStepResult SubmitFlowCore", StringComparison.Ordinal);
+        var submitFlowEnd = simulatorSource.IndexOf("public SimulationStepResult SubmitDecision", submitFlowStart, StringComparison.Ordinal);
+        AssertTrue(submitFlowStart >= 0 && submitFlowEnd > submitFlowStart, "Simulator SubmitFlowCore source boundary was not found.");
+        var submitFlowSource = simulatorSource[submitFlowStart..submitFlowEnd];
+        var wfpReservation = submitFlowSource.IndexOf("_wfp.ObserveFlow(flow)", StringComparison.Ordinal);
+        var challengeCreation = submitFlowSource.IndexOf("new NetworkGateChallenge", StringComparison.Ordinal);
+        AssertTrue(wfpReservation >= 0 && challengeCreation > wfpReservation, "SubmitFlowCore must reserve the held flow before creating a Core challenge.");
+        AssertTrue(!submitFlowSource[..wfpReservation].Contains("NetworkGateChallenge", StringComparison.Ordinal), "SubmitFlowCore created challenge material before WFP reservation.");
+        AssertTrue(!submitFlowSource.Contains("RejectAtChallengeCapacity", StringComparison.Ordinal), "Simulator retained the pre-reservation fake challenge transition.");
+    }
+
+    private static void AssertSimulatorSnapshotClean(JsonElement snapshot, string context)
+    {
+        foreach (var countName in new[]
+        {
+            "PendingReadCount", "ActiveChallengeCount", "HeldFlowCount", "ScheduledCount", "OwnedOperationCount",
+            "HostOwnershipCount", "SchedulerOwnerCount", "CoreActiveContextCount", "OutstandingTicketCount",
+            "ActiveGrantReservationCount", "InstalledGrantCount", "FaultPlanCount", "MinifilterIntentOutboxCount",
+            "MinifilterDispositionInboxCount", "MinifilterCompletionAckOutboxCount", "WfpGateArmInboxCount",
+            "WfpGateAckOutboxCount", "WfpFlowObservationInboxCount", "WfpChallengeOutboxCount"
+        })
+            AssertTrue(snapshot.GetProperty(countName).GetInt32() == 0, $"{context} retained {countName}.");
+        AssertTrue(snapshot.GetProperty("HeldByteCount").GetInt64() == 0, $"{context} retained held bytes.");
+        AssertTrue(snapshot.GetProperty("AcceptedReadCount").GetInt64() == snapshot.GetProperty("ReleasedReadCount").GetInt64(), $"{context} left read counters unbalanced.");
+        AssertTrue(snapshot.GetProperty("AcceptedFlowCount").GetInt64() == snapshot.GetProperty("ReleasedFlowCount").GetInt64(), $"{context} left flow counters unbalanced.");
+    }
+
+    private static async Task<(int ExitCode, string StandardOutput, string StandardError)> RunSimulatorAsync(string executable, params string[] arguments)
+    {
+        var startInfo = new ProcessStartInfo(executable)
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+        foreach (var argument in arguments)
+            startInfo.ArgumentList.Add(argument);
+        using var process = Process.Start(startInfo) ?? throw new InvalidOperationException("Unable to start the simulator executable.");
+        var standardOutput = process.StandardOutput.ReadToEndAsync();
+        var standardError = process.StandardError.ReadToEndAsync();
+        try
+        {
+            await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(45)).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            process.Kill(entireProcessTree: true);
+            throw new InvalidOperationException("Simulator executable exceeded the safety timeout.");
+        }
+        return (process.ExitCode, await standardOutput.ConfigureAwait(false), await standardError.ConfigureAwait(false));
+    }
+
     private static async Task TestPolicyRaceAsync(OutboundGateSample sample)
     {
         var clock = new TestMonotonicClock(sample.ReadWindow.StartedAt);
@@ -2904,12 +3211,35 @@ internal static class Program
     private static PreparedChallenge PrepareToChallenge(OutboundGateStateMachine machine, OutboundGateSample sample, TestMonotonicClock clock, TestNonceProvider nonces, FileReadIntent? intent = null)
     {
         intent ??= sample.Intent;
-        var prepared = PrepareToDisposition(machine, sample, nonces, intent);
-        machine.AcceptCompletion(CompletionFor(sample, prepared.Disposition, nonces, sample.MinifilterGeneration, intent));
+        var prepared = PrepareAwaitingChallenge(machine, sample, nonces, intent);
         var challenge = ChallengeFor(sample, prepared.Request, clock, nonces, intent, prepared.Request.RequiredCoverage);
         var result = machine.ReceiveChallenge(challenge);
         return new PreparedChallenge(challenge, result);
     }
+
+    private static PreparedRead PrepareAwaitingChallenge(OutboundGateStateMachine machine, OutboundGateSample sample, TestNonceProvider nonces, FileReadIntent? intent = null)
+    {
+        intent ??= sample.Intent;
+        var prepared = PrepareToDisposition(machine, sample, nonces, intent);
+        machine.AcceptCompletion(CompletionFor(sample, prepared.Disposition, nonces, sample.MinifilterGeneration, intent));
+        return prepared;
+    }
+
+    private static ChallengeAdmissionFailure ChallengeAdmissionFailureFor(
+        OutboundGateSample sample,
+        TestMonotonicClock clock,
+        Guid failureId,
+        FileReadIntent intent,
+        GateSubject? subject = null,
+        Guid? wfpGeneration = null) =>
+        new(
+            1,
+            failureId,
+            intent.IntentId,
+            subject ?? intent.Subject,
+            wfpGeneration ?? sample.DriverGeneration,
+            ChallengeAdmissionFailureKind.HeldFlowCapacityExhausted,
+            clock.Now());
 
     private static GateArmAck AckFor(OutboundGateSample sample, GateArmRequest request, TestNonceProvider nonces, FileReadIntent? intent = null) =>
         new(1, nonces.NextNonce(), request.IntentId, (intent ?? sample.Intent).Subject, request.RequiredCoverage, request.RequiredCoverage, 7, sample.DriverGeneration, request.RequestNonce, nonces.NextNonce(), sample.Start, request.ArmWindow, null);

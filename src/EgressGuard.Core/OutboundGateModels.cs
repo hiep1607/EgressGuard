@@ -570,6 +570,42 @@ public sealed record FileReadCompletionAck
         && GateAckId == disposition.GateAckId;
 }
 
+public enum ChallengeAdmissionFailureKind
+{
+    Unspecified,
+    HeldFlowCapacityExhausted
+}
+
+public sealed record ChallengeAdmissionFailure
+{
+    public int Version { get; }
+    public Guid FailureId { get; }
+    public Guid IntentId { get; }
+    public GateSubject Subject { get; }
+    public Guid WfpGeneration { get; }
+    public ChallengeAdmissionFailureKind FailureKind { get; }
+    public ServiceMonotonicTimestamp ObservedAt { get; }
+
+    public ChallengeAdmissionFailure(int version, Guid failureId, Guid intentId, GateSubject subject, Guid wfpGeneration, ChallengeAdmissionFailureKind failureKind, ServiceMonotonicTimestamp observedAt)
+    {
+        OutboundGateLimits.RequireVersion(version);
+        OutboundGateLimits.GuidValue(failureId, nameof(failureId));
+        OutboundGateLimits.GuidValue(intentId, nameof(intentId));
+        ArgumentNullException.ThrowIfNull(subject);
+        OutboundGateLimits.GuidValue(wfpGeneration, nameof(wfpGeneration));
+        if (!Enum.IsDefined(failureKind) || failureKind != ChallengeAdmissionFailureKind.HeldFlowCapacityExhausted)
+            throw new ArgumentOutOfRangeException(nameof(failureKind));
+        ArgumentNullException.ThrowIfNull(observedAt);
+        Version = version;
+        FailureId = failureId;
+        IntentId = intentId;
+        Subject = subject;
+        WfpGeneration = wfpGeneration;
+        FailureKind = failureKind;
+        ObservedAt = observedAt;
+    }
+}
+
 public sealed record NetworkGateChallenge
 {
     public int Version { get; }

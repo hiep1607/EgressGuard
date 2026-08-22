@@ -23,6 +23,10 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "EgressGuard.Service", "src\
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "EgressGuard.UI", "src\EgressGuard.UI\EgressGuard.UI.csproj", "{7FFBAF91-A24E-4C46-841A-089924E11DF4}"
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tools", "tools", "{2B9DEE1B-AE73-4E0D-A50D-679B98776995}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "EgressGuard.OutboundGateSimulator", "tools\EgressGuard.OutboundGateSimulator\EgressGuard.OutboundGateSimulator.csproj", "{124B3B8E-11B5-4397-ABBB-72B6A3C1C3F2}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -69,5 +73,12 @@ Global
 		{7FFBAF91-A24E-4C46-841A-089924E11DF4}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{7FFBAF91-A24E-4C46-841A-089924E11DF4}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{7FFBAF91-A24E-4C46-841A-089924E11DF4}.Release|Any CPU.Build.0 = Release|Any CPU
+		{124B3B8E-11B5-4397-ABBB-72B6A3C1C3F2}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{124B3B8E-11B5-4397-ABBB-72B6A3C1C3F2}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{124B3B8E-11B5-4397-ABBB-72B6A3C1C3F2}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{124B3B8E-11B5-4397-ABBB-72B6A3C1C3F2}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{124B3B8E-11B5-4397-ABBB-72B6A3C1C3F2} = {2B9DEE1B-AE73-4E0D-A50D-679B98776995}
 	EndGlobalSection
 EndGlobal
