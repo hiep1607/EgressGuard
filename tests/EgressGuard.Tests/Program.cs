@@ -170,6 +170,7 @@ internal static class Program
             ("sim-ui-bounds-and-framing", TestSimUiBoundsAndFramingAsync),
             ("sim-ui-service-capacity-bounds", TestSimUiServiceCapacityBoundsAsync),
             ("sim-ui-pipe-subscriber-capacity", TestSimUiSubscriberCapacityAsync),
+            ("sim-ui-shared-request-session-reconnect", TestSimUiSharedRequestSessionReconnectAsync),
             ("sim-ui-small-window-dpi", TestSimUiSmallWindowDpiAsync),
             ("sim-ui-keyboard-screen-reader", TestSimUiKeyboardScreenReaderAsync),
             ("sim-ui-privacy-scan", TestSimUiPrivacyScanAsync),
@@ -2824,8 +2825,8 @@ internal static class Program
 
             await RunStaAsync(async () =>
             {
-                await using (var barrierRequest = new EgressGuardPipeClient(pipeName))
-                await using (var barrierViewModel = new SimulatedDecisionViewModel(barrierRequest, pipeName))
+                await using (var barrierSession = new MainWindowRequestSession(pipeName))
+                await using (var barrierViewModel = new SimulatedDecisionViewModel(barrierSession, pipeName))
                 {
                     var barrierPanel = new SimulatedDecisionPanel { DataContext = barrierViewModel };
                     var barrierWindow = new System.Windows.Window
@@ -2879,9 +2880,9 @@ internal static class Program
                     throw new TestFailureException($"Two real MainWindow sessions did not establish the exact 6/8 pipe budget: pipes={server.ActivePipeCount}, subscribers={fixture.Hub.SubscriberCount}, firstReady={firstWindow.SimulatedDecisionViewModel.AllowOnceCommand.CanExecute(null)}, secondReady={secondWindow.SimulatedDecisionViewModel.AllowOnceCommand.CanExecute(null)}.");
                 }
 
-                AssertTrue(ReferenceEquals(firstWindow.SharedRequestClient, firstWindow.ViewModel.RequestClient)
-                    && ReferenceEquals(firstWindow.SharedRequestClient, firstWindow.SimulatedDecisionViewModel.RequestClient), "MainWindow view models did not share one request connection.");
-                AssertTrue(!firstWindow.ViewModel.OwnsRequestClient && !firstWindow.SimulatedDecisionViewModel.OwnsRequestClient, "A borrowing view model claimed ownership of MainWindow's shared request client.");
+                AssertTrue(ReferenceEquals(firstWindow.SharedRequestSession, firstWindow.ViewModel.RequestSession)
+                    && ReferenceEquals(firstWindow.SharedRequestSession, firstWindow.SimulatedDecisionViewModel.RequestSession), "MainWindow view models did not share one request session.");
+                AssertTrue(!firstWindow.ViewModel.OwnsRequestSession && !firstWindow.SimulatedDecisionViewModel.OwnsRequestSession, "A borrowing view model claimed ownership of MainWindow's shared request session.");
                 Console.WriteLine("INFO  Phase 5B-05 real MainWindow sessions: 6/8 pipe instances");
 
                 await using (var rejected = new EgressGuardSimulatedDecisionEventClient(pipeName))
@@ -2901,7 +2902,7 @@ internal static class Program
                 AssertEqual(2, fixture.Hub.SubscriberCount);
                 AssertEqual(1L, fixture.Hub.RejectedSubscriberCount);
 
-                var postRejection = await firstWindow.SharedRequestClient.SendAsync(
+                var postRejection = await firstWindow.SharedRequestSession.SendAsync(
                     MessageEnvelope.Create(OutboundGateMessageTypes.GetSimulatedDecisionSnapshot, new GetSimulatedDecisionSnapshotMessage(1)),
                     TimeSpan.FromSeconds(3),
                     CancellationToken.None).ConfigureAwait(true);
@@ -2995,6 +2996,125 @@ internal static class Program
             serverLifetime.Cancel();
             await server.StopAsync(CancellationToken.None).ConfigureAwait(false);
             AssertTrue(SpinWait.SpinUntil(() => server.ActivePipeCount == 0, TimeSpan.FromSeconds(5)), "Simulation PipeServer retained a client instance after cleanup.");
+            AssertEqual(0, fixture.Hub.SubscriberCount);
+            Environment.SetEnvironmentVariable("EGRESSGUARD_PIPE_NAME", previousPipeName);
+            SqliteConnection.ClearAllPools();
+            await DeleteDirectoryWithRetryAsync(dataDirectory).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task TestSimUiSharedRequestSessionReconnectAsync()
+    {
+        var previousPipeName = Environment.GetEnvironmentVariable("EGRESSGUARD_PIPE_NAME");
+        var pipeName = $"{ProtocolConstants.PipeName}.RequestSession.{Environment.ProcessId}.{Guid.NewGuid():N}";
+        var dataDirectory = Path.Combine(Path.GetTempPath(), "EgressGuard-RequestSession-" + Guid.NewGuid().ToString("N"));
+        Environment.SetEnvironmentVariable("EGRESSGUARD_PIPE_NAME", pipeName);
+        Directory.CreateDirectory(dataDirectory);
+        using var fixture = new SimulatedCoordinatorFixture();
+        _ = fixture.AddPrompt();
+        var database = new EgressGuardDatabase(Path.Combine(dataDirectory, "egressguard.db"));
+        await database.InitializeAsync().ConfigureAwait(false);
+        var generalHub = new EventHub();
+        using var server = new PipeServer(
+            new ServiceState(),
+            database,
+            new FakeFirewallRuleManager(),
+            generalHub,
+            new ListLogger<PipeServer>(),
+            fixture.Coordinator);
+        using var serverLifetime = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        await server.StartAsync(serverLifetime.Token).ConfigureAwait(false);
+        try
+        {
+            if (!WindowsFirewallManager.IsAdministrator())
+                throw new TestFailureException("The shared request-session integration requires an Administrator token.");
+
+            await RunStaAsync(async () =>
+            {
+                var window = new MainWindow(pipeName) { ShowInTaskbar = false, WindowStyle = System.Windows.WindowStyle.None };
+                var reserves = Enumerable.Range(0, 6).Select(_ => new EgressGuardPipeClient(pipeName)).ToArray();
+                try
+                {
+                    window.Show();
+                    SelectSimulationTab(window);
+                    await WaitForDispatcherConditionAsync(
+                        () => server.ActivePipeCount == 3
+                            && fixture.Hub.SubscriberCount == 1
+                            && window.SimulatedDecisionViewModel.AllowOnceCommand.CanExecute(null),
+                        TimeSpan.FromSeconds(10),
+                        "The request-session MainWindow did not establish its 3-pipe baseline.").ConfigureAwait(true);
+
+                    var session = window.SharedRequestSession;
+                    AssertTrue(ReferenceEquals(session, window.ViewModel.RequestSession)
+                        && ReferenceEquals(session, window.SimulatedDecisionViewModel.RequestSession), "The real MainWindow did not give both view models one request session.");
+                    AssertTrue(!window.ViewModel.OwnsRequestSession && !window.SimulatedDecisionViewModel.OwnsRequestSession, "A MainWindow view model claimed ownership of the shared request session.");
+
+                    await session.DisconnectAsync().ConfigureAwait(true);
+                    await WaitForDispatcherConditionAsync(
+                        () => server.ActivePipeCount == 2 && !session.IsConnected,
+                        TimeSpan.FromSeconds(5),
+                        "The shared request session did not release its original request connection.").ConfigureAwait(true);
+                    foreach (var reserve in reserves)
+                        await reserve.ConnectAsync(TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(true);
+                    await WaitForDispatcherConditionAsync(
+                        () => server.ActivePipeCount == SimulatedDecisionProtocolLimits.PipeInstanceCapacity,
+                        TimeSpan.FromSeconds(5),
+                        "The reconnect barrier did not occupy all 8 pipe instances.").ConfigureAwait(true);
+
+                    var generationBefore = session.ConnectionGeneration;
+                    InvokePrivateVoid(window.SimulatedDecisionViewModel, "DisableContinuity");
+                    var generalRefresh = InvokePrivateTaskAsync(window.ViewModel, "RefreshAsync");
+                    var simulatedRefresh = InvokePrivateTaskAsync(window.SimulatedDecisionViewModel, "RefreshSnapshotAsync");
+                    await WaitForDispatcherConditionAsync(
+                        () => session.PendingOperationCount >= 2,
+                        TimeSpan.FromSeconds(5),
+                        "Both view models did not reach the serialized reconnect barrier.").ConfigureAwait(true);
+                    AssertTrue(!session.IsConnected, "A request connection bypassed the full-pipe reconnect barrier.");
+                    AssertTrue(!window.SimulatedDecisionViewModel.AllowOnceCommand.CanExecute(null), "Simulation command enabled before snapshot and event continuity were re-established.");
+
+                    await reserves[0].DisconnectAsync().ConfigureAwait(true);
+                    await Task.WhenAll(generalRefresh, simulatedRefresh).ConfigureAwait(true);
+                    AssertEqual(generationBefore + 1, session.ConnectionGeneration);
+                    AssertTrue(session.IsConnected, "The serialized request session retained a disposed or stale pipe.");
+                    AssertTrue(window.ViewModel.ServiceStatus.StartsWith("Service online", StringComparison.Ordinal), "The general UI refresh did not succeed after serialized reconnect.");
+                    AssertTrue(window.SimulatedDecisionViewModel.SimulationStatus.StartsWith("Simulation active", StringComparison.Ordinal), "The Simulation UI refresh did not succeed after serialized reconnect.");
+                    AssertTrue(!window.SimulatedDecisionViewModel.AllowOnceCommand.CanExecute(null), "Snapshot refresh alone enabled a Simulation command without event continuity.");
+
+                    for (var index = 1; index < reserves.Length; index++)
+                        await reserves[index].DisconnectAsync().ConfigureAwait(true);
+                    await WaitForDispatcherConditionAsync(
+                        () => server.ActivePipeCount == 3,
+                        TimeSpan.FromSeconds(5),
+                        "Reconnect barrier cleanup did not restore one request and two event pipes.").ConfigureAwait(true);
+
+                    await InvokePrivateTaskAsync(window.SimulatedDecisionViewModel, "RefreshAndReconnectAsync").ConfigureAwait(true);
+                    await WaitForDispatcherConditionAsync(
+                        () => server.ActivePipeCount == 3
+                            && fixture.Hub.SubscriberCount == 1
+                            && window.SimulatedDecisionViewModel.AllowOnceCommand.CanExecute(null),
+                        TimeSpan.FromSeconds(10),
+                        "Simulation commands enabled before snapshot plus exact event continuity were proven.").ConfigureAwait(true);
+                    AssertEqual(generationBefore + 1, session.ConnectionGeneration);
+                }
+                finally
+                {
+                    foreach (var reserve in reserves)
+                        await reserve.DisposeAsync().ConfigureAwait(true);
+                    await window.DisposeAsync().ConfigureAwait(true);
+                    window.Close();
+                }
+
+                await WaitForDispatcherConditionAsync(
+                    () => server.ActivePipeCount == 0 && fixture.Hub.SubscriberCount == 0,
+                    TimeSpan.FromSeconds(10),
+                    "Shared request-session cleanup retained a pipe or subscriber.").ConfigureAwait(true);
+            }).ConfigureAwait(false);
+        }
+        finally
+        {
+            serverLifetime.Cancel();
+            await server.StopAsync(CancellationToken.None).ConfigureAwait(false);
+            AssertTrue(SpinWait.SpinUntil(() => server.ActivePipeCount == 0, TimeSpan.FromSeconds(5)), "Request-session PipeServer retained a client after cleanup.");
             AssertEqual(0, fixture.Hub.SubscriberCount);
             Environment.SetEnvironmentVariable("EGRESSGUARD_PIPE_NAME", previousPipeName);
             SqliteConnection.ClearAllPools();

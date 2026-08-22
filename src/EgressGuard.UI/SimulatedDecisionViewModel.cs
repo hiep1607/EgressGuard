@@ -14,9 +14,9 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
     private const int EventBufferCapacity = 512;
     private const int MaximumBatchSize = 128;
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(3);
-    private readonly EgressGuardPipeClient _requestClient;
+    private readonly MainWindowRequestSession _requestSession;
     private readonly EgressGuardSimulatedDecisionEventClient _eventClient;
-    private readonly bool _ownsRequestClient;
+    private readonly bool _ownsRequestSession;
     private readonly CancellationTokenSource _lifetime = new();
     private readonly DispatcherTimer _timer;
     private readonly Dispatcher _dispatcher;
@@ -42,18 +42,18 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
     private Task? _subscriptionTask;
 
     public SimulatedDecisionViewModel(string? pipeName = null)
-        : this(new EgressGuardPipeClient(pipeName), pipeName, ownsRequestClient: true)
+        : this(new MainWindowRequestSession(pipeName), pipeName, ownsRequestSession: true)
     {
     }
 
     internal SimulatedDecisionViewModel(
-        EgressGuardPipeClient requestClient,
+        MainWindowRequestSession requestSession,
         string? pipeName,
-        bool ownsRequestClient = false)
+        bool ownsRequestSession = false)
     {
-        _requestClient = requestClient ?? throw new ArgumentNullException(nameof(requestClient));
+        _requestSession = requestSession ?? throw new ArgumentNullException(nameof(requestSession));
         _eventClient = new EgressGuardSimulatedDecisionEventClient(pipeName);
-        _ownsRequestClient = ownsRequestClient;
+        _ownsRequestSession = ownsRequestSession;
         _dispatcher = Dispatcher.CurrentDispatcher;
         _timer = new DispatcherTimer(DispatcherPriority.Background)
         {
@@ -69,8 +69,8 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
 
     public event PropertyChangedEventHandler? PropertyChanged;
     internal event EventHandler? PromptTerminalized;
-    internal EgressGuardPipeClient RequestClient => _requestClient;
-    internal bool OwnsRequestClient => _ownsRequestClient;
+    internal MainWindowRequestSession RequestSession => _requestSession;
+    internal bool OwnsRequestSession => _ownsRequestSession;
 
     public ObservableCollection<SimulatedDecisionPromptProjection> ActivePrompts { get; } = [];
     public ObservableCollection<SimulatedReconnectRequiredProjection> ReconnectNotices { get; } = [];
@@ -360,8 +360,7 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
 
     private async Task RefreshSnapshotAsync()
     {
-        await EnsureRequestConnectedAsync().ConfigureAwait(true);
-        var response = await _requestClient.SendAsync(
+        var response = await _requestSession.SendAsync(
             MessageEnvelope.Create(
                 OutboundGateMessageTypes.GetSimulatedDecisionSnapshot,
                 new GetSimulatedDecisionSnapshotMessage(ProtocolConstants.Version)),
@@ -405,8 +404,7 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
             return;
         try
         {
-            await EnsureRequestConnectedAsync().ConfigureAwait(true);
-            var response = await _requestClient.SendAsync(
+            var response = await _requestSession.SendAsync(
                 MessageEnvelope.Create(
                     OutboundGateMessageTypes.SubmitSimulatedDecision,
                     new SubmitSimulatedDecisionMessage(ProtocolConstants.Version, prompt.ChallengeId, choice)),
@@ -439,8 +437,7 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
             return;
         try
         {
-            await EnsureRequestConnectedAsync().ConfigureAwait(true);
-            var response = await _requestClient.SendAsync(
+            var response = await _requestSession.SendAsync(
                 MessageEnvelope.Create(
                     OutboundGateMessageTypes.RevokeSimulatedRememberedRule,
                     new RevokeSimulatedRememberedRuleMessage(ProtocolConstants.Version, rule.RuleId, rule.Revision)),
@@ -478,12 +475,6 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
             return 0;
         var elapsed = Math.Max(0, Environment.TickCount64 - _selectedPromptTick);
         return Math.Max(0, prompt.Expiry.RemainingMilliseconds - elapsed);
-    }
-
-    private async Task EnsureRequestConnectedAsync()
-    {
-        if (!_requestClient.IsConnected)
-            await _requestClient.ConnectAsync(RequestTimeout, _lifetime.Token).ConfigureAwait(true);
     }
 
     private static void ThrowIfError(MessageEnvelope response)
@@ -605,8 +596,8 @@ public sealed class SimulatedDecisionViewModel : INotifyPropertyChanged, IAsyncD
         _timer.Stop();
         _lifetime.Cancel();
         await _eventClient.DisposeAsync().ConfigureAwait(false);
-        if (_ownsRequestClient)
-            await _requestClient.DisposeAsync().ConfigureAwait(false);
+        if (_ownsRequestSession)
+            await _requestSession.DisposeAsync().ConfigureAwait(false);
         if (_subscriptionTask is not null)
         {
             try

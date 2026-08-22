@@ -27,7 +27,9 @@ validation and subscriber admission are atomic under the Coordinator lock. Its
 channel explicitly permits the PipeServer reader and overflow drain reader.
 Each MainWindow owns one request connection shared by both view models plus two
 event connections, so two real sessions use 6/8 pipe instances and leave the
-locked two-instance request/reconnect reserve.
+locked two-instance request/reconnect reserve. A MainWindow-owned request
+session serializes connection checks, connect, send, broken-connection reset,
+forced disconnect, reconnect, and disposal across both view models.
 
 The WPF surface is one lifecycle-owned, scrollable Simulation tab. It uses one
 shared 250 ms presentation timer, drains at most 128 events per tick, restores
@@ -69,6 +71,7 @@ Each locked row maps one-to-one to a deterministic test with the same name:
 | `sim-ui-bounds-and-framing` | Structural 4-prompt/subject and 128-prompt global bounds plus all locked maxima; the envelope serializes to exactly 908,824 UTF-8 bytes. |
 | `sim-ui-service-capacity-bounds` | Live Service state reaches 8 rules/application, 64 rules/global, and every history cap; cap+1 preserves live state and takes no new authority. |
 | `sim-ui-pipe-subscriber-capacity` | Real PipeServer, production clients, real MainWindow/view models/panel on STA: a snapshot/subscribe mutation barrier keeps commands disabled until resync; two windows use 6/8; the exact 8-instance limit releases and accepts a replacement connection; subscriber-cap rejection leaves requests alive; Allow/Remember/Block/Revoke run through Automation peers. |
+| `sim-ui-shared-request-session-reconnect` | An 8/8 real-pipe barrier queues simultaneous general and Simulation refreshes behind one disconnected MainWindow session; one reconnect generation serves both, commands remain disabled until event continuity, and cleanup returns to zero. |
 | `sim-ui-small-window-dpi` | 640x480 DIP at 100/150/200% remains wrapped, scrollable, reachable. |
 | `sim-ui-keyboard-screen-reader` | Real STA WPF tree, IDs, peers, tab/reverse-tab, live regions, terminal focus. |
 | `sim-ui-privacy-scan` | Reflection, source, and serialized JSON reject prohibited data/types. |
@@ -82,7 +85,7 @@ the locked 131,072-byte reserve by 8,680 bytes.
 ## Local validation
 
 The final pre-commit validation ran the locked commands on Windows with the
-Release configuration. All **142/142** deterministic tests passed, including the
+Release configuration. All **143/143** deterministic tests passed, including the
 real local-Administrator PipeServer branch (`6/8` normal instances, exact 8/8
 limit, then successful replacement accept). Restore and format verification
 passed; Release build completed with zero warnings and zero errors; the
