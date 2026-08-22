@@ -726,6 +726,45 @@ public sealed record UserDecision
     }
 }
 
+public sealed record PersistentDecisionTransitionResult
+{
+    internal const int MaximumInvalidatedStatusCount = 255;
+
+    public int Version { get; }
+    public GateTransitionResult DecisionResult { get; }
+    public IReadOnlyList<GateStatus> InvalidatedStatuses { get; }
+    public long PolicyEpoch { get; }
+    public bool PolicyEpochAccepted { get; }
+
+    public PersistentDecisionTransitionResult(
+        int version,
+        GateTransitionResult decisionResult,
+        IReadOnlyList<GateStatus>? invalidatedStatuses,
+        long policyEpoch,
+        bool policyEpochAccepted)
+    {
+        OutboundGateLimits.RequireVersion(version);
+        ArgumentNullException.ThrowIfNull(decisionResult);
+        if (decisionResult.Version != version || decisionResult.Status is null || decisionResult.Status.Version != version)
+            throw new ArgumentException("Decision result must use the persistent transition contract version.", nameof(decisionResult));
+        ArgumentOutOfRangeException.ThrowIfNegative(policyEpoch);
+        var copiedStatuses = OutboundGateLimits.CopyBounded(
+            invalidatedStatuses,
+            nameof(invalidatedStatuses),
+            MaximumInvalidatedStatusCount);
+        if (copiedStatuses.Any(status => status is null || status.Version != version))
+            throw new ArgumentException("Invalidated statuses must be non-null and use the persistent transition contract version.", nameof(invalidatedStatuses));
+        if (!policyEpochAccepted && copiedStatuses.Count != 0)
+            throw new ArgumentException("A rejected policy epoch cannot report invalidated statuses.", nameof(invalidatedStatuses));
+
+        Version = version;
+        DecisionResult = decisionResult;
+        InvalidatedStatuses = copiedStatuses;
+        PolicyEpoch = policyEpoch;
+        PolicyEpochAccepted = policyEpochAccepted;
+    }
+}
+
 public sealed record OneTimeTicket
 {
     public int Version { get; }
