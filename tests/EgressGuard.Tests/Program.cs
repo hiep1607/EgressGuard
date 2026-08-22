@@ -7,6 +7,10 @@ using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Windows.Automation.Peers;
+using System.Windows.Automation.Provider;
+using System.Windows.Controls;
+using System.Windows.Media;
 using EgressGuard.Core;
 using EgressGuard.Persistence;
 using EgressGuard.Protocol;
@@ -21,6 +25,10 @@ namespace EgressGuard.Tests;
 
 internal static class Program
 {
+    private static readonly double[] SimulationUiDpiScales = [1d, 1.5d, 2d];
+    private static readonly string[] SimulationUiViewportControlIds =
+        ["AllowOnceButton", "Remember30DaysButton", "BlockCurrentFlowButton", "SimulationRefreshButton"];
+
     public static async Task<int> Main(string[] args)
     {
         if (args.Length == 1 && args[0] == "--firewall-cancellation-integration")
@@ -133,6 +141,41 @@ internal static class Program
             ("Phase 5B-05 Protocol event and result contracts enforce one-of outcomes", TestSimulatedDecisionProtocolEventAndResultValidationAsync),
             ("Phase 5B-05 Protocol contracts defensively copy and round-trip JSON", TestSimulatedDecisionProtocolJsonRoundTripAsync),
             ("Phase 5B-05 Protocol maximum snapshot stays below the frame limit", TestSimulatedDecisionProtocolMaximumSnapshotAsync),
+            ("sim-ui-disabled-default", TestSimUiDisabledDefaultAsync),
+            ("sim-ui-projection-exact-and-redacted", TestSimUiProjectionAsync),
+            ("sim-ui-allow-once", TestSimUiAllowOnceAsync),
+            ("sim-ui-remember-scope-preview", TestSimUiRememberScopePreviewAsync),
+            ("sim-ui-remember-policy-transaction", TestSimUiRememberPolicyTransactionAsync),
+            ("sim-ui-rule-id-collision", TestSimUiRuleIdCollisionAsync),
+            ("sim-ui-remember-rule-committed-ticket-failed-open", TestSimUiRuleCommittedTrafficFailedOpenAsync),
+            ("sim-ui-remember-and-auto-match", TestSimUiRememberAutoMatchAsync),
+            ("sim-ui-revoke", TestSimUiRevokeAsync),
+            ("sim-ui-file-mutation-invalidates", TestSimUiFileMutationAsync),
+            ("sim-ui-policy-epoch-invalidates", TestSimUiPolicyEpochAsync),
+            ("sim-ui-block-current-only", TestSimUiBlockCurrentAsync),
+            ("sim-ui-timeout-at-equality", TestSimUiTimeoutEqualityAsync),
+            ("sim-ui-reconnect-required", TestSimUiReconnectRequiredAsync),
+            ("sim-ui-critical-fail-open", TestSimUiCriticalFailOpenAsync),
+            ("sim-ui-exact-duplicate", TestSimUiExactDuplicateAsync),
+            ("sim-ui-conflicting-replay", TestSimUiConflictingReplayAsync),
+            ("sim-ui-caller-forgery-rejected", TestSimUiCallerForgeryAsync),
+            ("sim-ui-disconnect-reconnect-resync", TestSimUiResyncAsync),
+            ("sim-ui-projection-capacity-recovery", TestSimUiProjectionCapacityRecoveryAsync),
+            ("sim-ui-rule-id-prevalidation-rollback", TestSimUiRuleIdPrevalidationRollbackAsync),
+            ("sim-ui-rule-id-registry-capacity", TestSimUiRuleIdRegistryCapacityAsync),
+            ("sim-ui-rule-id-exact-reuse-at-registry-cap", TestSimUiRuleIdExactReuseAtCapAsync),
+            ("sim-ui-rule-id-promotion-count-stable", TestSimUiRuleIdPromotionAsync),
+            ("sim-ui-rule-id-tombstone-lifecycle", TestSimUiRuleIdTombstoneLifecycleAsync),
+            ("sim-ui-expired-rule-terminalizes-prompt", TestSimUiExpiredRuleTerminalizesPromptAsync),
+            ("sim-ui-bounds-and-framing", TestSimUiBoundsAndFramingAsync),
+            ("sim-ui-service-capacity-bounds", TestSimUiServiceCapacityBoundsAsync),
+            ("sim-ui-pipe-subscriber-capacity", TestSimUiSubscriberCapacityAsync),
+            ("sim-ui-shared-request-session-reconnect", TestSimUiSharedRequestSessionReconnectAsync),
+            ("sim-ui-small-window-dpi", TestSimUiSmallWindowDpiAsync),
+            ("sim-ui-keyboard-screen-reader", TestSimUiKeyboardScreenReaderAsync),
+            ("sim-ui-privacy-scan", TestSimUiPrivacyScanAsync),
+            ("sim-ui-zero-false-enforcement-claims", TestSimUiZeroFalseClaimsAsync),
+            ("sim-ui-cleanup-zero-owned-state", TestSimUiCleanupAsync),
             ("Phase 5B-01 contracts serialize and preserve exact identity", TestOutboundGateContractRoundTripAsync),
             ("Phase 5B-01 contracts enforce monotonic deadlines and generations", TestOutboundGateMonotonicValidationAsync),
             ("Phase 5B-01 contracts enforce decision and disposition invariants", TestOutboundGateDecisionValidationAsync),
@@ -2114,6 +2157,1623 @@ internal static class Program
         Guid CorrelationId)
     {
         public SimulatedSubjectProjection ProcessSubject => Prompt.Subject;
+    }
+
+    private static Task TestSimUiDisabledDefaultAsync()
+    {
+        using var hub = new SimulatedDecisionEventHub();
+        using var coordinator = new SimulatedDecisionCoordinator(new DisabledSimulatedDecisionAuthority(), hub);
+        var snapshot = coordinator.GetSnapshot(SimulatedAdministrator(), 1);
+        AssertTrue(!snapshot.SimulationEnabled, "Default Simulation authority was enabled.");
+        AssertEqual(0, snapshot.ActivePrompts.Count);
+        AssertEqual(0, snapshot.RememberedRules.Count);
+        AssertEqual(0, snapshot.Capacity.DecisionSubscriberCount);
+        AssertTrue(!snapshot.Authorization.CanAllowOnce && !snapshot.Authorization.CanRememberFor30Days && !snapshot.Authorization.CanBlockCurrent, "Disabled snapshot exposed a decision command.");
+        AssertEqual(new AuthoritySimulationRuntimeOwnershipSnapshot(0, 0, 0, 0, 0, 0), new DisabledSimulatedDecisionAuthority().CaptureOwnership());
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiProjectionAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        var accepted = fixture.AddPrompt();
+        var snapshot = fixture.Snapshot();
+        var prompt = snapshot.ActivePrompts.Single();
+        AssertEqual(accepted.Intent.IntentId, prompt.IntentId);
+        AssertEqual(accepted.Challenge.ChallengeId, prompt.ChallengeId);
+        AssertEqual("report.txt", prompt.RedactedFileLabel);
+        AssertEqual(accepted.Intent.File.VersionToken, prompt.FileVersion.VersionToken);
+        AssertEqual(accepted.Intent.Subject.ApplicationIdentity, prompt.ApplicationIdentity);
+        AssertEqual(accepted.Challenge.Destination.DomainEvidence, prompt.Destination.DomainEvidence);
+        AssertEqual(accepted.Challenge.Destination.DomainProvenance, prompt.Destination.DomainProvenance);
+        AssertEqual(accepted.Challenge.Destination.DomainObservedAtUtc, prompt.Destination.DomainObservedAtUtc);
+        var json = JsonSerializer.Serialize(prompt, JsonDefaults.Options);
+        AssertTrue(!json.Contains("volume-1", StringComparison.OrdinalIgnoreCase)
+            && !json.Contains("file-42", StringComparison.OrdinalIgnoreCase)
+            && !json.Contains("caller", StringComparison.OrdinalIgnoreCase)
+            && !json.Contains("ticket", StringComparison.OrdinalIgnoreCase)
+            && !json.Contains("grant", StringComparison.OrdinalIgnoreCase), "Projection leaked a hidden authority selector.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiAllowOnceAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        var accepted = fixture.AddPrompt();
+        var result = fixture.Coordinator.SubmitDecision(
+            SimulatedAdministrator(),
+            new SubmitSimulatedDecisionMessage(1, accepted.Challenge.ChallengeId, SimulatedDecisionChoice.AllowOnce));
+        AssertEqual(SimulatedDecisionItemState.AllowedOnce, result.DecisionState);
+        AssertTrue(result.RememberedRule is null && !result.TrafficFailedOpen, "Allow once widened into remembered or fail-open state.");
+        AssertEqual(1, fixture.Authority.OrdinaryDecisionCalls);
+        AssertEqual(1, fixture.Authority.DecisionNonceCalls);
+        AssertEqual(0, fixture.Authority.RuleIdNonceCalls);
+        AssertEqual(0, fixture.Snapshot().ActivePrompts.Count);
+        AssertEqual(0, fixture.Snapshot().RememberedRules.Count);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiRememberScopePreviewAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        var prompt = fixture.AddPrompt();
+        using var viewModel = new AsyncDisposableScope(new SimulatedDecisionViewModel());
+        viewModel.Value.ActivePrompts.Add(fixture.Snapshot().ActivePrompts.Single());
+        viewModel.Value.SelectedPrompt = viewModel.Value.ActivePrompts[0];
+        AssertTrue(viewModel.Value.DecisionScopePreview.Contains(prompt.Intent.File.VersionToken, StringComparison.Ordinal)
+            && viewModel.Value.DecisionScopePreview.Contains(prompt.Intent.Subject.ApplicationIdentity, StringComparison.Ordinal)
+            && viewModel.Value.DecisionScopePreview.Contains(prompt.Challenge.Destination.Address.ToString(), StringComparison.Ordinal)
+            && viewModel.Value.DecisionScopePreview.Contains(prompt.Challenge.Destination.Protocol.ToString(), StringComparison.Ordinal), "Remember preview did not equal the Service-projected canonical selector.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiRememberPolicyTransactionAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        var selected = fixture.AddPrompt();
+        var other = fixture.AddPrompt(sequence: 2, subject: SimulatedSubject(fixture.Sample, 2));
+        var beforeEpoch = fixture.Authority.PolicyEpoch;
+        var result = fixture.Coordinator.SubmitDecision(
+            SimulatedAdministrator(),
+            new SubmitSimulatedDecisionMessage(1, selected.Challenge.ChallengeId, SimulatedDecisionChoice.RememberFor30Days));
+        AssertEqual(beforeEpoch + 1, fixture.Authority.PolicyEpoch);
+        AssertEqual(SimulatedDecisionItemState.Remembered, result.RememberedRule!.State);
+        AssertEqual(1, fixture.Authority.PersistentDecisionCalls);
+        AssertTrue(!fixture.Snapshot().ActivePrompts.Any(item => item.ChallengeId == other.Challenge.ChallengeId), "Old-epoch prompt survived the atomic persistent transition.");
+        AssertEqual(1, fixture.Snapshot().RememberedRules.Count);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiRuleIdCollisionAsync()
+    {
+        using (var emptyFixture = new SimulatedCoordinatorFixture())
+        {
+            emptyFixture.Authority.EnqueueNonce(Guid.Empty);
+            var accepted = emptyFixture.AddPrompt();
+            AssertRuleIdCollisionIsNonMutating(emptyFixture, accepted, expectedCollisionCount: 1);
+        }
+
+        using (var activeFixture = new SimulatedCoordinatorFixture())
+        {
+            var rememberedPrompt = activeFixture.AddPrompt();
+            var remembered = activeFixture.Coordinator.SubmitDecision(
+                SimulatedAdministrator(),
+                new SubmitSimulatedDecisionMessage(1, rememberedPrompt.Challenge.ChallengeId, SimulatedDecisionChoice.RememberFor30Days));
+            activeFixture.Authority.EnqueueNonce(remembered.RememberedRule!.RuleId);
+            var collisionPrompt = activeFixture.AddPrompt(sequence: 2, destination: SimulatedDestination(activeFixture.Sample, 2));
+            AssertRuleIdCollisionIsNonMutating(activeFixture, collisionPrompt, expectedCollisionCount: 1);
+            AssertEqual(1, activeFixture.Snapshot().RememberedRules.Count);
+        }
+
+        using (var retainedFixture = new SimulatedCoordinatorFixture())
+        {
+            var rememberedPrompt = retainedFixture.AddPrompt();
+            var remembered = retainedFixture.Coordinator.SubmitDecision(
+                SimulatedAdministrator(),
+                new SubmitSimulatedDecisionMessage(1, rememberedPrompt.Challenge.ChallengeId, SimulatedDecisionChoice.RememberFor30Days));
+            _ = retainedFixture.Coordinator.RevokeRule(
+                SimulatedAdministrator(),
+                new RevokeSimulatedRememberedRuleMessage(1, remembered.RememberedRule!.RuleId, remembered.RememberedRule.Revision));
+            retainedFixture.Authority.EnqueueNonce(remembered.RememberedRule.RuleId);
+            var collisionPrompt = retainedFixture.AddPrompt(sequence: 2, destination: SimulatedDestination(retainedFixture.Sample, 3));
+            AssertRuleIdCollisionIsNonMutating(retainedFixture, collisionPrompt, expectedCollisionCount: 1);
+            AssertEqual(1, retainedFixture.Snapshot().Capacity.RuleIdRegistryEntryCount);
+        }
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiRuleCommittedTrafficFailedOpenAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        var accepted = fixture.AddPrompt();
+        fixture.Authority.PersistentOverride = (decision, epoch) =>
+        {
+            fixture.Authority.SetLogicalEpoch(epoch);
+            var status = SimulatedStatus(accepted, fixture.Clock.Now(), GateRuntimeState.FailedOpen, "ticket-global-capacity-exhausted", true);
+            var alert = SimulatedAlert(accepted, fixture.Clock.Now(), "ticket-global-capacity-exhausted", true);
+            return new PersistentDecisionTransitionResult(1, new GateTransitionResult(status, criticalAlert: alert), [], epoch, true);
+        };
+        var result = fixture.Coordinator.SubmitDecision(
+            SimulatedAdministrator(),
+            new SubmitSimulatedDecisionMessage(1, accepted.Challenge.ChallengeId, SimulatedDecisionChoice.RememberFor30Days));
+        AssertEqual(SimulatedDecisionItemState.FailedOpen, result.DecisionState);
+        AssertTrue(result.TrafficFailedOpen && result.RememberedRule?.State == SimulatedDecisionItemState.Remembered, "Independent remembered-rule and current traffic outcomes were collapsed.");
+        AssertEqual(1, fixture.Snapshot().RememberedRules.Count);
+        AssertTrue(fixture.Snapshot().CriticalAlerts.Any(item => item.TrafficFailedOpen), "Committed-rule fail-open alert was not projected.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiRememberAutoMatchAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        var first = fixture.AddPrompt();
+        var remembered = fixture.Coordinator.SubmitDecision(
+            SimulatedAdministrator(),
+            new SubmitSimulatedDecisionMessage(1, first.Challenge.ChallengeId, SimulatedDecisionChoice.RememberFor30Days));
+        var epoch = fixture.Authority.PolicyEpoch;
+        var ordinaryBefore = fixture.Authority.OrdinaryDecisionCalls;
+        var later = fixture.AddPrompt(sequence: 2);
+        AssertTrue(later.AutoResult?.RememberedRule?.RuleId == remembered.RememberedRule!.RuleId, "Exact remembered scope did not auto-match.");
+        AssertEqual(epoch, fixture.Authority.PolicyEpoch);
+        AssertEqual(ordinaryBefore + 1, fixture.Authority.OrdinaryDecisionCalls);
+        AssertEqual(0, fixture.Snapshot().ActivePrompts.Count);
+
+        var mismatchDestination = new DestinationBinding(1, IPAddress.Parse("127.0.0.2"), IpVersion.IPv4, 5050, TransportProtocol.Tcp, NetworkTrafficDirection.Outbound, 12, 34, "localhost", DomainEvidenceProvenance.DnsObservation, fixture.Sample.Start);
+        _ = fixture.AddPrompt(sequence: 3, destination: mismatchDestination);
+        AssertEqual(1, fixture.Snapshot().ActivePrompts.Count);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiRevokeAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        var prompt = fixture.AddPrompt();
+        var decision = fixture.Coordinator.SubmitDecision(SimulatedAdministrator(), new SubmitSimulatedDecisionMessage(1, prompt.Challenge.ChallengeId, SimulatedDecisionChoice.RememberFor30Days));
+        var rule = decision.RememberedRule!;
+        var epoch = fixture.Authority.PolicyEpoch;
+        var stale = AssertSimulatedError(() => fixture.Coordinator.RevokeRule(SimulatedAdministrator(), new RevokeSimulatedRememberedRuleMessage(1, rule.RuleId, rule.Revision - 1)));
+        AssertEqual(SimulatedDecisionReasonCodes.RuleRevisionConflict, stale.Code);
+        AssertEqual(epoch, fixture.Authority.PolicyEpoch);
+        var request = new RevokeSimulatedRememberedRuleMessage(1, rule.RuleId, rule.Revision);
+        var revoked = fixture.Coordinator.RevokeRule(SimulatedAdministrator(), request);
+        var duplicate = fixture.Coordinator.RevokeRule(SimulatedAdministrator(), request);
+        AssertEqual(SimulatedDecisionItemState.Revoked, revoked.State);
+        AssertTrue(duplicate.IsDuplicate, "Exact revoke replay was not deduplicated.");
+        AssertEqual(epoch + 1, fixture.Authority.PolicyEpoch);
+        AssertEqual(0, fixture.Snapshot().RememberedRules.Count);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiFileMutationAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        var prompt = fixture.AddPrompt();
+        _ = fixture.Coordinator.SubmitDecision(SimulatedAdministrator(), new SubmitSimulatedDecisionMessage(1, prompt.Challenge.ChallengeId, SimulatedDecisionChoice.RememberFor30Days));
+        var changed = new FileVersionIdentity(1, fixture.Sample.File.VolumeId, fixture.Sample.File.FileId, fixture.Sample.File.CreationTimeUtc, fixture.Sample.File.SizeBytes + 1, fixture.Sample.File.LastWriteTimeUtc.AddSeconds(1), fixture.Sample.File.ChangeTimeUtc.AddSeconds(1), fixture.Sample.File.Usn + 1, "version-token-2");
+        var epoch = fixture.Authority.PolicyEpoch;
+        fixture.Coordinator.InvalidateFileVersion(changed.VolumeId, changed.FileId, changed);
+        AssertEqual(epoch + 1, fixture.Authority.PolicyEpoch);
+        AssertEqual(0, fixture.Snapshot().RememberedRules.Count);
+        _ = fixture.AddPrompt(sequence: 2, file: changed);
+        AssertEqual(1, fixture.Snapshot().ActivePrompts.Count);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiPolicyEpochAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        var first = fixture.AddPrompt();
+        _ = fixture.Coordinator.SubmitDecision(SimulatedAdministrator(), new SubmitSimulatedDecisionMessage(1, first.Challenge.ChallengeId, SimulatedDecisionChoice.RememberFor30Days));
+        _ = fixture.AddPrompt(sequence: 2, subject: SimulatedSubject(fixture.Sample, 4), destination: new DestinationBinding(1, IPAddress.Parse("127.0.0.4"), IpVersion.IPv4, 5050, TransportProtocol.Tcp, NetworkTrafficDirection.Outbound, 12, 34, null, DomainEvidenceProvenance.None, null));
+        fixture.Coordinator.ApplyExternalPolicyEpoch(fixture.Authority.PolicyEpoch + 1);
+        var snapshot = fixture.Snapshot();
+        AssertEqual(0, snapshot.ActivePrompts.Count);
+        AssertEqual(0, snapshot.RememberedRules.Count);
+        AssertEqual(0, fixture.Authority.CaptureOwnership().CoreActiveContextCount);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiBlockCurrentAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        var prompt = fixture.AddPrompt();
+        var result = fixture.Coordinator.SubmitDecision(SimulatedAdministrator(), new SubmitSimulatedDecisionMessage(1, prompt.Challenge.ChallengeId, SimulatedDecisionChoice.BlockCurrent));
+        AssertEqual(SimulatedDecisionItemState.BlockedCurrent, result.DecisionState);
+        AssertEqual(0, fixture.Snapshot().RememberedRules.Count);
+        AssertTrue(result.RememberedRule is null, "Block current created persistent state.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiTimeoutEqualityAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        var prompt = fixture.AddPrompt();
+        fixture.Clock.Set(prompt.Challenge.DecisionWindow.Deadline);
+        var calls = fixture.Authority.OrdinaryDecisionCalls;
+        var result = fixture.Coordinator.SubmitDecision(SimulatedAdministrator(), new SubmitSimulatedDecisionMessage(1, prompt.Challenge.ChallengeId, SimulatedDecisionChoice.AllowOnce));
+        var duplicate = fixture.Coordinator.SubmitDecision(SimulatedAdministrator(), new SubmitSimulatedDecisionMessage(1, prompt.Challenge.ChallengeId, SimulatedDecisionChoice.AllowOnce));
+        AssertEqual(SimulatedDecisionItemState.FailedOpen, result.DecisionState);
+        AssertTrue(result.TrafficFailedOpen && duplicate.IsDuplicate, "Deadline equality was not terminal and idempotent.");
+        AssertEqual(calls + 1, fixture.Authority.OrdinaryDecisionCalls);
+        AssertEqual(0, fixture.Snapshot().ActivePrompts.Count);
+        AssertEqual(1, fixture.Snapshot().CriticalAlerts.Count(item => item.TrafficFailedOpen));
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiReconnectRequiredAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        fixture.Coordinator.AcceptTrustedReconnect(fixture.Sample.Intent, new ProtectedFileDisplayMetadata("tcp.txt"), fixture.Sample.Destination, "Existing TCP flow was not held.");
+        var udpDestination = new DestinationBinding(
+            1,
+            IPAddress.Parse("127.0.0.2"),
+            IpVersion.IPv4,
+            5051,
+            TransportProtocol.Udp,
+            NetworkTrafficDirection.Outbound,
+            12,
+            34,
+            null,
+            DomainEvidenceProvenance.None,
+            null);
+        var udpIntent = new FileReadIntent(1, Guid.NewGuid(), fixture.Sample.Subject, fixture.Sample.File, FileActivityOperation.Read, fixture.Sample.Start, fixture.Sample.ReadWindow, fixture.Sample.Boot, 2);
+        var quicIntent = new FileReadIntent(1, Guid.NewGuid(), fixture.Sample.Subject, fixture.Sample.File, FileActivityOperation.Read, fixture.Sample.Start, fixture.Sample.ReadWindow, fixture.Sample.Boot, 3);
+        fixture.Coordinator.AcceptTrustedReconnect(udpIntent, new ProtectedFileDisplayMetadata("udp.txt"), udpDestination, "Existing UDP flow was not held.");
+        fixture.Coordinator.AcceptTrustedReconnect(quicIntent, new ProtectedFileDisplayMetadata("quic.txt"), udpDestination, "Existing QUIC flow was not held.");
+        var snapshot = fixture.Snapshot();
+        AssertEqual(0, snapshot.ActivePrompts.Count);
+        AssertEqual(3, snapshot.ReconnectNotices.Count);
+        AssertTrue(snapshot.ReconnectNotices.All(item => item.ReasonCode == SimulatedDecisionReasonCodes.ReconnectRequired), "Reconnect notices did not retain their stable reason.");
+        AssertTrue(snapshot.ReconnectNotices.Select(item => item.LimitationReason).SequenceEqual([
+            "Existing TCP flow was not held.",
+            "Existing UDP flow was not held.",
+            "Existing QUIC flow was not held."
+        ]), "TCP, UDP and QUIC reconnect limitations were not preserved.");
+        AssertTrue(snapshot.ReconnectNotices.All(item => !JsonSerializer.Serialize(item, JsonDefaults.Options).Contains("challengeId", StringComparison.OrdinalIgnoreCase)), "Reconnect notice fabricated a challenge.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiCriticalFailOpenAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        var prompt = fixture.AddPrompt();
+        var now = fixture.Clock.Now();
+        fixture.Coordinator.ReconcileAuthoritativeStatus(
+            SimulatedStatus(prompt, now, GateRuntimeState.FailedOpen, "monotonic-deadline-expired", true),
+            SimulatedAlert(prompt, now, "monotonic-deadline-expired", true));
+        var snapshot = fixture.Snapshot();
+        AssertEqual(0, snapshot.ActivePrompts.Count);
+        AssertEqual(SimulatedDecisionProtocolLimits.FailOpenPresentationText, snapshot.CriticalAlerts.Single().PresentationText);
+        AssertTrue(snapshot.CriticalAlerts.Single().TrafficFailedOpen, "Critical alert lost fail-open semantics.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiExactDuplicateAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        var prompt = fixture.AddPrompt();
+        var request = new SubmitSimulatedDecisionMessage(1, prompt.Challenge.ChallengeId, SimulatedDecisionChoice.BlockCurrent);
+        var first = fixture.Coordinator.SubmitDecision(SimulatedAdministrator(), request);
+        var calls = fixture.Authority.OrdinaryDecisionCalls;
+        var second = fixture.Coordinator.SubmitDecision(SimulatedAdministrator(), request);
+        AssertTrue(second.IsDuplicate, "Exact decision replay was not marked duplicate.");
+        AssertEqual(first.Sequence, second.Sequence);
+        AssertEqual(calls, fixture.Authority.OrdinaryDecisionCalls);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiConflictingReplayAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        var prompt = fixture.AddPrompt();
+        _ = fixture.Coordinator.SubmitDecision(SimulatedAdministrator(), new SubmitSimulatedDecisionMessage(1, prompt.Challenge.ChallengeId, SimulatedDecisionChoice.AllowOnce));
+        var calls = fixture.Authority.OrdinaryDecisionCalls;
+        var error = AssertSimulatedError(() => fixture.Coordinator.SubmitDecision(SimulatedAdministrator(), new SubmitSimulatedDecisionMessage(1, prompt.Challenge.ChallengeId, SimulatedDecisionChoice.BlockCurrent)));
+        AssertEqual(SimulatedDecisionReasonCodes.DecisionConflict, error.Code);
+        AssertEqual(calls, fixture.Authority.OrdinaryDecisionCalls);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiCallerForgeryAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        var prompt = fixture.AddPrompt();
+        var nonAdmin = new SimulatedDecisionCaller("sid:S-1-5-21-1", false);
+        AssertEqual(SimulatedDecisionReasonCodes.AdministratorRequired, AssertSimulatedError(() => fixture.Coordinator.GetSnapshot(nonAdmin, 1)).Code);
+        AssertEqual(SimulatedDecisionReasonCodes.AdministratorRequired, AssertSimulatedError(() => fixture.Coordinator.SubmitDecision(nonAdmin, new SubmitSimulatedDecisionMessage(1, prompt.Challenge.ChallengeId, SimulatedDecisionChoice.AllowOnce))).Code);
+        var requestJson = JsonSerializer.Serialize(new SubmitSimulatedDecisionMessage(1, prompt.Challenge.ChallengeId, SimulatedDecisionChoice.AllowOnce), JsonDefaults.Options);
+        AssertTrue(!requestJson.Contains("caller", StringComparison.OrdinalIgnoreCase)
+            && !requestJson.Contains("time", StringComparison.OrdinalIgnoreCase)
+            && !requestJson.Contains("scope", StringComparison.OrdinalIgnoreCase)
+            && !requestJson.Contains("nonce", StringComparison.OrdinalIgnoreCase), "UI request serialized trusted caller/time/scope/nonce data.");
+        return Task.CompletedTask;
+    }
+
+    private static async Task TestSimUiResyncAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        await using var subscription = fixture.Coordinator.Subscribe(SimulatedAdministrator(), fixture.Coordinator.CurrentSequence);
+        _ = fixture.AddPrompt();
+        var promptEvent = await subscription.Reader.ReadAsync().ConfigureAwait(false);
+        AssertEqual(SimulatedDecisionEventKind.PromptUpserted, promptEvent.Kind);
+        await subscription.DisposeAsync().ConfigureAwait(false);
+        var stale = AssertSimulatedError(() => fixture.Coordinator.Subscribe(SimulatedAdministrator(), 0));
+        AssertEqual(SimulatedDecisionReasonCodes.ResyncRequired, stale.Code);
+        AssertEqual(0, fixture.Hub.SubscriberCount);
+
+        using var overflowHub = new SimulatedDecisionEventHub();
+        await using var slow = overflowHub.Subscribe();
+        for (var sequence = 1; sequence <= 257; sequence++)
+            overflowHub.Publish(SimulatedResyncStatusEvent(sequence));
+        var overflowMarker = await slow.Reader.ReadAsync().ConfigureAwait(false);
+        AssertTrue(overflowMarker.RequiresResync, "Slow subscriber overflow did not collapse to a resync marker.");
+    }
+
+    private static Task TestSimUiProjectionCapacityRecoveryAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        var rememberedPrompt = fixture.AddPrompt();
+        _ = fixture.Coordinator.SubmitDecision(SimulatedAdministrator(), new SubmitSimulatedDecisionMessage(1, rememberedPrompt.Challenge.ChallengeId, SimulatedDecisionChoice.RememberFor30Days));
+        var unmatchedDestination = new DestinationBinding(
+            1,
+            IPAddress.Parse("127.0.0.2"),
+            IpVersion.IPv4,
+            fixture.Sample.Destination.RemotePort,
+            fixture.Sample.Destination.Protocol,
+            NetworkTrafficDirection.Outbound,
+            fixture.Sample.Destination.NetworkCompartmentId,
+            fixture.Sample.Destination.InterfaceLuid,
+            null,
+            DomainEvidenceProvenance.None,
+            null);
+        for (var sequence = 2; sequence <= 5; sequence++)
+            _ = fixture.AddPrompt(sequence: sequence, destination: unmatchedDestination);
+        var coordinatorBefore = fixture.Coordinator.CaptureOwnership();
+        var authorityBefore = fixture.Authority.CaptureOwnership();
+        AssertTrue(
+            coordinatorBefore.PromptOwnershipCount > 0
+            && coordinatorBefore.JoinOwnershipCount > 0
+            && coordinatorBefore.RememberedRuleCount > 0
+            && coordinatorBefore.DecisionReceiptCount > 0
+            && coordinatorBefore.RuleIdRegistryEntryCount > 0,
+            "Projection recovery fixture did not populate every Coordinator ownership category.");
+        AssertTrue(!authorityBefore.IsZero, "Projection recovery fixture did not populate Authority ownership.");
+        var syntheticIntent = new FileReadIntent(1, Guid.NewGuid(), fixture.Sample.Subject, fixture.Sample.File, FileActivityOperation.Read, fixture.Sample.Start, fixture.Sample.ReadWindow, fixture.Sample.Boot, 99);
+        var syntheticChallenge = new NetworkGateChallenge(1, Guid.NewGuid(), syntheticIntent.IntentId, syntheticIntent.Subject, unmatchedDestination, 99, false, fixture.Sample.Coverage, fixture.Sample.Start, ServiceRange(fixture.Clock.Now().ClockInstanceId, fixture.Clock.Now().ElapsedMilliseconds, 15_000), "Simulation");
+        var status = new GateStatus(1, OutboundGateMode.Simulation, GateRuntimeState.AwaitingDecision, fixture.Sample.Coverage, "challenge-received", new GateAffectedScope(1, GateAffectedScopeKind.Intent, syntheticIntent.IntentId, syntheticIntent.Subject), fixture.Sample.Start, fixture.Clock.Now(), 0, 0, false);
+        _ = fixture.Coordinator.AcceptTrustedChallenge(syntheticIntent, new ProtectedFileDisplayMetadata("report.txt"), syntheticChallenge, status);
+        var ownership = fixture.Coordinator.CaptureOwnership();
+        var snapshot = fixture.Snapshot();
+        AssertTrue(ownership.IsZero && fixture.Authority.CaptureOwnership().IsZero, "Projection-capacity recovery did not prove aggregate all-zero ownership.");
+        AssertEqual(1L, snapshot.Counters.ProjectionCapacityFailureCount);
+        AssertTrue(snapshot.CriticalAlerts.Any(item => item.ReasonCode == SimulatedDecisionReasonCodes.ProjectionCapacityExhausted && item.TrafficFailedOpen), "Projection-capacity reason was emitted without Critical fail-open evidence.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiRuleIdPrevalidationRollbackAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        var prompt = fixture.AddPrompt();
+        fixture.Authority.PersistentOverride = (_, _) => new PersistentDecisionTransitionResult(1, prompt.AcceptedResult, [], fixture.Authority.PolicyEpoch, false);
+        var request = new SubmitSimulatedDecisionMessage(1, prompt.Challenge.ChallengeId, SimulatedDecisionChoice.RememberFor30Days);
+        var baseline = fixture.Coordinator.CaptureOwnership().RuleIdRegistryEntryCount;
+        var first = fixture.Coordinator.SubmitDecision(SimulatedAdministrator(), request);
+        var second = fixture.Coordinator.SubmitDecision(SimulatedAdministrator(), request);
+        AssertEqual(SimulatedDecisionItemState.AwaitingDecision, first.DecisionState);
+        AssertEqual(SimulatedDecisionItemState.AwaitingDecision, second.DecisionState);
+        AssertEqual(baseline, fixture.Coordinator.CaptureOwnership().RuleIdRegistryEntryCount);
+        AssertEqual(1, fixture.Snapshot().ActivePrompts.Count);
+        AssertEqual(0, fixture.Snapshot().RememberedRules.Count);
+
+        using var malformedFixture = new SimulatedCoordinatorFixture();
+        var malformedPrompt = malformedFixture.AddPrompt();
+        malformedFixture.Authority.PersistentOverride = (_, _) => new PersistentDecisionTransitionResult(
+            1,
+            malformedPrompt.AcceptedResult,
+            [],
+            malformedFixture.Authority.PolicyEpoch,
+            true);
+        var malformedRequest = new SubmitSimulatedDecisionMessage(1, malformedPrompt.Challenge.ChallengeId, SimulatedDecisionChoice.RememberFor30Days);
+        AssertThrows<InvalidOperationException>(() => malformedFixture.Coordinator.SubmitDecision(SimulatedAdministrator(), malformedRequest));
+        var malformedSnapshot = malformedFixture.Snapshot();
+        AssertEqual(1, malformedFixture.Coordinator.CaptureOwnership().RuleIdRegistryEntryCount);
+        AssertTrue(!malformedSnapshot.ActivePrompts.Single().Expiry.AcceptingDecisions, "Malformed authority result did not disable its prompt.");
+        AssertEqual(1, malformedSnapshot.CriticalAlerts.Count(alert => alert.ReasonCode == SimulatedDecisionReasonCodes.AuthorityResultInvalid));
+        var retainedError = AssertSimulatedError(() => malformedFixture.Coordinator.SubmitDecision(SimulatedAdministrator(), malformedRequest));
+        AssertEqual(SimulatedDecisionReasonCodes.AuthorityResultInvalid, retainedError.Code);
+        AssertEqual(1, malformedFixture.Snapshot().CriticalAlerts.Count(alert => alert.ReasonCode == SimulatedDecisionReasonCodes.AuthorityResultInvalid));
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiRuleIdRegistryCapacityAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        FillRuleRegistryWithTombstones(fixture, SimulatedDecisionProtocolLimits.RuleIdRegistryEntryCapacity);
+        var prompt = fixture.AddPrompt(sequence: 1000);
+        var nonceCalls = fixture.Authority.RuleIdNonceCalls;
+        var coreCalls = fixture.Authority.PersistentDecisionCalls;
+        var result = fixture.Coordinator.SubmitDecision(SimulatedAdministrator(), new SubmitSimulatedDecisionMessage(1, prompt.Challenge.ChallengeId, SimulatedDecisionChoice.RememberFor30Days));
+        AssertEqual(SimulatedDecisionReasonCodes.RuleIdRegistryCapacityExhausted, result.DecisionReasonCode);
+        AssertEqual(SimulatedDecisionProtocolLimits.RuleIdRegistryEntryCapacity, fixture.Coordinator.CaptureOwnership().RuleIdRegistryEntryCount);
+        AssertEqual(nonceCalls, fixture.Authority.RuleIdNonceCalls);
+        AssertEqual(coreCalls, fixture.Authority.PersistentDecisionCalls);
+        AssertEqual(1L, fixture.Snapshot().Counters.RuleIdRegistryCapacityRejectedCount);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiRuleIdExactReuseAtCapAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        FillRuleRegistryWithTombstones(fixture, SimulatedDecisionProtocolLimits.RuleIdRegistryEntryCapacity - 1);
+        var activePrompt = fixture.AddPrompt(sequence: 2000);
+        var active = fixture.Coordinator.SubmitDecision(SimulatedAdministrator(), new SubmitSimulatedDecisionMessage(1, activePrompt.Challenge.ChallengeId, SimulatedDecisionChoice.RememberFor30Days));
+        AssertEqual(SimulatedDecisionProtocolLimits.RuleIdRegistryEntryCapacity, fixture.Coordinator.CaptureOwnership().RuleIdRegistryEntryCount);
+        var epoch = fixture.Authority.PolicyEpoch;
+        var nonceCalls = fixture.Authority.RuleIdNonceCalls;
+        var decisionNonceCalls = fixture.Authority.DecisionNonceCalls;
+        var ordinary = fixture.Authority.OrdinaryDecisionCalls;
+        var replay = fixture.AddPrompt(sequence: 2001);
+        AssertEqual(active.RememberedRule!.RuleId, replay.AutoResult!.RememberedRule!.RuleId);
+        AssertEqual(epoch, fixture.Authority.PolicyEpoch);
+        AssertEqual(nonceCalls, fixture.Authority.RuleIdNonceCalls);
+        AssertEqual(decisionNonceCalls + 1, fixture.Authority.DecisionNonceCalls);
+        AssertEqual(ordinary + 1, fixture.Authority.OrdinaryDecisionCalls);
+        AssertEqual(SimulatedDecisionProtocolLimits.RuleIdRegistryEntryCapacity, fixture.Coordinator.CaptureOwnership().RuleIdRegistryEntryCount);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiRuleIdPromotionAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        var prompt = fixture.AddPrompt();
+        var baseline = fixture.Coordinator.CaptureOwnership().RuleIdRegistryEntryCount;
+        var nonceCalls = fixture.Authority.RuleIdNonceCalls;
+        var decisionNonceCalls = fixture.Authority.DecisionNonceCalls;
+        var result = fixture.Coordinator.SubmitDecision(SimulatedAdministrator(), new SubmitSimulatedDecisionMessage(1, prompt.Challenge.ChallengeId, SimulatedDecisionChoice.RememberFor30Days));
+        AssertEqual(baseline + 1, fixture.Coordinator.CaptureOwnership().RuleIdRegistryEntryCount);
+        AssertEqual(nonceCalls + 1, fixture.Authority.RuleIdNonceCalls);
+        AssertEqual(decisionNonceCalls, fixture.Authority.DecisionNonceCalls);
+        AssertEqual(SimulatedDecisionItemState.Remembered, result.RememberedRule!.State);
+        AssertEqual(1, fixture.Snapshot().RememberedRules.Count);
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiRuleIdTombstoneLifecycleAsync()
+    {
+        AssertRuleTombstoneLifecycle((fixture, rule) =>
+            _ = fixture.Coordinator.RevokeRule(SimulatedAdministrator(), new RevokeSimulatedRememberedRuleMessage(1, rule.RuleId, rule.Revision)));
+        AssertRuleTombstoneLifecycle((fixture, unusedRule) =>
+        {
+            fixture.Clock.Advance(30L * 24 * 60 * 60 * 1000);
+            _ = fixture.Snapshot();
+        });
+        AssertRuleTombstoneLifecycle((fixture, _) =>
+        {
+            var changed = new FileVersionIdentity(1, fixture.Sample.File.VolumeId, fixture.Sample.File.FileId, fixture.Sample.File.CreationTimeUtc, fixture.Sample.File.SizeBytes + 1, fixture.Sample.File.LastWriteTimeUtc.AddSeconds(1), fixture.Sample.File.ChangeTimeUtc.AddSeconds(1), fixture.Sample.File.Usn + 1, "version-token-mutated");
+            fixture.Coordinator.InvalidateFileVersion(changed.VolumeId, changed.FileId, changed);
+        });
+        AssertRuleTombstoneLifecycle((fixture, _) => fixture.Coordinator.ApplyExternalPolicyEpoch(fixture.Authority.PolicyEpoch + 1));
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiExpiredRuleTerminalizesPromptAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        var rememberedPrompt = fixture.AddPrompt();
+        _ = fixture.Coordinator.SubmitDecision(
+            SimulatedAdministrator(),
+            new SubmitSimulatedDecisionMessage(1, rememberedPrompt.Challenge.ChallengeId, SimulatedDecisionChoice.RememberFor30Days));
+        fixture.Clock.Advance(30L * 24 * 60 * 60 * 1000 - 1_000);
+        var activePrompt = fixture.AddPrompt(sequence: 2, destination: SimulatedDestination(fixture.Sample, 4));
+        fixture.Clock.Advance(1_000);
+        var epochBefore = fixture.Authority.PolicyEpoch;
+        var persistentCallsBefore = fixture.Authority.PersistentDecisionCalls;
+        var nonceCallsBefore = fixture.Authority.RuleIdNonceCalls;
+        var ownershipBefore = fixture.Coordinator.CaptureOwnership();
+
+        var error = AssertSimulatedError(() => fixture.Coordinator.SubmitDecision(
+            SimulatedAdministrator(),
+            new SubmitSimulatedDecisionMessage(1, activePrompt.Challenge.ChallengeId, SimulatedDecisionChoice.RememberFor30Days)));
+
+        var ownershipAfter = fixture.Coordinator.CaptureOwnership();
+        AssertEqual(SimulatedDecisionReasonCodes.ChallengeNotFound, error.Code);
+        AssertEqual(epochBefore + 1, fixture.Authority.PolicyEpoch);
+        AssertEqual(persistentCallsBefore, fixture.Authority.PersistentDecisionCalls);
+        AssertEqual(nonceCallsBefore, fixture.Authority.RuleIdNonceCalls);
+        AssertEqual(0, ownershipAfter.PromptOwnershipCount);
+        AssertEqual(0, ownershipAfter.JoinOwnershipCount);
+        AssertEqual(0, ownershipAfter.RememberedRuleCount);
+        AssertEqual(ownershipBefore.RuleIdRegistryEntryCount, ownershipAfter.RuleIdRegistryEntryCount);
+        AssertEqual(ownershipBefore.DecisionReceiptCount, ownershipAfter.DecisionReceiptCount);
+        AssertEqual(1, ownershipAfter.RuleIdRegistryEntryCount);
+        return Task.CompletedTask;
+    }
+
+    private static async Task TestSimUiBoundsAndFramingAsync()
+    {
+        await TestSimulatedDecisionProtocolMaximumSnapshotAsync().ConfigureAwait(false);
+        using var fixture = new SimulatedCoordinatorFixture();
+        var sequence = 0;
+        for (var subjectIndex = 0; subjectIndex < SimulatedDecisionProtocolLimits.MaximumPromptCount / SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject; subjectIndex++)
+        {
+            var subject = SimulatedSubject(fixture.Sample, subjectIndex + 1);
+            for (var subjectPrompt = 0; subjectPrompt < SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject; subjectPrompt++)
+                _ = fixture.AddPrompt(sequence: ++sequence, subject: subject, destination: SimulatedDestination(fixture.Sample, subjectIndex + 2));
+        }
+        var snapshot = fixture.Snapshot();
+        AssertEqual(SimulatedDecisionProtocolLimits.MaximumPromptCount, snapshot.ActivePrompts.Count);
+        AssertTrue(snapshot.ActivePrompts
+            .GroupBy(item => $"{item.ApplicationIdentity}|{item.Subject.Kind}|{item.Subject.PrimaryProcess.ProcessId}|{item.Subject.PrimaryProcess.StartTime:O}|{item.Subject.ProcessGroupId:D}|{string.Join(';', item.Subject.ExactMembers.Select(member => $"{member.ProcessId}:{member.StartTime:O}"))}", StringComparer.Ordinal)
+            .All(group => group.Count() == SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject), "The 128-prompt fixture did not preserve exactly four prompts per structural subject.");
+
+        var globalCapPlusOne = snapshot.ActivePrompts.ToList();
+        globalCapPlusOne.Add(ClonePromptWithSubject(snapshot.ActivePrompts[0], CreateSimulatedProtocolSample().ProcessSubject, "cap-plus-one-app", Guid.NewGuid(), Guid.NewGuid()));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionSnapshotMessage(
+            1, snapshot.Sequence, true, snapshot.Authorization, globalCapPlusOne, snapshot.ReconnectNotices,
+            snapshot.RememberedRules, snapshot.RecentStatuses, snapshot.CriticalAlerts, snapshot.Capacity, snapshot.Counters));
+        AssertEqual(SimulatedDecisionProtocolLimits.MaximumPromptCount + 1, globalCapPlusOne.Count);
+
+        var firstPrompt = snapshot.ActivePrompts[0];
+        var subjectCapPlusOne = snapshot.ActivePrompts
+            .Where(item => string.Equals(item.ApplicationIdentity, firstPrompt.ApplicationIdentity, StringComparison.Ordinal)
+                && item.Subject.Kind == firstPrompt.Subject.Kind
+                && item.Subject.PrimaryProcess == firstPrompt.Subject.PrimaryProcess
+                && item.Subject.ProcessGroupId == firstPrompt.Subject.ProcessGroupId
+                && item.Subject.ExactMembers.SequenceEqual(firstPrompt.Subject.ExactMembers))
+            .ToList();
+        AssertEqual(SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject, subjectCapPlusOne.Count);
+        subjectCapPlusOne.Add(ClonePromptWithSubject(firstPrompt, firstPrompt.Subject, firstPrompt.ApplicationIdentity, Guid.NewGuid(), Guid.NewGuid()));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionSnapshotMessage(
+            1, snapshot.Sequence, true, snapshot.Authorization, subjectCapPlusOne, [], [], [], [], snapshot.Capacity, snapshot.Counters));
+        AssertEqual(SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject + 1, subjectCapPlusOne.Count);
+    }
+
+    private static Task TestSimUiServiceCapacityBoundsAsync()
+    {
+        using (var perApplication = new SimulatedCoordinatorFixture())
+        {
+            for (var index = 0; index < SimulatedDecisionProtocolLimits.MaximumRememberedRulesPerApplication; index++)
+                _ = CommitRememberedRule(perApplication, index + 1, perApplication.Sample.Subject, SimulatedDestination(perApplication.Sample, index + 2));
+            var before = perApplication.Coordinator.CaptureOwnership();
+            var nonceBefore = perApplication.Authority.RuleIdNonceCalls;
+            var callsBefore = perApplication.Authority.PersistentDecisionCalls;
+            var capPrompt = perApplication.AddPrompt(sequence: 100, destination: SimulatedDestination(perApplication.Sample, 20));
+            var refused = perApplication.Coordinator.SubmitDecision(SimulatedAdministrator(), new SubmitSimulatedDecisionMessage(1, capPrompt.Challenge.ChallengeId, SimulatedDecisionChoice.RememberFor30Days));
+            AssertEqual(SimulatedDecisionReasonCodes.RememberedRuleCapacityExhausted, refused.DecisionReasonCode);
+            AssertEqual(SimulatedDecisionProtocolLimits.MaximumRememberedRulesPerApplication, perApplication.Snapshot().RememberedRules.Count);
+            AssertEqual(before.RuleIdRegistryEntryCount, perApplication.Coordinator.CaptureOwnership().RuleIdRegistryEntryCount);
+            AssertEqual(nonceBefore, perApplication.Authority.RuleIdNonceCalls);
+            AssertEqual(callsBefore, perApplication.Authority.PersistentDecisionCalls);
+        }
+
+        using (var global = new SimulatedCoordinatorFixture())
+        {
+            var sequence = 0;
+            for (var application = 0; application < 8; application++)
+            {
+                var subject = SimulatedSubject(global.Sample, application + 1);
+                for (var index = 0; index < SimulatedDecisionProtocolLimits.MaximumRememberedRulesPerApplication; index++)
+                    _ = CommitRememberedRule(global, ++sequence, subject, SimulatedDestination(global.Sample, 30 + sequence));
+            }
+            AssertEqual(SimulatedDecisionProtocolLimits.MaximumRememberedRuleCount, global.Snapshot().RememberedRules.Count);
+            var registryBefore = global.Coordinator.CaptureOwnership().RuleIdRegistryEntryCount;
+            var nonceBefore = global.Authority.RuleIdNonceCalls;
+            var callsBefore = global.Authority.PersistentDecisionCalls;
+            var capPrompt = global.AddPrompt(sequence: 1_000, subject: SimulatedSubject(global.Sample, 20), destination: SimulatedDestination(global.Sample, 120));
+            var refused = global.Coordinator.SubmitDecision(SimulatedAdministrator(), new SubmitSimulatedDecisionMessage(1, capPrompt.Challenge.ChallengeId, SimulatedDecisionChoice.RememberFor30Days));
+            AssertEqual(SimulatedDecisionReasonCodes.RememberedRuleCapacityExhausted, refused.DecisionReasonCode);
+            AssertEqual(SimulatedDecisionProtocolLimits.MaximumRememberedRuleCount, global.Snapshot().RememberedRules.Count);
+            AssertEqual(registryBefore, global.Coordinator.CaptureOwnership().RuleIdRegistryEntryCount);
+            AssertEqual(nonceBefore, global.Authority.RuleIdNonceCalls);
+            AssertEqual(callsBefore, global.Authority.PersistentDecisionCalls);
+        }
+
+        using (var histories = new SimulatedCoordinatorFixture())
+        {
+            var livePrompt = histories.AddPrompt();
+            for (var index = 0; index <= SimulatedDecisionProtocolLimits.MaximumReconnectNoticeCount; index++)
+            {
+                var intent = new FileReadIntent(1, Guid.NewGuid(), histories.Sample.Subject, histories.Sample.File, FileActivityOperation.Read, histories.Sample.Start, histories.Sample.ReadWindow, histories.Sample.Boot, index + 10);
+                histories.Coordinator.AcceptTrustedReconnect(intent, new ProtectedFileDisplayMetadata($"notice-{index}.txt"), SimulatedDestination(histories.Sample, index + 2), "Existing flow was not held.");
+            }
+            for (var index = 0; index <= SimulatedDecisionProtocolLimits.MaximumStatusCount; index++)
+            {
+                var status = new GateStatus(1, OutboundGateMode.Simulation, GateRuntimeState.AwaitingDecision, histories.Sample.Coverage, $"status-{index}", new GateAffectedScope(1, GateAffectedScopeKind.Intent, Guid.NewGuid(), histories.Sample.Subject), histories.Sample.Start.AddSeconds(index), histories.Clock.Now(), 0, 0, false);
+                histories.Coordinator.ReconcileAuthoritativeStatus(status);
+            }
+            for (var index = 0; index <= SimulatedDecisionProtocolLimits.MaximumCriticalAlertCount; index++)
+            {
+                var status = new GateStatus(1, OutboundGateMode.Simulation, GateRuntimeState.AwaitingDecision, histories.Sample.Coverage, $"alert-status-{index}", new GateAffectedScope(1, GateAffectedScopeKind.Intent, Guid.NewGuid(), histories.Sample.Subject), histories.Sample.Start.AddMinutes(index), histories.Clock.Now(), 0, 0, false);
+                var alert = new CriticalAlert(1, Guid.NewGuid(), $"alert-{index}", status.AffectedScope, histories.Sample.Start.AddMinutes(index), histories.Clock.Now(), 0, 0, false);
+                histories.Coordinator.ReconcileAuthoritativeStatus(status, alert);
+            }
+            var snapshot = histories.Snapshot();
+            AssertEqual(SimulatedDecisionProtocolLimits.MaximumReconnectNoticeCount, snapshot.ReconnectNotices.Count);
+            AssertEqual(SimulatedDecisionProtocolLimits.MaximumStatusCount, snapshot.RecentStatuses.Count);
+            AssertEqual(SimulatedDecisionProtocolLimits.MaximumCriticalAlertCount, snapshot.CriticalAlerts.Count);
+            AssertTrue(snapshot.ReconnectNotices.All(item => item.RedactedFileLabel != "notice-0.txt"), "Reconnect cap+1 did not evict only the oldest presentation history.");
+            AssertTrue(snapshot.ActivePrompts.Any(item => item.ChallengeId == livePrompt.Challenge.ChallengeId), "Presentation-history cap+1 evicted live prompt authority.");
+        }
+        return Task.CompletedTask;
+    }
+
+    private static async Task TestSimUiSubscriberCapacityAsync()
+    {
+        var previousPipeName = Environment.GetEnvironmentVariable("EGRESSGUARD_PIPE_NAME");
+        var pipeName = $"{ProtocolConstants.PipeName}.Simulation.{Environment.ProcessId}.{Guid.NewGuid():N}";
+        var dataDirectory = Path.Combine(Path.GetTempPath(), "EgressGuard-SimulationPipe-" + Guid.NewGuid().ToString("N"));
+        Environment.SetEnvironmentVariable("EGRESSGUARD_PIPE_NAME", pipeName);
+        Directory.CreateDirectory(dataDirectory);
+        using var fixture = new SimulatedCoordinatorFixture();
+        _ = fixture.AddPrompt();
+        var database = new EgressGuardDatabase(Path.Combine(dataDirectory, "egressguard.db"));
+        await database.InitializeAsync().ConfigureAwait(false);
+        var generalHub = new EventHub();
+        using var server = new PipeServer(
+            new ServiceState(),
+            database,
+            new FakeFirewallRuleManager(),
+            generalHub,
+            new ListLogger<PipeServer>(),
+            fixture.Coordinator);
+        using var serverLifetime = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        await server.StartAsync(serverLifetime.Token).ConfigureAwait(false);
+        try
+        {
+            if (!WindowsFirewallManager.IsAdministrator())
+                throw new TestFailureException("The real MainWindow/PipeServer Simulation integration requires an Administrator token.");
+
+            await RunStaAsync(async () =>
+            {
+                await using (var barrierSession = new MainWindowRequestSession(pipeName))
+                await using (var barrierViewModel = new SimulatedDecisionViewModel(barrierSession, pipeName))
+                {
+                    var barrierPanel = new SimulatedDecisionPanel { DataContext = barrierViewModel };
+                    var barrierWindow = new System.Windows.Window
+                    {
+                        Content = barrierPanel,
+                        Width = 640,
+                        Height = 480,
+                        ShowInTaskbar = false,
+                        WindowStyle = System.Windows.WindowStyle.None
+                    };
+                    barrierWindow.Show();
+                    await InvokePrivateTaskAsync(barrierViewModel, "RefreshSnapshotAsync").ConfigureAwait(true);
+                    var callsBeforeGap = fixture.Authority.OrdinaryDecisionCalls;
+                    _ = fixture.AddPrompt(sequence: 2, destination: SimulatedDestination(fixture.Sample, 5));
+                    AssertTrue(!barrierViewModel.AllowOnceCommand.CanExecute(null), "A snapshot without a continuous subscription enabled a decision command.");
+                    AssertAutomationInvokeDisabled(barrierPanel, "AllowOnceButton");
+                    AssertEqual(callsBeforeGap, fixture.Authority.OrdinaryDecisionCalls);
+                    InvokePrivateVoid(barrierViewModel, "StartSubscription");
+                    await WaitForDispatcherConditionAsync(
+                        () => barrierViewModel.AllowOnceCommand.CanExecute(null),
+                        TimeSpan.FromSeconds(10),
+                        "Snapshot/subscribe sequence mismatch did not resync before enabling commands.").ConfigureAwait(true);
+                    AssertEqual(2, barrierViewModel.ActivePrompts.Count);
+                    await barrierViewModel.DisposeAsync().ConfigureAwait(true);
+                    barrierWindow.Close();
+                }
+
+                await WaitForDispatcherConditionAsync(
+                    () => fixture.Hub.SubscriberCount == 0 && server.ActivePipeCount == 0,
+                    TimeSpan.FromSeconds(5),
+                    "Barrier UI session did not release its request/event pipes.").ConfigureAwait(true);
+
+                var firstWindow = new MainWindow(pipeName) { ShowInTaskbar = false, WindowStyle = System.Windows.WindowStyle.None };
+                var secondWindow = new MainWindow(pipeName) { ShowInTaskbar = false, WindowStyle = System.Windows.WindowStyle.None };
+                firstWindow.Show();
+                secondWindow.Show();
+                SelectSimulationTab(firstWindow);
+                SelectSimulationTab(secondWindow);
+                try
+                {
+                    await WaitForDispatcherConditionAsync(
+                        () => server.ActivePipeCount == 6
+                            && fixture.Hub.SubscriberCount == 2
+                            && firstWindow.SimulatedDecisionViewModel.AllowOnceCommand.CanExecute(null)
+                            && secondWindow.SimulatedDecisionViewModel.AllowOnceCommand.CanExecute(null),
+                        TimeSpan.FromSeconds(10),
+                        "Two real MainWindow sessions did not establish the exact 6/8 pipe budget.").ConfigureAwait(true);
+                }
+                catch (TestFailureException)
+                {
+                    throw new TestFailureException($"Two real MainWindow sessions did not establish the exact 6/8 pipe budget: pipes={server.ActivePipeCount}, subscribers={fixture.Hub.SubscriberCount}, firstReady={firstWindow.SimulatedDecisionViewModel.AllowOnceCommand.CanExecute(null)}, secondReady={secondWindow.SimulatedDecisionViewModel.AllowOnceCommand.CanExecute(null)}.");
+                }
+
+                AssertTrue(ReferenceEquals(firstWindow.SharedRequestSession, firstWindow.ViewModel.RequestSession)
+                    && ReferenceEquals(firstWindow.SharedRequestSession, firstWindow.SimulatedDecisionViewModel.RequestSession), "MainWindow view models did not share one request session.");
+                AssertTrue(!firstWindow.ViewModel.OwnsRequestSession && !firstWindow.SimulatedDecisionViewModel.OwnsRequestSession, "A borrowing view model claimed ownership of MainWindow's shared request session.");
+                Console.WriteLine("INFO  Phase 5B-05 real MainWindow sessions: 6/8 pipe instances");
+
+                await using (var rejected = new EgressGuardSimulatedDecisionEventClient(pipeName))
+                using (var rejectionTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
+                {
+                    try
+                    {
+                        await rejected.SubscribeAsync(fixture.Coordinator.CurrentSequence, _ => ValueTask.CompletedTask, null, rejectionTimeout.Token).ConfigureAwait(true);
+                        throw new TestFailureException("Third Simulation decision subscriber was accepted.");
+                    }
+                    catch (InvalidDataException exception)
+                    {
+                        AssertTrue(exception.Message.Contains(SimulatedDecisionReasonCodes.SubscriberCapacityExhausted, StringComparison.Ordinal), "Third-subscriber rejection lost its stable reason code.");
+                    }
+                }
+                AssertEqual(6, server.ActivePipeCount);
+                AssertEqual(2, fixture.Hub.SubscriberCount);
+                AssertEqual(1L, fixture.Hub.RejectedSubscriberCount);
+
+                var postRejection = await firstWindow.SharedRequestSession.SendAsync(
+                    MessageEnvelope.Create(OutboundGateMessageTypes.GetSimulatedDecisionSnapshot, new GetSimulatedDecisionSnapshotMessage(1)),
+                    TimeSpan.FromSeconds(3),
+                    CancellationToken.None).ConfigureAwait(true);
+                var budget = postRejection.ReadPayload<SimulatedDecisionSnapshotMessage>().Capacity;
+                AssertEqual(6, budget.PipeInstanceCount);
+                AssertEqual(8, budget.PipeInstanceCapacity);
+                AssertEqual(2, budget.ReservedRequestReconnectCapacity);
+
+                await using (var reserveOne = new EgressGuardPipeClient(pipeName))
+                await using (var reserveTwo = new EgressGuardPipeClient(pipeName))
+                {
+                    await reserveOne.ConnectAsync(TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(true);
+                    await reserveTwo.ConnectAsync(TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(true);
+                    await WaitForDispatcherConditionAsync(
+                        () => server.ActivePipeCount == SimulatedDecisionProtocolLimits.PipeInstanceCapacity,
+                        TimeSpan.FromSeconds(5),
+                        "The real PipeServer did not reach its exact 8-instance limit.").ConfigureAwait(true);
+
+                    await reserveOne.DisconnectAsync().ConfigureAwait(true);
+                    await WaitForDispatcherConditionAsync(
+                        () => server.ActivePipeCount == SimulatedDecisionProtocolLimits.PipeInstanceCapacity - 1,
+                        TimeSpan.FromSeconds(5),
+                        "The full PipeServer did not release a request slot.").ConfigureAwait(true);
+                    await using (var replacement = new EgressGuardPipeClient(pipeName))
+                    {
+                        await replacement.ConnectAsync(TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(true);
+                        var replacementResponse = await replacement.SendAsync(
+                            MessageEnvelope.Create(OutboundGateMessageTypes.GetSimulatedDecisionSnapshot, new GetSimulatedDecisionSnapshotMessage(1)),
+                            TimeSpan.FromSeconds(3),
+                            CancellationToken.None).ConfigureAwait(true);
+                        AssertEqual(OutboundGateMessageTypes.SimulatedDecisionSnapshot, replacementResponse.Type);
+                        AssertEqual(SimulatedDecisionProtocolLimits.PipeInstanceCapacity, server.ActivePipeCount);
+                        await replacement.DisconnectAsync().ConfigureAwait(true);
+                    }
+                    await reserveTwo.DisconnectAsync().ConfigureAwait(true);
+                    await WaitForDispatcherConditionAsync(
+                        () => server.ActivePipeCount == 6,
+                        TimeSpan.FromSeconds(5),
+                        "Request/reconnect reserve cleanup did not restore the 6/8 MainWindow baseline.").ConfigureAwait(true);
+                }
+
+                var ordinaryBeforeAllow = fixture.Authority.OrdinaryDecisionCalls;
+                InvokeAutomationButton(firstWindow.DecisionPanel, "AllowOnceButton");
+                await WaitForDispatcherConditionAsync(
+                    () => fixture.Authority.OrdinaryDecisionCalls == ordinaryBeforeAllow + 1
+                        && firstWindow.SimulatedDecisionViewModel.ActivePrompts.Count == 1,
+                    TimeSpan.FromSeconds(10),
+                    "AllowOnce Automation invoke did not complete through the real pipe.").ConfigureAwait(true);
+
+                InvokeAutomationButton(firstWindow.DecisionPanel, "Remember30DaysButton");
+                await WaitForDispatcherConditionAsync(
+                    () => fixture.Authority.PersistentDecisionCalls == 1
+                        && firstWindow.SimulatedDecisionViewModel.RememberedRules.Count == 1
+                        && firstWindow.SimulatedDecisionViewModel.ActivePrompts.Count == 0,
+                    TimeSpan.FromSeconds(10),
+                    "Remember Automation invoke did not commit through the real pipe.").ConfigureAwait(true);
+
+                _ = fixture.AddPrompt(sequence: 3, destination: SimulatedDestination(fixture.Sample, 6));
+                await WaitForDispatcherConditionAsync(
+                    () => firstWindow.SimulatedDecisionViewModel.ActivePrompts.Count == 1,
+                    TimeSpan.FromSeconds(5),
+                    "Block fixture prompt did not arrive through the production event client.").ConfigureAwait(true);
+                firstWindow.SimulatedDecisionViewModel.SelectedPrompt = firstWindow.SimulatedDecisionViewModel.ActivePrompts.Single();
+                var ordinaryBeforeBlock = fixture.Authority.OrdinaryDecisionCalls;
+                InvokeAutomationButton(firstWindow.DecisionPanel, "BlockCurrentFlowButton");
+                await WaitForDispatcherConditionAsync(
+                    () => fixture.Authority.OrdinaryDecisionCalls == ordinaryBeforeBlock + 1
+                        && firstWindow.SimulatedDecisionViewModel.ActivePrompts.Count == 0,
+                    TimeSpan.FromSeconds(10),
+                    "Block Automation invoke did not complete through the real pipe.").ConfigureAwait(true);
+
+                firstWindow.SimulatedDecisionViewModel.SelectedRule = firstWindow.SimulatedDecisionViewModel.RememberedRules.Single();
+                InvokeAutomationButton(firstWindow.DecisionPanel, "RevokeRememberedRuleButton");
+                await WaitForDispatcherConditionAsync(
+                    () => firstWindow.SimulatedDecisionViewModel.RememberedRules.Count == 0,
+                    TimeSpan.FromSeconds(10),
+                    "Revoke Automation invoke did not complete through the real pipe.").ConfigureAwait(true);
+
+                await firstWindow.DisposeAsync().ConfigureAwait(true);
+                await secondWindow.DisposeAsync().ConfigureAwait(true);
+                firstWindow.Close();
+                secondWindow.Close();
+                await WaitForDispatcherConditionAsync(
+                    () => server.ActivePipeCount == 0 && fixture.Hub.SubscriberCount == 0,
+                    TimeSpan.FromSeconds(10),
+                    "MainWindow shared connection ownership leaked a pipe or subscriber.").ConfigureAwait(true);
+            }).ConfigureAwait(false);
+        }
+        finally
+        {
+            serverLifetime.Cancel();
+            await server.StopAsync(CancellationToken.None).ConfigureAwait(false);
+            AssertTrue(SpinWait.SpinUntil(() => server.ActivePipeCount == 0, TimeSpan.FromSeconds(5)), "Simulation PipeServer retained a client instance after cleanup.");
+            AssertEqual(0, fixture.Hub.SubscriberCount);
+            Environment.SetEnvironmentVariable("EGRESSGUARD_PIPE_NAME", previousPipeName);
+            SqliteConnection.ClearAllPools();
+            await DeleteDirectoryWithRetryAsync(dataDirectory).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task TestSimUiSharedRequestSessionReconnectAsync()
+    {
+        var previousPipeName = Environment.GetEnvironmentVariable("EGRESSGUARD_PIPE_NAME");
+        var pipeName = $"{ProtocolConstants.PipeName}.RequestSession.{Environment.ProcessId}.{Guid.NewGuid():N}";
+        var dataDirectory = Path.Combine(Path.GetTempPath(), "EgressGuard-RequestSession-" + Guid.NewGuid().ToString("N"));
+        Environment.SetEnvironmentVariable("EGRESSGUARD_PIPE_NAME", pipeName);
+        Directory.CreateDirectory(dataDirectory);
+        using var fixture = new SimulatedCoordinatorFixture();
+        _ = fixture.AddPrompt();
+        var database = new EgressGuardDatabase(Path.Combine(dataDirectory, "egressguard.db"));
+        await database.InitializeAsync().ConfigureAwait(false);
+        var generalHub = new EventHub();
+        using var server = new PipeServer(
+            new ServiceState(),
+            database,
+            new FakeFirewallRuleManager(),
+            generalHub,
+            new ListLogger<PipeServer>(),
+            fixture.Coordinator);
+        using var serverLifetime = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        await server.StartAsync(serverLifetime.Token).ConfigureAwait(false);
+        try
+        {
+            if (!WindowsFirewallManager.IsAdministrator())
+                throw new TestFailureException("The shared request-session integration requires an Administrator token.");
+
+            await RunStaAsync(async () =>
+            {
+                var window = new MainWindow(pipeName) { ShowInTaskbar = false, WindowStyle = System.Windows.WindowStyle.None };
+                var reserves = Enumerable.Range(0, 6).Select(_ => new EgressGuardPipeClient(pipeName)).ToArray();
+                try
+                {
+                    window.Show();
+                    SelectSimulationTab(window);
+                    await WaitForDispatcherConditionAsync(
+                        () => server.ActivePipeCount == 3
+                            && fixture.Hub.SubscriberCount == 1
+                            && window.SimulatedDecisionViewModel.AllowOnceCommand.CanExecute(null),
+                        TimeSpan.FromSeconds(10),
+                        "The request-session MainWindow did not establish its 3-pipe baseline.").ConfigureAwait(true);
+
+                    var session = window.SharedRequestSession;
+                    AssertTrue(ReferenceEquals(session, window.ViewModel.RequestSession)
+                        && ReferenceEquals(session, window.SimulatedDecisionViewModel.RequestSession), "The real MainWindow did not give both view models one request session.");
+                    AssertTrue(!window.ViewModel.OwnsRequestSession && !window.SimulatedDecisionViewModel.OwnsRequestSession, "A MainWindow view model claimed ownership of the shared request session.");
+
+                    await session.DisconnectAsync().ConfigureAwait(true);
+                    await WaitForDispatcherConditionAsync(
+                        () => server.ActivePipeCount == 2 && !session.IsConnected,
+                        TimeSpan.FromSeconds(5),
+                        "The shared request session did not release its original request connection.").ConfigureAwait(true);
+                    foreach (var reserve in reserves)
+                        await reserve.ConnectAsync(TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(true);
+                    await WaitForDispatcherConditionAsync(
+                        () => server.ActivePipeCount == SimulatedDecisionProtocolLimits.PipeInstanceCapacity,
+                        TimeSpan.FromSeconds(5),
+                        "The reconnect barrier did not occupy all 8 pipe instances.").ConfigureAwait(true);
+
+                    var generationBefore = session.ConnectionGeneration;
+                    InvokePrivateVoid(window.SimulatedDecisionViewModel, "DisableContinuity");
+                    var generalRefresh = InvokePrivateTaskAsync(window.ViewModel, "RefreshAsync");
+                    var simulatedRefresh = InvokePrivateTaskAsync(window.SimulatedDecisionViewModel, "RefreshSnapshotAsync");
+                    await WaitForDispatcherConditionAsync(
+                        () => session.PendingOperationCount >= 2,
+                        TimeSpan.FromSeconds(5),
+                        "Both view models did not reach the serialized reconnect barrier.").ConfigureAwait(true);
+                    AssertTrue(!session.IsConnected, "A request connection bypassed the full-pipe reconnect barrier.");
+                    AssertTrue(!window.SimulatedDecisionViewModel.AllowOnceCommand.CanExecute(null), "Simulation command enabled before snapshot and event continuity were re-established.");
+
+                    await reserves[0].DisconnectAsync().ConfigureAwait(true);
+                    await Task.WhenAll(generalRefresh, simulatedRefresh).ConfigureAwait(true);
+                    AssertEqual(generationBefore + 1, session.ConnectionGeneration);
+                    AssertTrue(session.IsConnected, "The serialized request session retained a disposed or stale pipe.");
+                    AssertTrue(window.ViewModel.ServiceStatus.StartsWith("Service online", StringComparison.Ordinal), "The general UI refresh did not succeed after serialized reconnect.");
+                    AssertTrue(window.SimulatedDecisionViewModel.SimulationStatus.StartsWith("Simulation active", StringComparison.Ordinal), "The Simulation UI refresh did not succeed after serialized reconnect.");
+                    AssertTrue(!window.SimulatedDecisionViewModel.AllowOnceCommand.CanExecute(null), "Snapshot refresh alone enabled a Simulation command without event continuity.");
+
+                    for (var index = 1; index < reserves.Length; index++)
+                        await reserves[index].DisconnectAsync().ConfigureAwait(true);
+                    await WaitForDispatcherConditionAsync(
+                        () => server.ActivePipeCount == 3,
+                        TimeSpan.FromSeconds(5),
+                        "Reconnect barrier cleanup did not restore one request and two event pipes.").ConfigureAwait(true);
+
+                    await InvokePrivateTaskAsync(window.SimulatedDecisionViewModel, "RefreshAndReconnectAsync").ConfigureAwait(true);
+                    await WaitForDispatcherConditionAsync(
+                        () => server.ActivePipeCount == 3
+                            && fixture.Hub.SubscriberCount == 1
+                            && window.SimulatedDecisionViewModel.AllowOnceCommand.CanExecute(null),
+                        TimeSpan.FromSeconds(10),
+                        "Simulation commands enabled before snapshot plus exact event continuity were proven.").ConfigureAwait(true);
+                    AssertEqual(generationBefore + 1, session.ConnectionGeneration);
+                }
+                finally
+                {
+                    foreach (var reserve in reserves)
+                        await reserve.DisposeAsync().ConfigureAwait(true);
+                    await window.DisposeAsync().ConfigureAwait(true);
+                    window.Close();
+                }
+
+                await WaitForDispatcherConditionAsync(
+                    () => server.ActivePipeCount == 0 && fixture.Hub.SubscriberCount == 0,
+                    TimeSpan.FromSeconds(10),
+                    "Shared request-session cleanup retained a pipe or subscriber.").ConfigureAwait(true);
+            }).ConfigureAwait(false);
+        }
+        finally
+        {
+            serverLifetime.Cancel();
+            await server.StopAsync(CancellationToken.None).ConfigureAwait(false);
+            AssertTrue(SpinWait.SpinUntil(() => server.ActivePipeCount == 0, TimeSpan.FromSeconds(5)), "Request-session PipeServer retained a client after cleanup.");
+            AssertEqual(0, fixture.Hub.SubscriberCount);
+            Environment.SetEnvironmentVariable("EGRESSGUARD_PIPE_NAME", previousPipeName);
+            SqliteConnection.ClearAllPools();
+            await DeleteDirectoryWithRetryAsync(dataDirectory).ConfigureAwait(false);
+        }
+    }
+
+    private static Task TestSimUiSmallWindowDpiAsync()
+    {
+        RunSta(() =>
+        {
+            foreach (var scale in SimulationUiDpiScales)
+            {
+                var viewModel = new SimulatedDecisionViewModel();
+                var panel = new SimulatedDecisionPanel { DataContext = viewModel };
+                var width = 640d / scale;
+                var height = 480d / scale;
+                var viewport = new Border { Width = width, Height = height, Child = panel };
+                viewport.Measure(new System.Windows.Size(width, height));
+                viewport.Arrange(new System.Windows.Rect(0, 0, width, height));
+                viewport.UpdateLayout();
+                var scroller = FindVisualChild<ScrollViewer>(panel) ?? throw new TestFailureException("Simulation panel has no bounded scroll viewport.");
+                AssertTrue(panel.ActualWidth <= width && panel.ActualHeight <= height, $"Simulation panel exceeded the {scale:P0} viewport.");
+                AssertTrue(scroller.ViewportHeight <= height, $"Simulation scroller exceeded the {scale:P0} viewport.");
+                AssertTrue(scroller.ScrollableHeight > 0, $"Simulation content was not scrollable at {scale:P0}.");
+                foreach (var id in SimulationUiViewportControlIds)
+                {
+                    var control = FindByAutomationId(panel, id);
+                    AssertTrue(control is not null, $"Viewport lost reachable control {id}.");
+                }
+                viewModel.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            }
+        });
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiKeyboardScreenReaderAsync()
+    {
+        RunSta(() =>
+        {
+            var viewModel = new SimulatedDecisionViewModel();
+            var panel = new SimulatedDecisionPanel { DataContext = viewModel };
+            var window = new System.Windows.Window
+            {
+                Content = panel,
+                Width = 640,
+                Height = 480,
+                ShowInTaskbar = false,
+                WindowStyle = System.Windows.WindowStyle.None
+            };
+            window.Show();
+            window.Activate();
+            panel.UpdateLayout();
+            var required = RequiredSimulationAutomationIds();
+            foreach (var id in required)
+            {
+                var element = FindByAutomationId(panel, id) ?? throw new TestFailureException($"Missing AutomationId {id}.");
+                AssertTrue(!string.IsNullOrWhiteSpace(System.Windows.Automation.AutomationProperties.GetName(element)), $"{id} has no accessible name.");
+                if (element is Button button)
+                {
+                    var peer = new ButtonAutomationPeer(button);
+                    AssertTrue(peer.GetPattern(PatternInterface.Invoke) is IInvokeProvider, $"{id} exposes no invoke provider.");
+                    AssertTrue(!string.IsNullOrWhiteSpace(System.Windows.Automation.AutomationProperties.GetHelpText(button)), $"{id} has no accessible help text.");
+                }
+            }
+            var status = FindByAutomationId(panel, "SimulationStatus")!;
+            var critical = FindByAutomationId(panel, "CriticalFailOpenBanner")!;
+            AssertEqual(System.Windows.Automation.AutomationLiveSetting.Polite, System.Windows.Automation.AutomationProperties.GetLiveSetting(status));
+            AssertEqual(System.Windows.Automation.AutomationLiveSetting.Assertive, System.Windows.Automation.AutomationProperties.GetLiveSetting(critical));
+            var refresh = FindByAutomationId(panel, "SimulationRefreshButton")!;
+            AssertTrue(refresh.Focus(), "Keyboard focus could not enter the Simulation command surface.");
+            AssertTrue(refresh.MoveFocus(new System.Windows.Input.TraversalRequest(System.Windows.Input.FocusNavigationDirection.Next)), "Tab traversal did not advance from the refresh command.");
+            AssertTrue(System.Windows.Input.Keyboard.FocusedElement is System.Windows.DependencyObject, "Tab traversal lost keyboard focus.");
+            AssertTrue(((System.Windows.UIElement)System.Windows.Input.Keyboard.FocusedElement).MoveFocus(new System.Windows.Input.TraversalRequest(System.Windows.Input.FocusNavigationDirection.Previous)), "Shift+Tab traversal did not return through the Simulation surface.");
+
+            var terminalFocus = typeof(SimulatedDecisionPanel).GetMethod("OnPromptTerminalized", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+                ?? throw new TestFailureException("Simulation panel omitted terminal focus recovery.");
+            viewModel.ActivePrompts.Add(CreateSimulatedProtocolSample().Prompt);
+            terminalFocus.Invoke(panel, [viewModel, EventArgs.Empty]);
+            panel.Dispatcher.Invoke(() => { }, System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+            AssertTrue(ReferenceEquals(System.Windows.Input.Keyboard.FocusedElement, FindByAutomationId(panel, "DecisionPromptList")), "Terminal focus did not recover to the remaining prompt list.");
+            viewModel.ActivePrompts.Clear();
+            terminalFocus.Invoke(panel, [viewModel, EventArgs.Empty]);
+            panel.Dispatcher.Invoke(() => { }, System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+            AssertTrue(ReferenceEquals(System.Windows.Input.Keyboard.FocusedElement, FindByAutomationId(panel, "SimulationModeLabel")), "Terminal focus did not recover to the Simulation heading after the last prompt.");
+
+            var mainWindowXaml = File.ReadAllText(Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "src", "EgressGuard.UI", "MainWindow.xaml")));
+            AssertTrue(mainWindowXaml.Contains("AutomationProperties.AutomationId=\"SimulationDecisionTab\"", StringComparison.Ordinal), "Simulation tab omitted its locked AutomationId.");
+            window.Close();
+            viewModel.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        });
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiPrivacyScanAsync()
+    {
+        var messageTypes = typeof(GetSimulatedDecisionSnapshotMessage).Assembly.GetTypes()
+            .Where(type => type.Namespace == "EgressGuard.Protocol" && type.Name.StartsWith("Simulated", StringComparison.Ordinal));
+        var forbidden = new[] { "RawPath", "FilePath", "Content", "Payload", "Packet", "Buffer", "TicketSecret", "AuthenticatorProof", "OneTimeTicket", "EphemeralFlowGrant", "VolumeId", "FileId", "Caller" };
+        foreach (var property in messageTypes.SelectMany(type => type.GetProperties()))
+            AssertTrue(!forbidden.Any(item => property.Name.Contains(item, StringComparison.OrdinalIgnoreCase) || property.PropertyType.Name.Contains(item, StringComparison.OrdinalIgnoreCase)), $"UI Protocol property {property.DeclaringType?.Name}.{property.Name} leaked forbidden data.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiZeroFalseClaimsAsync()
+    {
+        var root = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", ".."));
+        var files = new[]
+        {
+            Path.Combine(root, "src", "EgressGuard.UI", "SimulatedDecisionPanel.xaml"),
+            Path.Combine(root, "src", "EgressGuard.UI", "SimulatedDecisionViewModel.cs"),
+            Path.Combine(root, "src", "EgressGuard.Protocol", "SimulatedDecisionMessages.cs")
+        };
+        var text = string.Join("\n", files.Select(File.ReadAllText)).ToLowerInvariant();
+        foreach (var claim in new[] { "upload blocked", "upload prevented", "file protected" })
+            AssertTrue(!text.Contains(claim, StringComparison.Ordinal), $"Simulation UI contains false enforcement claim '{claim}'.");
+        AssertTrue(text.Contains("simulation", StringComparison.Ordinal) && text.Contains("traffic was allowed", StringComparison.Ordinal), "Simulation/fail-open truth labels are missing.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimUiCleanupAsync()
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        _ = fixture.AddPrompt();
+        fixture.Coordinator.ApplyExternalPolicyEpoch(fixture.Authority.PolicyEpoch + 1);
+        AssertTrue(fixture.Coordinator.CaptureOwnership().IsZero, "Coordinator retained owned state after policy cleanup.");
+        AssertTrue(fixture.Authority.CaptureOwnership().IsZero, "Authority retained owned state after policy cleanup.");
+        AssertEqual(0, fixture.Hub.SubscriberCount);
+        return Task.CompletedTask;
+    }
+
+    private static SimulatedDecisionCaller SimulatedAdministrator() => new("sid:S-1-5-32-544", true);
+
+    private static SimulatedDecisionPromptProjection ClonePromptWithSubject(
+        SimulatedDecisionPromptProjection source,
+        SimulatedSubjectProjection subject,
+        string applicationIdentity,
+        Guid challengeId,
+        Guid intentId) => new(
+            source.Version,
+            challengeId,
+            intentId,
+            source.RedactedFileLabel,
+            source.FileVersion,
+            applicationIdentity,
+            subject,
+            source.Destination,
+            source.ExistingFlow,
+            source.State,
+            source.ReasonCode,
+            source.LimitationReason,
+            source.Expiry,
+            source.Revision);
+
+    private static SimulatedRememberedRuleOutcome CommitRememberedRule(
+        SimulatedCoordinatorFixture fixture,
+        int sequence,
+        GateSubject subject,
+        DestinationBinding destination)
+    {
+        var prompt = fixture.AddPrompt(sequence, subject, destination: destination);
+        return fixture.Coordinator.SubmitDecision(
+            SimulatedAdministrator(),
+            new SubmitSimulatedDecisionMessage(1, prompt.Challenge.ChallengeId, SimulatedDecisionChoice.RememberFor30Days)).RememberedRule
+            ?? throw new TestFailureException("Remembered-rule capacity fixture did not commit its baseline rule.");
+    }
+
+    private static void AssertRuleIdCollisionIsNonMutating(
+        SimulatedCoordinatorFixture fixture,
+        AcceptedSimulationPrompt prompt,
+        long expectedCollisionCount)
+    {
+        var epochBefore = fixture.Authority.PolicyEpoch;
+        var persistentCallsBefore = fixture.Authority.PersistentDecisionCalls;
+        var registryBefore = fixture.Coordinator.CaptureOwnership().RuleIdRegistryEntryCount;
+        var result = fixture.Coordinator.SubmitDecision(
+            SimulatedAdministrator(),
+            new SubmitSimulatedDecisionMessage(1, prompt.Challenge.ChallengeId, SimulatedDecisionChoice.RememberFor30Days));
+        var snapshot = fixture.Snapshot();
+        AssertEqual(SimulatedDecisionItemState.AwaitingDecision, result.DecisionState);
+        AssertEqual(SimulatedDecisionReasonCodes.RuleIdCollision, result.DecisionReasonCode);
+        AssertEqual(epochBefore, fixture.Authority.PolicyEpoch);
+        AssertEqual(persistentCallsBefore, fixture.Authority.PersistentDecisionCalls);
+        AssertEqual(registryBefore, fixture.Coordinator.CaptureOwnership().RuleIdRegistryEntryCount);
+        AssertEqual(expectedCollisionCount, snapshot.Counters.RuleIdCollisionCount);
+        AssertTrue(snapshot.ActivePrompts.Any(item => item.ChallengeId == prompt.Challenge.ChallengeId), "RuleId collision evicted the live prompt.");
+        AssertTrue(snapshot.CriticalAlerts.Any(item => item.ReasonCode == SimulatedDecisionReasonCodes.RuleIdCollision), "RuleId collision omitted its stable Critical diagnostic.");
+    }
+
+    private static void AssertRuleTombstoneLifecycle(
+        Action<SimulatedCoordinatorFixture, SimulatedRememberedRuleOutcome> transition)
+    {
+        using var fixture = new SimulatedCoordinatorFixture();
+        var prompt = fixture.AddPrompt();
+        var decision = fixture.Coordinator.SubmitDecision(
+            SimulatedAdministrator(),
+            new SubmitSimulatedDecisionMessage(1, prompt.Challenge.ChallengeId, SimulatedDecisionChoice.RememberFor30Days));
+        var rule = decision.RememberedRule!;
+        transition(fixture, rule);
+        var terminal = fixture.Snapshot();
+        AssertEqual(0, terminal.RememberedRules.Count);
+        AssertEqual(1, terminal.Capacity.RuleIdRegistryEntryCount);
+        fixture.Clock.Advance(5 * 60 * 1000 - 1);
+        AssertEqual(1, fixture.Snapshot().Capacity.RuleIdRegistryEntryCount);
+        fixture.Clock.Advance(1);
+        AssertEqual(0, fixture.Snapshot().Capacity.RuleIdRegistryEntryCount);
+    }
+
+    private static SimulatedDecisionRequestException AssertSimulatedError(Action action)
+    {
+        try
+        {
+            action();
+        }
+        catch (SimulatedDecisionRequestException exception)
+        {
+            return exception;
+        }
+        throw new TestFailureException("Expected a stable Simulation request error.");
+    }
+
+    private static GateSubject SimulatedSubject(OutboundGateSample sample, int suffix)
+    {
+        var process = new ProcessIdentity(1000 + suffix, sample.Start.AddSeconds(suffix));
+        return new GateSubject(1, process, $"application-{suffix}", null, [process]);
+    }
+
+    private static DestinationBinding SimulatedDestination(OutboundGateSample sample, int suffix) => new(
+        1,
+        IPAddress.Parse($"127.0.0.{suffix}"),
+        IpVersion.IPv4,
+        sample.Destination.RemotePort + suffix,
+        sample.Destination.Protocol,
+        NetworkTrafficDirection.Outbound,
+        sample.Destination.NetworkCompartmentId,
+        sample.Destination.InterfaceLuid,
+        null,
+        DomainEvidenceProvenance.None,
+        null);
+
+    private static GateStatus SimulatedStatus(
+        AcceptedSimulationPrompt prompt,
+        ServiceMonotonicTimestamp now,
+        GateRuntimeState state,
+        string reason,
+        bool failedOpen) => new(
+            1,
+            OutboundGateMode.Simulation,
+            state,
+            prompt.Challenge.RequiredCoverage,
+            reason,
+            new GateAffectedScope(1, GateAffectedScopeKind.Intent, prompt.Intent.IntentId, prompt.Intent.Subject),
+            prompt.Intent.ObservedAtUtc,
+            now,
+            0,
+            0,
+            failedOpen);
+
+    private static CriticalAlert SimulatedAlert(
+        AcceptedSimulationPrompt prompt,
+        ServiceMonotonicTimestamp now,
+        string reason,
+        bool failedOpen) => new(
+            1,
+            Guid.NewGuid(),
+            reason,
+            new GateAffectedScope(1, GateAffectedScopeKind.Intent, prompt.Intent.IntentId, prompt.Intent.Subject),
+            prompt.Intent.ObservedAtUtc,
+            now,
+            0,
+            0,
+            failedOpen);
+
+    private static SimulatedDecisionEventMessage SimulatedResyncStatusEvent(long sequence)
+    {
+        var status = new SimulatedGateStatusProjection(1, null, GateRuntimeState.Idle, "sim-ui-prompt-active", DateTimeOffset.UnixEpoch.AddTicks(sequence), false, 0, 0, sequence);
+        return new SimulatedDecisionEventMessage(1, sequence, SimulatedDecisionEventKind.StatusChanged, null, null, null, null, null, status, null, false);
+    }
+
+    private static void FillRuleRegistryWithTombstones(SimulatedCoordinatorFixture fixture, int count)
+    {
+        for (var index = 0; index < count; index++)
+        {
+            var prompt = fixture.AddPrompt(sequence: 10_000 + index);
+            var decision = fixture.Coordinator.SubmitDecision(SimulatedAdministrator(), new SubmitSimulatedDecisionMessage(1, prompt.Challenge.ChallengeId, SimulatedDecisionChoice.RememberFor30Days));
+            _ = fixture.Coordinator.RevokeRule(SimulatedAdministrator(), new RevokeSimulatedRememberedRuleMessage(1, decision.RememberedRule!.RuleId, decision.RememberedRule.Revision));
+        }
+    }
+
+    private static string[] RequiredSimulationAutomationIds() =>
+    [
+        "SimulationModeLabel", "SimulationStatus", "DecisionPromptList", "DecisionFileLabel", "DecisionFileVersion",
+        "DecisionApplication", "DecisionSubjectScope", "DecisionCollateralWarning", "DecisionDestination",
+        "DecisionDomainProvenance", "DecisionExistingFlowWarning", "DecisionLimitation", "DecisionExpiry",
+        "DecisionScopePreview", "AllowOnceButton", "Remember30DaysButton", "BlockCurrentFlowButton",
+        "RememberedRuleList", "RevokeRememberedRuleButton", "ReconnectRequiredNotice", "CriticalFailOpenBanner",
+        "SimulationRefreshButton"
+    ];
+
+    private static System.Windows.FrameworkElement? FindByAutomationId(System.Windows.DependencyObject root, string automationId)
+    {
+        if (root is System.Windows.FrameworkElement element
+            && string.Equals(System.Windows.Automation.AutomationProperties.GetAutomationId(element), automationId, StringComparison.Ordinal))
+            return element;
+        for (var index = 0; index < VisualTreeHelper.GetChildrenCount(root); index++)
+        {
+            var match = FindByAutomationId(VisualTreeHelper.GetChild(root, index), automationId);
+            if (match is not null)
+                return match;
+        }
+        return null;
+    }
+
+    private static void SelectSimulationTab(MainWindow window)
+    {
+        var tabControl = FindLogicalChild<TabControl>(window)
+            ?? throw new TestFailureException("MainWindow omitted its tab control.");
+        var tab = tabControl.Items.OfType<TabItem>().SingleOrDefault(item =>
+                string.Equals(System.Windows.Automation.AutomationProperties.GetAutomationId(item), "SimulationDecisionTab", StringComparison.Ordinal))
+            ?? throw new TestFailureException("MainWindow omitted the Simulation decision tab.");
+        tab.IsSelected = true;
+        window.UpdateLayout();
+    }
+
+    private static void InvokeAutomationButton(System.Windows.DependencyObject root, string automationId)
+    {
+        var button = FindByAutomationId(root, automationId) as Button
+            ?? throw new TestFailureException($"Missing Automation button {automationId}.");
+        AssertTrue(button.IsEnabled, $"Automation button {automationId} was not enabled.");
+        var provider = new ButtonAutomationPeer(button).GetPattern(PatternInterface.Invoke) as IInvokeProvider
+            ?? throw new TestFailureException($"Automation button {automationId} exposed no invoke provider.");
+        provider.Invoke();
+    }
+
+    private static void AssertAutomationInvokeDisabled(System.Windows.DependencyObject root, string automationId)
+    {
+        var button = FindByAutomationId(root, automationId) as Button
+            ?? throw new TestFailureException($"Missing Automation button {automationId}.");
+        AssertTrue(!button.IsEnabled, $"Automation button {automationId} was enabled before continuity was proven.");
+        var provider = new ButtonAutomationPeer(button).GetPattern(PatternInterface.Invoke) as IInvokeProvider
+            ?? throw new TestFailureException($"Automation button {automationId} exposed no invoke provider.");
+        try
+        {
+            provider.Invoke();
+        }
+        catch (System.Windows.Automation.ElementNotEnabledException)
+        {
+        }
+    }
+
+    private static Task InvokePrivateTaskAsync(object target, string methodName)
+    {
+        var method = target.GetType().GetMethod(methodName, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            ?? throw new TestFailureException($"Missing private lifecycle method {methodName}.");
+        return method.Invoke(target, null) as Task
+            ?? throw new TestFailureException($"Private lifecycle method {methodName} did not return Task.");
+    }
+
+    private static void InvokePrivateVoid(object target, string methodName)
+    {
+        var method = target.GetType().GetMethod(methodName, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            ?? throw new TestFailureException($"Missing private lifecycle method {methodName}.");
+        _ = method.Invoke(target, null);
+    }
+
+    private static async Task WaitForDispatcherConditionAsync(
+        Func<bool> condition,
+        TimeSpan timeout,
+        string failureMessage)
+    {
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        while (!condition())
+        {
+            if (stopwatch.Elapsed >= timeout)
+                throw new TestFailureException(failureMessage);
+            await System.Windows.Threading.Dispatcher.Yield(System.Windows.Threading.DispatcherPriority.Background);
+        }
+    }
+
+    private static T? FindVisualChild<T>(System.Windows.DependencyObject root) where T : System.Windows.DependencyObject
+    {
+        for (var index = 0; index < VisualTreeHelper.GetChildrenCount(root); index++)
+        {
+            var child = VisualTreeHelper.GetChild(root, index);
+            if (child is T match)
+                return match;
+            if (FindVisualChild<T>(child) is { } descendant)
+                return descendant;
+        }
+        return null;
+    }
+
+    private static T? FindLogicalChild<T>(System.Windows.DependencyObject root) where T : System.Windows.DependencyObject
+    {
+        if (root is T match)
+            return match;
+        foreach (var child in System.Windows.LogicalTreeHelper.GetChildren(root).OfType<System.Windows.DependencyObject>())
+        {
+            var descendant = FindLogicalChild<T>(child);
+            if (descendant is not null)
+                return descendant;
+        }
+        return null;
+    }
+
+    private static void RunSta(Action action)
+    {
+        Exception? failure = null;
+        using var completed = new ManualResetEventSlim();
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                action();
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+            }
+            finally
+            {
+                if (System.Windows.Application.Current is { } application
+                    && application.Dispatcher.CheckAccess())
+                {
+                    foreach (System.Windows.Window window in application.Windows)
+                        window.Close();
+                }
+                completed.Set();
+            }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        if (!completed.Wait(TimeSpan.FromSeconds(30)))
+            throw new TestFailureException("STA Simulation UI test exceeded its hard timeout.");
+        thread.Join();
+        if (failure is not null)
+            throw new TestFailureException(failure.Message);
+    }
+
+    private static Task RunStaAsync(Func<Task> action)
+    {
+        Exception? failure = null;
+        using var completed = new ManualResetEventSlim();
+        var thread = new Thread(() =>
+        {
+            var dispatcher = System.Windows.Threading.Dispatcher.CurrentDispatcher;
+            SynchronizationContext.SetSynchronizationContext(new System.Windows.Threading.DispatcherSynchronizationContext(dispatcher));
+            try
+            {
+                var task = action();
+                _ = task.ContinueWith(
+                    _ => dispatcher.BeginInvokeShutdown(System.Windows.Threading.DispatcherPriority.Background),
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+                System.Windows.Threading.Dispatcher.Run();
+                task.GetAwaiter().GetResult();
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+            }
+            finally
+            {
+                if (System.Windows.Application.Current is { } application)
+                {
+                    foreach (System.Windows.Window window in application.Windows.Cast<System.Windows.Window>().Where(window => window.Dispatcher == dispatcher).ToArray())
+                        window.Close();
+                }
+                completed.Set();
+            }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        if (!completed.Wait(TimeSpan.FromSeconds(60)))
+            throw new TestFailureException("STA Simulation integration exceeded its hard timeout.");
+        thread.Join();
+        if (failure is not null)
+            throw new TestFailureException(failure.Message);
+        return Task.CompletedTask;
+    }
+
+    private sealed class AsyncDisposableScope : IDisposable
+    {
+        internal AsyncDisposableScope(SimulatedDecisionViewModel value) => Value = value;
+        internal SimulatedDecisionViewModel Value { get; }
+        public void Dispose() => Value.DisposeAsync().AsTask().GetAwaiter().GetResult();
+    }
+
+    private sealed class SimulatedCoordinatorFixture : IDisposable
+    {
+        private readonly OneTimeGateTicketService _ticketService;
+        private bool _disposed;
+
+        internal SimulatedCoordinatorFixture()
+        {
+            Sample = OutboundGateSamples();
+            Clock = new TestMonotonicClock(Sample.ReadWindow.StartedAt);
+            MachineNonces = new TestNonceProvider();
+            AuditClock = new TestAuditClock(Sample.Start);
+            _ticketService = CreateTicketService(Sample, Clock, MachineNonces);
+            Machine = CreateOutboundGateMachine(Sample, Clock, MachineNonces, ticketService: _ticketService, auditClock: AuditClock);
+            Authority = new TestSimulatedDecisionAuthority(Machine, _ticketService, Clock, AuditClock, Sample);
+            Hub = new SimulatedDecisionEventHub();
+            Coordinator = new SimulatedDecisionCoordinator(Authority, Hub);
+        }
+
+        internal OutboundGateSample Sample { get; }
+        internal TestMonotonicClock Clock { get; }
+        internal TestNonceProvider MachineNonces { get; }
+        internal TestAuditClock AuditClock { get; }
+        internal OutboundGateStateMachine Machine { get; }
+        internal TestSimulatedDecisionAuthority Authority { get; }
+        internal SimulatedDecisionEventHub Hub { get; }
+        internal SimulatedDecisionCoordinator Coordinator { get; }
+
+        internal AcceptedSimulationPrompt AddPrompt(
+            int sequence = 1,
+            GateSubject? subject = null,
+            FileVersionIdentity? file = null,
+            DestinationBinding? destination = null)
+        {
+            subject ??= Sample.Subject;
+            file ??= Sample.File;
+            destination ??= Sample.Destination;
+            var now = Clock.Now();
+            var readWindow = ServiceRange(now.ClockInstanceId, now.ElapsedMilliseconds, 2_000);
+            var intent = new FileReadIntent(1, Guid.NewGuid(), subject, file, FileActivityOperation.Read, AuditClock.NowUtc(), readWindow, Sample.Boot, sequence);
+            var prepared = PrepareAwaitingChallenge(Machine, Sample, MachineNonces, intent);
+            var challenge = new NetworkGateChallenge(1, Guid.NewGuid(), intent.IntentId, subject, destination, sequence, false, prepared.Request.RequiredCoverage, AuditClock.NowUtc(), ServiceRange(now.ClockInstanceId, now.ElapsedMilliseconds, 15_000), "Simulation");
+            var accepted = Machine.ReceiveChallenge(challenge);
+            var projected = Coordinator.AcceptTrustedChallenge(intent, new ProtectedFileDisplayMetadata("report.txt"), challenge, accepted.Status);
+            return new AcceptedSimulationPrompt(intent, challenge, accepted, projected);
+        }
+
+        internal SimulatedDecisionSnapshotMessage Snapshot() => Coordinator.GetSnapshot(SimulatedAdministrator(), 1);
+
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+            _disposed = true;
+            Coordinator.Dispose();
+            Hub.Dispose();
+            Machine.Dispose();
+        }
+    }
+
+    private sealed record AcceptedSimulationPrompt(
+        FileReadIntent Intent,
+        NetworkGateChallenge Challenge,
+        GateTransitionResult AcceptedResult,
+        SimulatedDecisionResultMessage? AutoResult);
+
+    private sealed class TestSimulatedDecisionAuthority : ISimulatedDecisionAuthority
+    {
+        private readonly OutboundGateStateMachine _machine;
+        private readonly OneTimeGateTicketService _ticketService;
+        private readonly TestMonotonicClock _clock;
+        private readonly TestAuditClock _auditClock;
+        private readonly OutboundGateSample _sample;
+        private readonly Queue<Guid> _nonces = [];
+        private int _nonceCounter = 0x10000000;
+        private long _logicalEpoch;
+
+        internal TestSimulatedDecisionAuthority(
+            OutboundGateStateMachine machine,
+            OneTimeGateTicketService ticketService,
+            TestMonotonicClock clock,
+            TestAuditClock auditClock,
+            OutboundGateSample sample)
+        {
+            _machine = machine;
+            _ticketService = ticketService;
+            _clock = clock;
+            _auditClock = auditClock;
+            _sample = sample;
+            _logicalEpoch = machine.PolicyEpoch;
+        }
+
+        public bool IsEnabled => true;
+        public long PolicyEpoch => _logicalEpoch;
+        internal int DecisionNonceCalls { get; private set; }
+        internal int RuleIdNonceCalls { get; private set; }
+        internal int OrdinaryDecisionCalls { get; private set; }
+        internal int PersistentDecisionCalls { get; private set; }
+        internal Func<UserDecision, long, PersistentDecisionTransitionResult>? PersistentOverride { get; set; }
+
+        public ServiceMonotonicTimestamp MonotonicNow() => _clock.Now();
+        public DateTimeOffset AuditNowUtc() => _auditClock.NowUtc();
+        public Guid NextDecisionId()
+        {
+            DecisionNonceCalls++;
+            return Guid.Parse($"{++_nonceCounter:x8}-1111-4111-8111-111111111111");
+        }
+
+        public Guid NextRuleId()
+        {
+            RuleIdNonceCalls++;
+            if (_nonces.TryDequeue(out var scripted))
+                return scripted;
+            return Guid.Parse($"{++_nonceCounter:x8}-1111-4111-8111-111111111111");
+        }
+
+        internal void EnqueueNonce(Guid value) => _nonces.Enqueue(value);
+        internal void SetLogicalEpoch(long value) => _logicalEpoch = value;
+
+        public GateTransitionResult ReceiveDecision(UserDecision decision)
+        {
+            OrdinaryDecisionCalls++;
+            return _machine.ReceiveDecision(decision);
+        }
+
+        public PersistentDecisionTransitionResult ReceivePersistentDecision(UserDecision decision, long nextPolicyEpoch)
+        {
+            PersistentDecisionCalls++;
+            var result = PersistentOverride is null
+                ? _machine.ReceivePersistentDecision(decision, nextPolicyEpoch)
+                : PersistentOverride(decision, nextPolicyEpoch);
+            if (result.PolicyEpochAccepted)
+                _logicalEpoch = result.PolicyEpoch;
+            return result;
+        }
+
+        public IReadOnlyList<GateStatus> ApplyPolicyEpoch(long policyEpoch)
+        {
+            var statuses = _machine.ApplyPolicyEpoch(policyEpoch);
+            _logicalEpoch = policyEpoch;
+            return statuses;
+        }
+
+        public AuthoritySimulationRuntimeOwnershipSnapshot CaptureOwnership()
+        {
+            var storage = _machine.Storage;
+            var tickets = _ticketService.Snapshot;
+            return new AuthoritySimulationRuntimeOwnershipSnapshot(
+                storage.ActiveContextCount,
+                storage.ChallengeMappingCount,
+                checked((int)_machine.Counters.ActiveChallengeCount),
+                checked(_machine.Counters.ActiveChallengeCount * 1024),
+                tickets.OutstandingGlobal,
+                tickets.ActiveGrantReservations);
+        }
+
+        public SimulationRuntimeInvalidationResult InvalidateRuntimeForProjectionCapacityFailure()
+        {
+            var before = CaptureOwnership();
+            var runtime = new OutboundGateTrustedRuntimeState(Guid.NewGuid(), _sample.DriverGeneration, _sample.MinifilterGeneration);
+            var statuses = _machine.HandleServiceRestart(runtime);
+            var after = CaptureOwnership();
+            return new SimulationRuntimeInvalidationResult(
+                1,
+                SimulationRuntimeInvalidationKind.ProjectionCapacityExhausted,
+                statuses,
+                statuses.LongCount(status => status.TrafficFailedOpen),
+                before,
+                after,
+                statuses.Any(status => status.TrafficFailedOpen));
+        }
     }
 
     private static Task TestOutboundGateContractRoundTripAsync()
@@ -4753,6 +6413,47 @@ internal static class Program
                 stage = "first status request";
                 var response = await first.SendAsync(MessageEnvelope.Create(MessageTypes.GetStatus, new { }), TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(false);
                 AssertTrue(response.ReadPayload<ServiceStatusMessage>().IsRunning, "Service did not report running state.");
+
+                stage = "disabled Simulation snapshot over production pipe";
+                var correlationId = Guid.NewGuid();
+                var simulationResponse = await first.SendAsync(
+                    MessageEnvelope.Create(
+                        OutboundGateMessageTypes.GetSimulatedDecisionSnapshot,
+                        new GetSimulatedDecisionSnapshotMessage(ProtocolConstants.Version),
+                        correlationId),
+                    TimeSpan.FromSeconds(3),
+                    CancellationToken.None).ConfigureAwait(false);
+                AssertEqual(correlationId, simulationResponse.CorrelationId);
+                if (WindowsFirewallManager.IsAdministrator())
+                {
+                    AssertEqual(OutboundGateMessageTypes.SimulatedDecisionSnapshot, simulationResponse.Type);
+                    var disabledSnapshot = simulationResponse.ReadPayload<SimulatedDecisionSnapshotMessage>();
+                    AssertTrue(!disabledSnapshot.SimulationEnabled, "Production Service did not keep Simulation authority disabled by default.");
+                    AssertTrue(disabledSnapshot.ActivePrompts.Count == 0 && disabledSnapshot.RememberedRules.Count == 0, "Disabled production snapshot exposed owned Simulation state.");
+                }
+                else
+                {
+                    AssertEqual(MessageTypes.Error, simulationResponse.Type);
+                    AssertEqual(SimulatedDecisionReasonCodes.AdministratorRequired, simulationResponse.ReadPayload<ErrorMessage>().Code);
+                }
+            }
+
+            stage = "disabled Simulation event stream over production pipe";
+            await using (var simulationEvents = new EgressGuardSimulatedDecisionEventClient(pipeName))
+            using (var subscriptionTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
+            {
+                try
+                {
+                    await simulationEvents.SubscribeAsync(0, _ => ValueTask.CompletedTask, null, subscriptionTimeout.Token).ConfigureAwait(false);
+                    throw new TestFailureException("Disabled production Simulation event stream was accepted.");
+                }
+                catch (InvalidDataException exception)
+                {
+                    var expectedReason = WindowsFirewallManager.IsAdministrator()
+                        ? SimulatedDecisionReasonCodes.Disabled
+                        : SimulatedDecisionReasonCodes.AdministratorRequired;
+                    AssertTrue(exception.Message.Contains(expectedReason, StringComparison.Ordinal), "Production Simulation stream rejection lost its stable reason code.");
+                }
             }
 
             long snapshotSequence;

@@ -25,8 +25,19 @@ builder.Services.AddSingleton<RiskEngine>();
 builder.Services.AddSingleton<BaselineTracker>();
 builder.Services.AddSingleton<ServiceState>();
 builder.Services.AddSingleton<EventHub>();
+builder.Services.AddSingleton<SimulatedDecisionEventHub>();
+builder.Services.AddSingleton<ISimulatedDecisionAuthority, DisabledSimulatedDecisionAuthority>();
+builder.Services.AddSingleton(serviceProvider => new SimulatedDecisionCoordinator(
+    serviceProvider.GetRequiredService<ISimulatedDecisionAuthority>(),
+    serviceProvider.GetRequiredService<SimulatedDecisionEventHub>()));
 builder.Services.AddHostedService<FlowCoordinator>();
-builder.Services.AddHostedService<PipeServer>();
+builder.Services.AddHostedService(serviceProvider => new PipeServer(
+    serviceProvider.GetRequiredService<ServiceState>(),
+    serviceProvider.GetRequiredService<EgressGuardDatabase>(),
+    serviceProvider.GetRequiredService<IFirewallRuleManager>(),
+    serviceProvider.GetRequiredService<EventHub>(),
+    serviceProvider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<PipeServer>>(),
+    serviceProvider.GetRequiredService<SimulatedDecisionCoordinator>()));
 if (int.TryParse(Environment.GetEnvironmentVariable("EGRESSGUARD_TEST_DURATION_SECONDS"), out var testDurationSeconds)
     && testDurationSeconds > 0)
 {

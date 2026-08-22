@@ -12,8 +12,9 @@ namespace EgressGuard.UI;
 
 public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposable
 {
-    private readonly EgressGuardPipeClient _client = new();
-    private readonly EgressGuardEventClient _eventClient = new();
+    private readonly MainWindowRequestSession _requestSession;
+    private readonly EgressGuardEventClient _eventClient;
+    private readonly bool _ownsRequestSession;
     private readonly SequencedEventBuffer _eventBuffer = new(4096);
     private readonly CancellationTokenSource _lifetimeCancellation = new();
     private readonly DispatcherTimer _batchTimer;
@@ -37,9 +38,21 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     private string _databasePath = "Unavailable until connected";
     private string _fileSensorStatus = "File correlation status unavailable";
     private bool _fileCorrelationEnabled;
+    private bool _disposed;
 
     public MainWindowViewModel()
+        : this(new MainWindowRequestSession(), pipeName: null, ownsRequestSession: true)
     {
+    }
+
+    internal MainWindowViewModel(
+        MainWindowRequestSession requestSession,
+        string? pipeName,
+        bool ownsRequestSession = false)
+    {
+        _requestSession = requestSession ?? throw new ArgumentNullException(nameof(requestSession));
+        _eventClient = new EgressGuardEventClient(pipeName);
+        _ownsRequestSession = ownsRequestSession;
         FlowView = CollectionViewSource.GetDefaultView(Flows);
         FlowView.Filter = FilterFlow;
         _batchTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(_refreshIntervalMilliseconds) };
@@ -61,6 +74,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
+    internal MainWindowRequestSession RequestSession => _requestSession;
+    internal bool OwnsRequestSession => _ownsRequestSession;
     public ObservableCollection<FlowRow> Flows { get; } = [];
     public ObservableCollection<FirewallRule> Rules { get; } = [];
     public ObservableCollection<SecurityAlert> Alerts { get; } = [];
@@ -142,15 +157,14 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     {
         try
         {
-            await EnsureConnectedAsync().ConfigureAwait(true);
-            var flowResponse = await _client.SendAsync(MessageEnvelope.Create(MessageTypes.GetActiveFlows, new { }), TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(true);
-            var statusResponse = await _client.SendAsync(MessageEnvelope.Create(MessageTypes.GetStatus, new { }), TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(true);
+            var flowResponse = await _requestSession.SendAsync(MessageEnvelope.Create(MessageTypes.GetActiveFlows, new { }), TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(true);
+            var statusResponse = await _requestSession.SendAsync(MessageEnvelope.Create(MessageTypes.GetStatus, new { }), TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(true);
             var activeSnapshot = flowResponse.ReadPayload<ActiveFlowsMessage>();
             var active = activeSnapshot.Flows;
             var status = statusResponse.ReadPayload<ServiceStatusMessage>();
             Replace(Flows, active.Select(flow => new FlowRow(flow)));
-            var rulesResponse = await _client.SendAsync(MessageEnvelope.Create(MessageTypes.GetRules, new { }), TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(true);
-            var alertsResponse = await _client.SendAsync(MessageEnvelope.Create(MessageTypes.GetAlerts, new { }), TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(true);
+            var rulesResponse = await _requestSession.SendAsync(MessageEnvelope.Create(MessageTypes.GetRules, new { }), TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(true);
+            var alertsResponse = await _requestSession.SendAsync(MessageEnvelope.Create(MessageTypes.GetAlerts, new { }), TimeSpan.FromSeconds(3), CancellationToken.None).ConfigureAwait(true);
             Replace(Rules, rulesResponse.ReadPayload<RulesMessage>().Rules);
             Replace(Alerts, alertsResponse.ReadPayload<AlertsMessage>().Alerts);
             _eventBuffer.Reset();
@@ -166,7 +180,6 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         {
             ServiceStatus = "Service disconnected · reconnecting";
             LastOperation = exception.Message;
-            await _client.DisconnectAsync().ConfigureAwait(true);
         }
     }
 
@@ -299,19 +312,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         return -1;
     }
 
-    private async Task EnsureConnectedAsync(CancellationToken cancellationToken = default)
-    {
-        if (!_client.IsConnected)
-        {
-            await _client.ConnectAsync(TimeSpan.FromSeconds(3), cancellationToken).ConfigureAwait(true);
-            LastOperation = "Connected to EgressGuard Service.";
-        }
-    }
-
     private async Task<FileCorrelationsMessage> FetchFileCorrelationsAsync(string flowId, CancellationToken cancellationToken)
     {
-        await EnsureConnectedAsync(cancellationToken).ConfigureAwait(true);
-        var response = await _client.SendAsync(
+        var response = await _requestSession.SendAsync(
             MessageEnvelope.Create(MessageTypes.GetFileCorrelations, new GetFileCorrelationsMessage(flowId, 20)),
             TimeSpan.FromSeconds(3), cancellationToken).ConfigureAwait(true);
         return response.ReadPayload<FileCorrelationsMessage>();
@@ -366,8 +369,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     {
         try
         {
-            await EnsureConnectedAsync().ConfigureAwait(true);
-            var response = await _client.SendAsync(MessageEnvelope.Create(type, payload), TimeSpan.FromSeconds(10), CancellationToken.None).ConfigureAwait(true);
+            var response = await _requestSession.SendAsync(MessageEnvelope.Create(type, payload), TimeSpan.FromSeconds(10), CancellationToken.None).ConfigureAwait(true);
             LastOperation = response.Type == MessageTypes.Error ? response.ReadPayload<ErrorMessage>().Message : response.ReadPayload<SuccessMessage>().Message;
             await RefreshAsync().ConfigureAwait(true);
         }
@@ -416,11 +418,15 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
 
     public async ValueTask DisposeAsync()
     {
+        if (_disposed)
+            return;
+        _disposed = true;
         _batchTimer.Stop();
         _lifetimeCancellation.Cancel();
         await _correlationRefresh.DisposeAsync().ConfigureAwait(false);
         await _eventClient.DisposeAsync().ConfigureAwait(false);
-        await _client.DisposeAsync().ConfigureAwait(false);
+        if (_ownsRequestSession)
+            await _requestSession.DisposeAsync().ConfigureAwait(false);
         if (_subscriptionTask is not null)
         {
             try { await _subscriptionTask.ConfigureAwait(false); }

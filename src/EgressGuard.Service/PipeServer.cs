@@ -1,6 +1,7 @@
 using System.IO.Pipes;
 using System.Security.AccessControl;
 using System.Security.Principal;
+using System.Text.Json;
 using EgressGuard.Core;
 using EgressGuard.Persistence;
 using EgressGuard.Protocol;
@@ -18,14 +19,54 @@ public sealed partial class PipeServer : BackgroundService
     private readonly EventHub _eventHub;
     private readonly ILogger<PipeServer> _logger;
     private readonly FirewallRuleCreateCoordinator _firewallRuleCreateCoordinator;
+    private readonly SimulatedDecisionCoordinator _simulatedDecisionCoordinator;
+    private readonly bool _ownsSimulatedDecisionCoordinator;
+    private readonly SemaphoreSlim _pipeSlots = new(
+        SimulatedDecisionProtocolLimits.PipeInstanceCapacity,
+        SimulatedDecisionProtocolLimits.PipeInstanceCapacity);
+    private int _activePipeCount;
+
+    internal int ActivePipeCount => Volatile.Read(ref _activePipeCount);
 
     public PipeServer(ServiceState state, EgressGuardDatabase database, IFirewallRuleManager firewall, EventHub eventHub, ILogger<PipeServer> logger)
+        : this(
+            state,
+            database,
+            firewall,
+            eventHub,
+            logger,
+            new SimulatedDecisionCoordinator(new DisabledSimulatedDecisionAuthority(), new SimulatedDecisionEventHub()),
+            ownsSimulatedDecisionCoordinator: true)
+    {
+    }
+
+    internal PipeServer(
+        ServiceState state,
+        EgressGuardDatabase database,
+        IFirewallRuleManager firewall,
+        EventHub eventHub,
+        ILogger<PipeServer> logger,
+        SimulatedDecisionCoordinator simulatedDecisionCoordinator)
+        : this(state, database, firewall, eventHub, logger, simulatedDecisionCoordinator, ownsSimulatedDecisionCoordinator: false)
+    {
+    }
+
+    private PipeServer(
+        ServiceState state,
+        EgressGuardDatabase database,
+        IFirewallRuleManager firewall,
+        EventHub eventHub,
+        ILogger<PipeServer> logger,
+        SimulatedDecisionCoordinator simulatedDecisionCoordinator,
+        bool ownsSimulatedDecisionCoordinator)
     {
         _state = state;
         _database = database;
         _firewall = firewall;
         _eventHub = eventHub;
         _logger = logger;
+        _simulatedDecisionCoordinator = simulatedDecisionCoordinator ?? throw new ArgumentNullException(nameof(simulatedDecisionCoordinator));
+        _ownsSimulatedDecisionCoordinator = ownsSimulatedDecisionCoordinator;
         _firewallRuleCreateCoordinator = new FirewallRuleCreateCoordinator(
             _firewall,
             _database.SaveRuleAsync,
@@ -38,20 +79,35 @@ public sealed partial class PipeServer : BackgroundService
         var pipeName = ProtocolConstants.ResolvePipeName();
         while (!stoppingToken.IsCancellationRequested)
         {
-            var pipe = CreateServerPipe(pipeName);
             try
             {
-                await pipe.WaitForConnectionAsync(stoppingToken).ConfigureAwait(false);
-                _ = HandleClientAsync(pipe, stoppingToken);
+                await _pipeSlots.WaitAsync(stoppingToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
-                await pipe.DisposeAsync().ConfigureAwait(false);
+                break;
+            }
+
+            NamedPipeServerStream? pipe = null;
+            try
+            {
+                pipe = CreateServerPipe(pipeName);
+                await pipe.WaitForConnectionAsync(stoppingToken).ConfigureAwait(false);
+                _ = HandleClientAsync(pipe, stoppingToken);
+                pipe = null;
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                if (pipe is not null)
+                    await pipe.DisposeAsync().ConfigureAwait(false);
+                _pipeSlots.Release();
                 break;
             }
             catch (Exception exception)
             {
-                await pipe.DisposeAsync().ConfigureAwait(false);
+                if (pipe is not null)
+                    await pipe.DisposeAsync().ConfigureAwait(false);
+                _pipeSlots.Release();
                 LogAcceptFailed(_logger, exception);
             }
         }
@@ -64,7 +120,7 @@ public sealed partial class PipeServer : BackgroundService
         return NamedPipeServerStreamAcl.Create(
             pipeName,
             PipeDirection.InOut,
-            8,
+            SimulatedDecisionProtocolLimits.PipeInstanceCapacity,
             PipeTransmissionMode.Byte,
             PipeOptions.Asynchronous | PipeOptions.WriteThrough,
             0,
@@ -91,53 +147,88 @@ public sealed partial class PipeServer : BackgroundService
 
     private async Task HandleClientAsync(NamedPipeServerStream pipe, CancellationToken stoppingToken)
     {
-        await using (pipe)
+        Interlocked.Increment(ref _activePipeCount);
+        try
         {
-            while (pipe.IsConnected && !stoppingToken.IsCancellationRequested)
+            await using (pipe)
             {
-                MessageEnvelope? request;
-                try
+                while (pipe.IsConnected && !stoppingToken.IsCancellationRequested)
                 {
-                    request = await MessageFraming.ReadAsync(pipe, stoppingToken).ConfigureAwait(false);
-                    if (request is null)
+                    MessageEnvelope? request = null;
+                    try
                     {
+                        request = await MessageFraming.ReadAsync(pipe, stoppingToken).ConfigureAwait(false);
+                        if (request is null)
+                        {
+                            break;
+                        }
+
+                        if (request.Type == MessageTypes.SubscribeEvents)
+                        {
+                            await StreamEventsAsync(pipe, request, stoppingToken).ConfigureAwait(false);
+                            return;
+                        }
+                        if (request.Type == OutboundGateMessageTypes.SubscribeSimulatedDecisionEvents)
+                        {
+                            try
+                            {
+                                await StreamSimulatedDecisionEventsAsync(pipe, request, stoppingToken).ConfigureAwait(false);
+                            }
+                            catch (SimulatedDecisionRequestException exception)
+                            {
+                                await WriteErrorAsync(pipe, request, exception.Code, exception.Message, stoppingToken).ConfigureAwait(false);
+                            }
+                            catch (Exception exception) when (exception is JsonException or ArgumentException or InvalidDataException)
+                            {
+                                await WriteErrorAsync(pipe, request, SimulatedDecisionReasonCodes.RequestInvalid, "The Simulation subscription request is invalid.", stoppingToken).ConfigureAwait(false);
+                            }
+                            return;
+                        }
+
+                        var response = await DispatchAsync(pipe, request, stoppingToken).ConfigureAwait(false);
+                        await MessageFraming.WriteAsync(pipe, response, stoppingToken).ConfigureAwait(false);
+                    }
+                    catch (SimulatedDecisionRequestException exception)
+                    {
+                        LogRequestRejected(_logger, exception.Message);
+                        if (!pipe.IsConnected)
+                            break;
+                        await WriteErrorAsync(pipe, request, exception.Code, exception.Message, stoppingToken).ConfigureAwait(false);
+                    }
+                    catch (Exception exception) when (exception is IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException or JsonException)
+                    {
+                        var detail = string.IsNullOrWhiteSpace(exception.Message)
+                            ? exception.GetType().FullName ?? exception.GetType().Name
+                            : exception.Message;
+                        LogRequestRejected(_logger, detail);
+                        if (!pipe.IsConnected)
+                        {
+                            break;
+                        }
+
+                        var error = MessageEnvelope.Create(MessageTypes.Error, new ErrorMessage("REQUEST_REJECTED", detail), request?.CorrelationId);
+                        await MessageFraming.WriteAsync(pipe, error, stoppingToken).ConfigureAwait(false);
+                    }
+                    catch (Exception exception)
+                    {
+                        LogClientFailed(_logger, exception);
                         break;
                     }
-
-                    if (request.Type == MessageTypes.SubscribeEvents)
-                    {
-                        await StreamEventsAsync(pipe, request, stoppingToken).ConfigureAwait(false);
-                        return;
-                    }
-
-                    var response = await DispatchAsync(pipe, request, stoppingToken).ConfigureAwait(false);
-                    await MessageFraming.WriteAsync(pipe, response, stoppingToken).ConfigureAwait(false);
-                }
-                catch (Exception exception) when (exception is IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException)
-                {
-                    var detail = string.IsNullOrWhiteSpace(exception.Message)
-                        ? exception.GetType().FullName ?? exception.GetType().Name
-                        : exception.Message;
-                    LogRequestRejected(_logger, detail);
-                    if (!pipe.IsConnected)
-                    {
-                        break;
-                    }
-
-                    var error = MessageEnvelope.Create(MessageTypes.Error, new ErrorMessage("REQUEST_REJECTED", detail));
-                    await MessageFraming.WriteAsync(pipe, error, stoppingToken).ConfigureAwait(false);
-                }
-                catch (Exception exception)
-                {
-                    LogClientFailed(_logger, exception);
-                    break;
                 }
             }
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _activePipeCount);
+            _pipeSlots.Release();
         }
     }
 
     private async Task<MessageEnvelope> DispatchAsync(NamedPipeServerStream pipe, MessageEnvelope request, CancellationToken cancellationToken)
     {
+        if (IsSimulatedDecisionRequest(request.Type))
+            return DispatchSimulatedDecision(pipe, request);
+
         if (IsMutating(request.Type) && !IsAdministratorClient(pipe))
         {
             throw new UnauthorizedAccessException("The connected Windows identity is not authorized to modify protection state.");
@@ -224,6 +315,55 @@ public sealed partial class PipeServer : BackgroundService
         or MessageTypes.ResetBaseline
         or MessageTypes.ClearHistory;
 
+    private static bool IsSimulatedDecisionRequest(string type) => type is
+        OutboundGateMessageTypes.GetSimulatedDecisionSnapshot
+        or OutboundGateMessageTypes.SubmitSimulatedDecision
+        or OutboundGateMessageTypes.RevokeSimulatedRememberedRule;
+
+    private MessageEnvelope DispatchSimulatedDecision(NamedPipeServerStream pipe, MessageEnvelope request)
+    {
+        var caller = CaptureSimulatedDecisionCaller(pipe);
+        try
+        {
+            return request.Type switch
+            {
+                OutboundGateMessageTypes.GetSimulatedDecisionSnapshot => SnapshotResponse(request, caller),
+                OutboundGateMessageTypes.SubmitSimulatedDecision => DecisionResponse(request, caller),
+                OutboundGateMessageTypes.RevokeSimulatedRememberedRule => RuleMutationResponse(request, caller),
+                _ => throw new InvalidOperationException("Unknown Simulation decision request.")
+            };
+        }
+        catch (SimulatedDecisionRequestException)
+        {
+            throw;
+        }
+        catch (Exception exception) when (exception is JsonException or ArgumentException or InvalidDataException)
+        {
+            throw new SimulatedDecisionRequestException(
+                SimulatedDecisionReasonCodes.RequestInvalid,
+                "The Simulation decision request failed version, identifier, enum, one-of, or bound validation.");
+        }
+    }
+
+    private MessageEnvelope SnapshotResponse(MessageEnvelope request, SimulatedDecisionCaller caller)
+    {
+        _ = request.ReadPayload<GetSimulatedDecisionSnapshotMessage>();
+        var snapshot = _simulatedDecisionCoordinator.GetSnapshot(caller, Volatile.Read(ref _activePipeCount));
+        return MessageEnvelope.Create(OutboundGateMessageTypes.SimulatedDecisionSnapshot, snapshot, request.CorrelationId);
+    }
+
+    private MessageEnvelope DecisionResponse(MessageEnvelope request, SimulatedDecisionCaller caller)
+    {
+        var result = _simulatedDecisionCoordinator.SubmitDecision(caller, request.ReadPayload<SubmitSimulatedDecisionMessage>());
+        return MessageEnvelope.Create(OutboundGateMessageTypes.SimulatedDecisionResult, result, request.CorrelationId);
+    }
+
+    private MessageEnvelope RuleMutationResponse(MessageEnvelope request, SimulatedDecisionCaller caller)
+    {
+        var result = _simulatedDecisionCoordinator.RevokeRule(caller, request.ReadPayload<RevokeSimulatedRememberedRuleMessage>());
+        return MessageEnvelope.Create(OutboundGateMessageTypes.SimulatedRuleMutationResult, result, request.CorrelationId);
+    }
+
     private static bool IsAdministratorClient(NamedPipeServerStream pipe)
     {
         var authorized = false;
@@ -233,6 +373,20 @@ public sealed partial class PipeServer : BackgroundService
             authorized = new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
         });
         return authorized;
+    }
+
+    private static SimulatedDecisionCaller CaptureSimulatedDecisionCaller(NamedPipeServerStream pipe)
+    {
+        SimulatedDecisionCaller? caller = null;
+        pipe.RunAsClient(() =>
+        {
+            using var identity = WindowsIdentity.GetCurrent();
+            var sid = identity.User?.Value;
+            caller = new SimulatedDecisionCaller(
+                sid is null ? string.Empty : $"sid:{sid}",
+                new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator));
+        });
+        return caller ?? new SimulatedDecisionCaller(string.Empty, false);
     }
 
     private static MessageEnvelope Success(MessageEnvelope request, string message) =>
@@ -246,19 +400,111 @@ public sealed partial class PipeServer : BackgroundService
         var subscriptionRequest = request.ReadPayload<SubscribeEventsMessage>();
         await using var subscription = _eventHub.Subscribe(subscriptionRequest.LastSequence);
         await MessageFraming.WriteAsync(pipe, Success(request, "Event subscription active."), cancellationToken).ConfigureAwait(false);
-        await foreach (var streamEvent in subscription.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+        using var streamCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var disconnectMonitor = MonitorSubscriptionDisconnectAsync(pipe, streamCancellation);
+        try
         {
-            var messageType = streamEvent.Kind switch
+            await foreach (var streamEvent in subscription.Reader.ReadAllAsync(streamCancellation.Token).ConfigureAwait(false))
             {
-                StreamEventKind.AlertRaised => MessageTypes.AlertRaised,
-                StreamEventKind.ServiceStatusChanged => MessageTypes.ServiceStatusChanged,
-                _ => MessageTypes.FlowObserved
-            };
-            await MessageFraming.WriteAsync(
-                pipe,
-                MessageEnvelope.Create(messageType, streamEvent),
-                cancellationToken).ConfigureAwait(false);
+                var messageType = streamEvent.Kind switch
+                {
+                    StreamEventKind.AlertRaised => MessageTypes.AlertRaised,
+                    StreamEventKind.ServiceStatusChanged => MessageTypes.ServiceStatusChanged,
+                    _ => MessageTypes.FlowObserved
+                };
+                await MessageFraming.WriteAsync(
+                    pipe,
+                    MessageEnvelope.Create(messageType, streamEvent),
+                    streamCancellation.Token).ConfigureAwait(false);
+            }
         }
+        catch (OperationCanceledException) when (streamCancellation.IsCancellationRequested)
+        {
+        }
+        finally
+        {
+            await StopDisconnectMonitorAsync(streamCancellation, disconnectMonitor).ConfigureAwait(false);
+        }
+    }
+
+    private async Task StreamSimulatedDecisionEventsAsync(
+        NamedPipeServerStream pipe,
+        MessageEnvelope request,
+        CancellationToken cancellationToken)
+    {
+        var caller = CaptureSimulatedDecisionCaller(pipe);
+        var subscriptionRequest = request.ReadPayload<SubscribeSimulatedDecisionEventsMessage>();
+        await using var subscription = _simulatedDecisionCoordinator.Subscribe(caller, subscriptionRequest.LastSequence);
+        await MessageFraming.WriteAsync(pipe, Success(request, "Simulation decision event subscription active."), cancellationToken).ConfigureAwait(false);
+        using var streamCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var disconnectMonitor = MonitorSubscriptionDisconnectAsync(pipe, streamCancellation);
+        try
+        {
+            await foreach (var streamEvent in subscription.Reader.ReadAllAsync(streamCancellation.Token).ConfigureAwait(false))
+            {
+                await MessageFraming.WriteAsync(
+                    pipe,
+                    MessageEnvelope.Create(OutboundGateMessageTypes.SimulatedDecisionEvent, streamEvent),
+                    streamCancellation.Token).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (streamCancellation.IsCancellationRequested)
+        {
+        }
+        finally
+        {
+            await StopDisconnectMonitorAsync(streamCancellation, disconnectMonitor).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task MonitorSubscriptionDisconnectAsync(
+        NamedPipeServerStream pipe,
+        CancellationTokenSource streamCancellation)
+    {
+        try
+        {
+            _ = await MessageFraming.ReadAsync(pipe, streamCancellation.Token).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is IOException or EndOfStreamException or OperationCanceledException or ObjectDisposedException)
+        {
+        }
+        finally
+        {
+            if (!streamCancellation.IsCancellationRequested)
+                await streamCancellation.CancelAsync().ConfigureAwait(false);
+        }
+    }
+
+    private static async Task StopDisconnectMonitorAsync(
+        CancellationTokenSource streamCancellation,
+        Task disconnectMonitor)
+    {
+        if (!streamCancellation.IsCancellationRequested)
+            await streamCancellation.CancelAsync().ConfigureAwait(false);
+        try
+        {
+            await disconnectMonitor.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private static Task WriteErrorAsync(
+        NamedPipeServerStream pipe,
+        MessageEnvelope? request,
+        string code,
+        string message,
+        CancellationToken cancellationToken) => MessageFraming.WriteAsync(
+            pipe,
+            MessageEnvelope.Create(MessageTypes.Error, new ErrorMessage(code, message), request?.CorrelationId),
+            cancellationToken);
+
+    public override void Dispose()
+    {
+        if (_ownsSimulatedDecisionCoordinator)
+            _simulatedDecisionCoordinator.Dispose();
+        base.Dispose();
     }
 
     [LoggerMessage(Level = LogLevel.Error, Message = "Named pipe accept failed; retrying.")]
