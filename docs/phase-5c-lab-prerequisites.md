@@ -1,36 +1,49 @@
 # Phase 5C isolated minifilter lab prerequisites
 
-Status: `LAB APPROVAL REQUIRED`. This document records the required lab contract; it is not approval to create, build, sign, install, load, or test a driver.
+Status: `GATE 1 REVIEW REQUIRED`; Gate 2B remains `LAB APPROVAL REQUIRED`.
+
+This document is not approval to create or run a driver. After a different qualified reviewer approves Gate 1 on an exact commit, Gate 2A may create source, compile it and run build-time analysis under the non-runtime restrictions below. Signing, altitude, packaging and lab execution are not prerequisites for Gate 2A and do not block that build-only work.
 
 Baseline source commit: `7523c42e7894ae4e8c9ed436a0936984ae46945f`.
 
 ## Gate decision
 
-Phase 5C kernel work is blocked at Gate 1. The request and repository do not contain authoritative evidence for the VM owner and exact guest build, a clean checkpoint and successful restore drill, an accepted signing route, current Secure Boot/Application Control state, or a Microsoft-assigned minifilter altitude. Those values cannot be inferred or approved by the author of this document.
+Phase 5C uses five ordered gates with a deliberate build/runtime split:
 
-While any required row below is not `Approved`, the branch must contain no `drivers` directory, no driver binary/package/certificate/key, and no command or automation that installs or loads a driver.
+| Gate | Permitted work | Entry condition | Explicit prohibition |
+|---|---|---|---|
+| 1 | Review this design and the safety/lab plan | Documentation only | No driver source, build, package, install or load |
+| 2A | Create source, compile x64, run driver code analysis/CodeQL and pure-logic tests | Gate 1 approved on the exact commit | No complete INF, installable package, install, service registration or driver load |
+| 2B | Install and execute only the exact rebuilt, packaged candidate returned Microsoft-signed | External lab rows approved, Microsoft altitude assigned and exact returned package signature/digest verified | No execution on GitHub runners or the primary workstation |
+| 3 | Prove exact file/volume/process identity with synthetic data | Gate 2B observe-only matrix passes on the exact signed artifact | No read pending |
+| 4 | Prove bounded, cancel-safe read hold/release | Gate 3 identity matrix passes on the same artifact | No network/WFP scope |
 
-| Prerequisite | Required value or evidence | Current state |
-|---|---|---|
-| Lab owner | Named human or team with authority over the disposable VM and recovery procedure | `MISSING` |
-| Independent security reviewer | A different qualified Windows kernel reviewer, identified by durable handle, reviewing the exact Gate 1 commit | `MISSING` |
-| Hypervisor and VM | Dedicated Generation 2 x64 Windows VM; not a developer workstation; no unrelated workloads or personal data | `UNAPPROVED` |
-| Guest OS | Exact Windows edition, release, full build and x64 architecture captured from the approved VM | `MISSING` |
-| Clean recovery point | Hypervisor checkpoint/image identifier, creation time and immutable parent/image identity | `MISSING` |
-| Restore proof | Dated drill restoring that exact recovery point, booting successfully and showing the expected clean state | `NOT RUN` |
-| Network isolation | Private lab network; no route to personal networks; no host personal-folder sharing | `UNVERIFIED` |
-| Signing | Microsoft-signed lab package obtained through an approved Partner Center attestation or WHCP/HLK route | `MISSING` |
-| Secure Boot | Enabled before driver load and unchanged throughout the accepted run | `UNVERIFIED` |
-| Application Control/HVCI | Existing policy and Memory Integrity recorded and left enabled/unchanged | `UNVERIFIED` |
-| Filter altitude | Microsoft-assigned altitude and allocation evidence for this product/filter | `MISSING` |
-| Crash capture | Kernel dump configuration and debugger/recovery owner; dumps stored outside Git | `UNAPPROVED` |
-| Synthetic corpus | Dedicated test VHDX and directory containing only generated files | `NOT CREATED` |
+The current branch is blocked at Gate 1 because no different qualified Windows kernel reviewer has approved this exact design. The missing runtime-lab, altitude and signing rows below are hard blockers for Gate 2B, but they are not blockers for Gate 2A after Gate 1 approval. This removes the former circular condition in which source was needed to obtain signing but source creation was forbidden until signing already existed.
 
-The missing rows are hard prerequisites, not documentation TODOs that implementation may bypass.
+| Prerequisite | Required value or evidence | Required before | Current state |
+|---|---|---|---|
+| Independent design/security reviewer | A different qualified Windows kernel reviewer, identified by durable handle, reviewing the exact Gate 1 commit and the Gate 2A restrictions | Gate 2A | `MISSING` |
+| Frozen build environment | Exact supported Visual Studio/SDK/WDK versions and a build-only runner with no install/load step | Gate 2A | `CANDIDATE ONLY` |
+| Lab owner | Named human or team with authority over the disposable VM and recovery procedure | Gate 2B | `MISSING` |
+| Hypervisor and VM | Dedicated Generation 2 x64 Windows VM; not a developer workstation; no unrelated workloads or personal data | Gate 2B | `UNAPPROVED` |
+| Guest OS | Exact Windows edition, release, full build and x64 architecture captured from the approved VM | Gate 2B | `MISSING` |
+| Clean recovery point | Hypervisor checkpoint/image identifier, creation time and immutable parent/image identity | Gate 2B | `MISSING` |
+| Restore proof | Dated drill restoring that exact recovery point, booting successfully and showing the expected clean state | Gate 2B | `NOT RUN` |
+| Network isolation | Private lab network; no route to personal networks; no host personal-folder sharing | Gate 2B | `UNVERIFIED` |
+| Signing route and returned artifact | Organization-approved Partner Center attestation or WHCP/HLK route plus the exact returned Microsoft-signed package/digest | Gate 2B | `MISSING` |
+| Secure Boot | Enabled before driver load and unchanged throughout the accepted run | Gate 2B runtime | `UNVERIFIED` |
+| Application Control/HVCI | Existing policy and Memory Integrity recorded and left enabled/unchanged | Gate 2B runtime | `UNVERIFIED` |
+| Filter altitude | Microsoft-assigned altitude and allocation evidence for this product/filter | Gate 2A-to-2B packaging transition | `MISSING` |
+| Crash capture | Kernel dump configuration and debugger/recovery owner; dumps stored outside Git | Gate 2B runtime | `UNAPPROVED` |
+| Synthetic corpus | Dedicated test VHDX and directory containing only generated files | Gate 2B runtime | `NOT CREATED` |
+
+Until Gate 1 is approved, the branch remains documentation-only. Once Gate 1 is approved, Gate 2A may add only the planned source/build-test paths from the design lock. Gate 2A must not create a complete installable INF or catalog, register an SCM service, modify the Driver Store, call `fltmc`, load a `.sys`, change boot/security policy or target any Windows system for driver execution.
+
+An unsigned `.sys` produced by Gate 2A is an ephemeral analysis output only: it exists only in the temporary Windows build worker, is hashed for the sanitized build result, is not committed or published as a product/artifact, and is deleted with the worker. Without a Microsoft-assigned altitude, any INF-like source is limited to a clearly non-installable structural template whose altitude token is unresolved and whose build cannot produce a package.
 
 ## Proposed lab profile awaiting owner approval
 
-The owner and independent reviewer must either approve this profile verbatim or replace it with an equally isolated profile before Gate 2.
+The owner and independent reviewer must either approve this profile verbatim or replace it with an equally isolated profile before Gate 2B runtime. Gate 2A does not use this VM.
 
 - Hypervisor: Hyper-V Generation 2 VM with x64 virtual processors, virtual TPM 2.0, UEFI firmware and Secure Boot.
 - Guest: Windows 11 Enterprise x64. The release, edition ID, full `CurrentBuildNumber.UBR`, installation media digest and patch level must be recorded from the actual VM; no guessed build is accepted.
@@ -57,7 +70,7 @@ Screenshots, exported VM configuration, event logs and system dumps remain in th
 
 ## Frozen toolchain candidate
 
-The following Microsoft toolchain is the Gate 1 candidate. Gate 2 requires evidence from the approved VM that these exact versions are installed; a silent update changes the evidence target and requires a new clean checkpoint.
+The following Microsoft toolchain is the Gate 1 candidate. Gate 2A requires an exact version transcript from its temporary Windows build worker. Gate 2B requires the same evidence from the approved VM; a silent update changes the evidence target, requires a new clean checkpoint and invalidates artifact comparison.
 
 | Component | Frozen candidate |
 |---|---|
@@ -70,6 +83,16 @@ The following Microsoft toolchain is the Gate 1 candidate. Gate 2 requires evide
 
 The SDK and WDK build numbers must match. The approved build transcript must record `MSBuild.exe -version`, `cl.exe /Bv`, SDK/WDK directories and hashes of the offline installers/layout manifest. Installers and generated logs are evidence-store artifacts, not repository files.
 
+Gate 2A may run on a temporary GitHub-hosted Windows runner only to:
+
+1. compile `Release|x64` with the WDK;
+2. run driver code analysis, CodeQL and compile-time contract assertions;
+3. run tests that are pure user-mode logic and never install or open a minifilter port;
+4. record the source commit, tool versions, diagnostics and SHA-256 of the ephemeral output; and
+5. delete all `.sys`, object, package and analysis intermediates when the job ends, with no binary artifact upload.
+
+The Gate 2A workflow must contain no INF/package installation, `pnputil`, `sc create`, `fltmc`, `FilterLoad`, Driver Verifier configuration, reboot or security-policy command. Neither a GitHub runner nor the user's primary workstation may install or execute the driver.
+
 Microsoft references:
 
 - [Download the Windows Driver Kit](https://learn.microsoft.com/en-us/windows-hardware/drivers/download-the-wdk)
@@ -79,15 +102,19 @@ Microsoft references:
 
 ## Signing route
 
-The only accepted route for this lab is a Microsoft-signed package returned by Partner Center through an organization-owned attestation or WHCP/HLK submission. The signing owner must provide a sanitized submission ID, certification type, returned-package digest and successful Microsoft signature verification for the exact artifact.
+Signing is not a Gate 1 or Gate 2A prerequisite. Gate 2A intentionally proves that source can compile and be analyzed without making an installable package. After Gate 2A passes and Microsoft assigns the exact altitude, the organization may perform a controlled Gate 2A-to-2B transition outside the repository: reconstruct the candidate, create the complete INF/catalog, submit that exact package and wait for the Microsoft-signed return. This transition is not Gate 2A and authorizes no installation or execution. Gate 2B does not begin until the returned package and digest are verified.
 
-Gate 2 is blocked until the organization has:
+The only accepted runtime route is a Microsoft-signed package returned by Partner Center through an organization-owned attestation or WHCP/HLK submission. The signing owner must provide a sanitized submission ID, certification type, source commit, unsigned input-package digest, returned-package digest and successful Microsoft signature verification for the exact artifact.
+
+Gate 2B is blocked until the organization has:
 
 - a registered Windows Hardware Developer Program account;
 - an organization-controlled, valid EV certificate associated with that account;
 - approved key custody and signing operators outside this repository;
 - a completed Partner Center submission for the exact candidate package; and
 - a returned Microsoft-signed package whose catalog and binary validate with `signtool verify /v /kp`.
+
+Every rebuild of any file in the package creates a new artifact: its previous signature evidence is invalid, it must receive a new digest and Partner Center submission, and it cannot be installed or loaded until the newly returned package verifies. A Gate 2A ephemeral `.sys` is never promoted directly to a runtime product.
 
 The repository must never contain a PFX, private key, certificate export, signing token, Partner Center credential or signed package. Self-signed test certificates, `TESTSIGNING`, disabling Secure Boot, clearing UEFI keys and bypassing Application Control are not accepted alternatives. The agent must not perform or automate any of those actions.
 
@@ -100,7 +127,7 @@ Microsoft references:
 
 ## Minifilter altitude
 
-No numeric altitude is reserved or guessed. Gate 2 requires the exact altitude allocated by Microsoft for `EgressGuard.Minifilter.sys`. Until allocation evidence exists, an INF must not be created and the filter must not be registered or loaded.
+No numeric altitude is reserved or guessed. Gate 2A may compile source without an altitude, but it must not create a complete/installable INF. The controlled Gate 2A-to-2B packaging transition requires the exact altitude allocated by Microsoft for `EgressGuard.Minifilter.sys`; until allocation evidence exists, no complete INF/catalog/package may be produced and the filter must not be registered or loaded.
 
 The organization owner must send the Microsoft altitude request with:
 
@@ -208,39 +235,56 @@ These bounds are fixed before any driver measurement and may not be increased af
 
 | Resource | Frozen bound |
 |---|---:|
-| Metadata record wire size | 512 bytes maximum, fixed-width header and bounded payload |
+| Connect context / common wire header | 64 bytes each |
+| Version-1 wire records | Metadata 320; status 512; pending read 384; read completion 384; receiver ready 128; disposition 320 bytes |
+| Maximum wire record | 512 bytes; no variable/flexible record |
 | Driver-to-service metadata queue | 1,024 records global |
 | Metadata queue reserved storage | 512 KiB records; 640 KiB total allocation ceiling including queue bookkeeping |
 | All driver-owned pool allocation | 1 MiB global across the three EgressGuard pool tags; Filter Manager-owned memory is reported separately |
 | Communication clients | 1 LocalSystem/administrator client |
 | Driver-to-service send timeout | 250 ms per attempt, on the single emitter thread only |
-| Unsupported-volume warning reasons | Fixed enum; monotonic counters bounded to `uint64` saturation |
+| Status snapshot | Exactly one 512-byte record; at most 40 fixed counter entries |
+| Reason counters | Closed pass-through/terminal enums; monotonic `uint64` saturation |
 | Pending reads, exact subject | 4 |
 | Pending reads, global | 64 |
 | Pending-read deadline | 2,000 ms; equality is expired/fail-open |
 | Pending-entry storage | 1 KiB maximum each; 64 KiB total entry ceiling |
+| Completion tombstones | 64 entries, 128 bytes each, 8 KiB total |
+| Core-mapped sequences | `1..INT64_MAX`, no wrap; exhaustion fail-opens and stops admission |
 | Worker model | One long-lived emitter and one shared watchdog/completion path; zero per-event threads |
 | Raw path lifetime | Callback-local only; never queued, messaged, logged or persisted |
-| Redacted file label | 96 ASCII characters maximum |
+| Redacted file label | 1-96 bytes in `[A-Za-z0-9 ._()-]`, then zero padding to 96 bytes |
 
 Queue exhaustion, unavailable service, identity uncertainty and unsupported I/O/volume paths always pass through and increment exactly one applicable monotonic counter. No bound may be tuned upward to make a test pass.
 
-## Gate 1 approval record
+## Gate approval records
 
-This section remains intentionally incomplete until external evidence exists.
+Gate 1 is intentionally independent of Microsoft signing, altitude and runtime-lab readiness. This separation allows an approved Gate 2A build to create the artifact needed for later packaging/signing without authorizing installation or execution.
+
+### Gate 1 and Gate 2A entry
 
 | Field | Value |
 |---|---|
-| Gate 1 commit | `PENDING` |
-| Lab owner | `PENDING` |
-| Independent reviewer | `PENDING` |
+| Gate 1 design commit | `PENDING` |
+| Independent Windows kernel/security reviewer | `PENDING` |
 | Review date | `PENDING` |
+| Frozen Gate 2A toolchain/runner | `PENDING` |
+| Build-only/no-install review verdict | `PENDING` |
+| Independent Gate 1 verdict | `PENDING` |
+
+### Gate 2B packaging/runtime entry
+
+| Field | Value |
+|---|---|
+| Exact Gate 2A source commit | `PENDING` |
+| Lab owner | `PENDING` |
 | VM and exact OS build | `PENDING` |
 | Clean checkpoint ID | `PENDING` |
 | Restore drill | `PENDING` |
-| Signing submission/evidence | `PENDING` |
-| Microsoft altitude | `PENDING` |
+| Microsoft altitude evidence | `PENDING` |
+| Signing route approval | `PENDING` |
+| Exact returned Microsoft-signed package digest | `PENDING` |
 | Security-state verdict | `PENDING` |
-| Independent verdict | `PENDING` |
+| Independent Gate 2B runtime verdict | `PENDING` |
 
-Only a different qualified reviewer and the VM/security owner may change the verdict to `Approved`. The document author cannot self-approve.
+Only a different qualified reviewer may approve Gate 1/Gate 2A entry. Only that reviewer together with the named VM/security owner may approve Gate 2B runtime. The document author cannot self-approve either record.
