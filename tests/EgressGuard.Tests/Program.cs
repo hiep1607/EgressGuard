@@ -129,6 +129,10 @@ internal static class Program
             ("Automatic firewall rule rolls back on cancellation", TestAutomaticRuleCancellationRollbackAsync),
             ("Automatic firewall rollback logs original and rollback failures", TestAutomaticRuleRollbackFailureLoggingAsync),
             ("Protocol frame roundtrip", TestProtocolRoundTripAsync),
+            ("Phase 5B-05 Protocol request and projection contracts enforce bounds", TestSimulatedDecisionProtocolRequestAndProjectionValidationAsync),
+            ("Phase 5B-05 Protocol event and result contracts enforce one-of outcomes", TestSimulatedDecisionProtocolEventAndResultValidationAsync),
+            ("Phase 5B-05 Protocol contracts defensively copy and round-trip JSON", TestSimulatedDecisionProtocolJsonRoundTripAsync),
+            ("Phase 5B-05 Protocol maximum snapshot stays below the frame limit", TestSimulatedDecisionProtocolMaximumSnapshotAsync),
             ("Phase 5B-01 contracts serialize and preserve exact identity", TestOutboundGateContractRoundTripAsync),
             ("Phase 5B-01 contracts enforce monotonic deadlines and generations", TestOutboundGateMonotonicValidationAsync),
             ("Phase 5B-01 contracts enforce decision and disposition invariants", TestOutboundGateDecisionValidationAsync),
@@ -1741,6 +1745,375 @@ internal static class Program
         var result = await MessageFraming.ReadAsync(stream, CancellationToken.None).ConfigureAwait(false);
         AssertEqual(message.Type, result?.Type);
         AssertEqual(message.CorrelationId, result?.CorrelationId);
+    }
+
+    private static Task TestSimulatedDecisionProtocolRequestAndProjectionValidationAsync()
+    {
+        var sample = CreateSimulatedProtocolSample();
+        var messageTypes = new[]
+        {
+            OutboundGateMessageTypes.GetSimulatedDecisionSnapshot,
+            OutboundGateMessageTypes.SimulatedDecisionSnapshot,
+            OutboundGateMessageTypes.SubscribeSimulatedDecisionEvents,
+            OutboundGateMessageTypes.SimulatedDecisionEvent,
+            OutboundGateMessageTypes.SubmitSimulatedDecision,
+            OutboundGateMessageTypes.SimulatedDecisionResult,
+            OutboundGateMessageTypes.RevokeSimulatedRememberedRule,
+            OutboundGateMessageTypes.SimulatedRuleMutationResult
+        };
+        AssertEqual(8, messageTypes.Distinct(StringComparer.Ordinal).Count());
+        AssertTrue(messageTypes.All(type => type.StartsWith("Phase5B.Ui.", StringComparison.Ordinal)), "A simulated-decision message type escaped the frozen namespace.");
+
+        _ = new GetSimulatedDecisionSnapshotMessage(1);
+        _ = new SubscribeSimulatedDecisionEventsMessage(1, 0);
+        _ = new SubmitSimulatedDecisionMessage(1, sample.ChallengeId, SimulatedDecisionChoice.AllowOnce);
+        _ = new RevokeSimulatedRememberedRuleMessage(1, sample.RuleId, 1);
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new GetSimulatedDecisionSnapshotMessage(2));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new SubscribeSimulatedDecisionEventsMessage(1, -1));
+        AssertThrows<ArgumentException>(() => _ = new SubmitSimulatedDecisionMessage(1, Guid.Empty, SimulatedDecisionChoice.AllowOnce));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new SubmitSimulatedDecisionMessage(1, sample.ChallengeId, SimulatedDecisionChoice.Unspecified));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new SubmitSimulatedDecisionMessage(1, sample.ChallengeId, (SimulatedDecisionChoice)99));
+        AssertThrows<ArgumentException>(() => _ = new RevokeSimulatedRememberedRuleMessage(1, Guid.Empty, 0));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new RevokeSimulatedRememberedRuleMessage(1, sample.RuleId, -1));
+
+        var absentDomain = new SimulatedDestinationProjection(1, IPAddress.IPv6Loopback, IpVersion.IPv6, 443, TransportProtocol.Tcp, null, DomainEvidenceProvenance.None, null);
+        AssertEqual(null, absentDomain.DomainObservedAtUtc);
+        var observedAt = sample.Now.ToOffset(TimeSpan.FromHours(2));
+        var observedDomain = new SimulatedDestinationProjection(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, "localhost", DomainEvidenceProvenance.DnsObservation, observedAt);
+        AssertEqual(sample.Now, observedDomain.DomainObservedAtUtc);
+        _ = new SimulatedDestinationProjection(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, "xn--mnich-kva.example", DomainEvidenceProvenance.DnsObservation, sample.Now);
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDestinationProjection(1, IPAddress.IPv6Loopback, IpVersion.IPv6, 443, TransportProtocol.Tcp, null, DomainEvidenceProvenance.None, sample.Now));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDestinationProjection(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, "localhost", DomainEvidenceProvenance.None, sample.Now));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDestinationProjection(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, "localhost", DomainEvidenceProvenance.DnsObservation, null));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDestinationProjection(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, "m\u0800nich.example", DomainEvidenceProvenance.DnsObservation, sample.Now));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDestinationProjection(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, "MUNICH.example", DomainEvidenceProvenance.DnsObservation, sample.Now));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDestinationProjection(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, "bad_label.example", DomainEvidenceProvenance.DnsObservation, sample.Now));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDestinationProjection(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, $"{new string('a', 64)}.example", DomainEvidenceProvenance.DnsObservation, sample.Now));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDestinationProjection(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, "empty..label", DomainEvidenceProvenance.DnsObservation, sample.Now));
+
+        AssertThrows<JsonException>(() => _ = JsonSerializer.Deserialize<GetSimulatedDecisionSnapshotMessage>("{\"version\":1,\"caller\":\"test\"}", JsonDefaults.Options));
+        AssertThrows<JsonException>(() => _ = JsonSerializer.Deserialize<GetSimulatedDecisionSnapshotMessage>("{\"version\":1,\"time\":\"2026-01-01T00:00:00Z\"}", JsonDefaults.Options));
+        AssertThrows<JsonException>(() => _ = JsonSerializer.Deserialize<SubscribeSimulatedDecisionEventsMessage>("{\"version\":1,\"lastSequence\":0,\"scope\":\"all\"}", JsonDefaults.Options));
+        AssertThrows<JsonException>(() => _ = JsonSerializer.Deserialize<SubscribeSimulatedDecisionEventsMessage>("{\"version\":1,\"lastSequence\":0,\"decisionId\":\"00000000-0000-0000-0000-000000000001\"}", JsonDefaults.Options));
+        AssertThrows<JsonException>(() => _ = JsonSerializer.Deserialize<SubmitSimulatedDecisionMessage>($"{{\"version\":1,\"challengeId\":\"{sample.ChallengeId}\",\"choice\":1,\"nonce\":\"x\"}}", JsonDefaults.Options));
+        AssertThrows<JsonException>(() => _ = JsonSerializer.Deserialize<RevokeSimulatedRememberedRuleMessage>($"{{\"version\":1,\"ruleId\":\"{sample.RuleId}\",\"expectedRevision\":0,\"ticket\":\"x\",\"grant\":\"x\"}}", JsonDefaults.Options));
+
+        AssertThrows<ArgumentException>(() => _ = new SimulatedFileVersionProjection(1, new string('v', 129), 1, sample.Now, sample.Now, null));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedFileVersionProjection(1, "version\u0800token", 1, sample.Now, sample.Now, null));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new SimulatedFileVersionProjection(1, "v1", -1, sample.Now, sample.Now, null));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionPromptProjection(1, sample.ChallengeId, sample.IntentId, "C:\\secret.txt", sample.File, "sha256:app", sample.ProcessSubject, sample.Destination, false, GateRuntimeState.AwaitingDecision, "awaiting", null, sample.ActiveExpiry, 1));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionPromptProjection(1, sample.ChallengeId, sample.IntentId, "report.txt", sample.File, "sha256/app", sample.ProcessSubject, sample.Destination, false, GateRuntimeState.AwaitingDecision, "awaiting", null, sample.ActiveExpiry, 1));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionPromptProjection(1, sample.ChallengeId, sample.IntentId, "report.txt", sample.File, "sha256:app", sample.ProcessSubject, sample.Destination, false, GateRuntimeState.AwaitingDecision, "bad@reason", null, sample.ActiveExpiry, 1));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionPromptProjection(1, sample.ChallengeId, sample.IntentId, "report\u0800.txt", sample.File, "sha256:app", sample.ProcessSubject, sample.Destination, false, GateRuntimeState.AwaitingDecision, "awaiting", null, sample.ActiveExpiry, 1));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionPromptProjection(1, sample.ChallengeId, sample.IntentId, "report.txt", sample.File, "sha256:app", sample.ProcessSubject, sample.Destination, true, GateRuntimeState.AwaitingDecision, "awaiting", null, sample.ActiveExpiry, 1));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionPromptProjection(1, sample.ChallengeId, sample.IntentId, "..", sample.File, "sha256:app", sample.ProcessSubject, sample.Destination, false, GateRuntimeState.AwaitingDecision, "awaiting", null, sample.ActiveExpiry, 1));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new SimulatedDecisionExpiryProjection(1, 15_001, sample.Now, true));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new SimulatedDecisionExpiryProjection(1, 0, sample.Now, true));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new SimulatedDecisionExpiryProjection(1, -1, sample.Now, false));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionPromptProjection(1, sample.ChallengeId, sample.IntentId, "report.txt", sample.File, "sha256:app", sample.ProcessSubject, sample.Destination, false, GateRuntimeState.AwaitingDecision, "awaiting", null, sample.ClosedExpiry, 1));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new SimulatedDecisionPromptProjection(1, sample.ChallengeId, sample.IntentId, "report.txt", sample.File, "sha256:app", sample.ProcessSubject, sample.Destination, false, (GateRuntimeState)99, "awaiting", null, sample.ActiveExpiry, 1));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new SimulatedDecisionPromptProjection(1, sample.ChallengeId, sample.IntentId, "report.txt", sample.File, "sha256:app", sample.ProcessSubject, sample.Destination, false, GateRuntimeState.AwaitingDecision, "awaiting", null, sample.ActiveExpiry, -1));
+
+        var processMembers = new List<ProcessIdentity> { sample.Process };
+        var processSubject = new SimulatedSubjectProjection(1, SimulatedDecisionSubjectKind.ExactProcess, sample.Process, null, processMembers, false, null);
+        processMembers.Clear();
+        AssertEqual(1, processSubject.ExactMembers.Count);
+        AssertThrows<NotSupportedException>(() => ((IList<ProcessIdentity>)processSubject.ExactMembers).Clear());
+        AssertThrows<ArgumentException>(() => _ = new SimulatedSubjectProjection(1, SimulatedDecisionSubjectKind.ExactProcess, sample.Process, Guid.NewGuid(), [sample.Process], false, null));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedSubjectProjection(1, SimulatedDecisionSubjectKind.ExactProcessGroup, sample.Process, sample.GroupSubject.ProcessGroupId, [sample.Process], true, SimulatedDecisionProtocolLimits.GroupCollateralWarning));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedSubjectProjection(1, SimulatedDecisionSubjectKind.ExactProcessGroup, sample.Process, sample.GroupSubject.ProcessGroupId, [sample.GroupMember, sample.Process], true, SimulatedDecisionProtocolLimits.GroupCollateralWarning));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedSubjectProjection(1, SimulatedDecisionSubjectKind.ExactProcessGroup, sample.Process, sample.GroupSubject.ProcessGroupId, [sample.Process, sample.GroupMember], true, "wrong warning"));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedSubjectProjection(1, SimulatedDecisionSubjectKind.ExactProcessGroup, sample.Process, Guid.Empty, [sample.Process, sample.GroupMember], true, SimulatedDecisionProtocolLimits.GroupCollateralWarning));
+
+        AssertEqual(SimulatedDecisionProtocolLimits.DecisionSubscriberCapacity, sample.Capacity.DecisionSubscriberCapacity);
+        AssertEqual(SimulatedDecisionProtocolLimits.PipeInstanceCapacity, sample.Capacity.PipeInstanceCapacity);
+        AssertEqual(SimulatedDecisionProtocolLimits.ReservedRequestReconnectCapacity, sample.Capacity.ReservedRequestReconnectCapacity);
+        AssertEqual(SimulatedDecisionProtocolLimits.RuleIdRegistryEntryCapacity, sample.Capacity.RuleIdRegistryEntryCapacity);
+        AssertEqual(8, SimulatedDecisionProtocolLimits.MaximumReconnectNoticeCount);
+        AssertEqual(64, SimulatedDecisionProtocolLimits.MaximumStatusCount);
+        AssertEqual(32, SimulatedDecisionProtocolLimits.MaximumCriticalAlertCount);
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new SimulatedDecisionCapacitySnapshot(3, 2, 0, 8, 0, 2, 0, 256));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new SimulatedDecisionCapacitySnapshot(0, 3, 0, 8, 0, 2, 0, 256));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new SimulatedDecisionCapacitySnapshot(0, 2, 0, 8, 0, 2, 257, 256));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new SimulatedDecisionCounterSnapshot(-1, 0, 0, 0));
+
+        var prompts = new List<SimulatedDecisionPromptProjection> { sample.Prompt };
+        var snapshot = new SimulatedDecisionSnapshotMessage(1, 1, true, sample.Authorization, prompts, [sample.Reconnect], [sample.Rule], [sample.Status], [sample.Alert], sample.Capacity, sample.Counters);
+        prompts.Clear();
+        AssertEqual(1, snapshot.ActivePrompts.Count);
+        AssertTrue(snapshot.ActivePrompts is IList<SimulatedDecisionPromptProjection> exposedPrompts && exposedPrompts.IsReadOnly, "Snapshot prompt collection was not read-only.");
+        AssertThrows<NotSupportedException>(() => ((IList<SimulatedDecisionPromptProjection>)snapshot.ActivePrompts).Clear());
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionSnapshotMessage(1, 1, true, sample.Authorization, Enumerable.Repeat(sample.Prompt, SimulatedDecisionProtocolLimits.MaximumPromptCount + 1).ToArray(), [], [], [], [], sample.Capacity, sample.Counters));
+        var sameSubjectPrompts = Enumerable.Range(0, SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject + 1)
+            .Select(index => CreatePrompt(sample, sample.ProcessSubject, index, "sha256:subject-bound"))
+            .ToArray();
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionSnapshotMessage(1, 1, true, sample.Authorization, sameSubjectPrompts, [], [], [], [], sample.Capacity, sample.Counters));
+        var structuralSubjectCopy = new SimulatedSubjectProjection(1, SimulatedDecisionSubjectKind.ExactProcess, sample.Process, null, [sample.Process], false, null);
+        var structurallyEqualPrompts = sameSubjectPrompts
+            .Take(SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject)
+            .Append(CreatePrompt(sample, structuralSubjectCopy, SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject, "sha256:subject-bound"))
+            .ToArray();
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionSnapshotMessage(1, 1, true, sample.Authorization, structurallyEqualPrompts, [], [], [], [], sample.Capacity, sample.Counters));
+        var ordinalApplicationPrompts = sameSubjectPrompts
+            .Take(SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject)
+            .Append(CreatePrompt(sample, sample.ProcessSubject, SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject, "SHA256:SUBJECT-BOUND"))
+            .ToArray();
+        _ = new SimulatedDecisionSnapshotMessage(1, 1, true, sample.Authorization, ordinalApplicationPrompts, [], [], [], [], sample.Capacity, sample.Counters);
+        var sameApplicationRules = Enumerable.Range(0, SimulatedDecisionProtocolLimits.MaximumRememberedRulesPerApplication + 1)
+            .Select(index => CreateRule(sample, index, "sha256:one-application"))
+            .ToArray();
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionSnapshotMessage(1, 1, true, sample.Authorization, [], [], sameApplicationRules, [], [], sample.Capacity, sample.Counters));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionSnapshotMessage(1, 1, true, sample.Authorization, [], Enumerable.Repeat(sample.Reconnect, SimulatedDecisionProtocolLimits.MaximumReconnectNoticeCount + 1).ToArray(), [], [], [], sample.Capacity, sample.Counters));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionSnapshotMessage(1, 1, true, sample.Authorization, [], [], [], Enumerable.Repeat(sample.Status, SimulatedDecisionProtocolLimits.MaximumStatusCount + 1).ToArray(), [], sample.Capacity, sample.Counters));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionSnapshotMessage(1, 1, true, sample.Authorization, [], [], [], [], Enumerable.Repeat(sample.Alert, SimulatedDecisionProtocolLimits.MaximumCriticalAlertCount + 1).ToArray(), sample.Capacity, sample.Counters));
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimulatedDecisionProtocolEventAndResultValidationAsync()
+    {
+        var sample = CreateSimulatedProtocolSample();
+        var events = new[]
+        {
+            new SimulatedDecisionEventMessage(1, 1, SimulatedDecisionEventKind.PromptUpserted, sample.Prompt, null, null, null, null, null, null, false),
+            new SimulatedDecisionEventMessage(1, 2, SimulatedDecisionEventKind.PromptRemoved, null, sample.ChallengeId, null, null, null, null, null, false),
+            new SimulatedDecisionEventMessage(1, 3, SimulatedDecisionEventKind.ReconnectRequired, null, null, sample.Reconnect, null, null, null, null, false),
+            new SimulatedDecisionEventMessage(1, 4, SimulatedDecisionEventKind.RememberedRuleUpserted, null, null, null, sample.Rule, null, null, null, false),
+            new SimulatedDecisionEventMessage(1, 5, SimulatedDecisionEventKind.RememberedRuleRemoved, null, null, null, null, sample.RuleId, null, null, false),
+            new SimulatedDecisionEventMessage(1, 6, SimulatedDecisionEventKind.StatusChanged, null, null, null, null, null, sample.Status, null, false),
+            new SimulatedDecisionEventMessage(1, 7, SimulatedDecisionEventKind.CriticalAlertRaised, null, null, null, null, null, null, sample.Alert, false),
+            new SimulatedDecisionEventMessage(1, 8, SimulatedDecisionEventKind.ResyncRequired, null, null, null, null, null, null, null, true)
+        };
+        AssertEqual(8, events.Length);
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionEventMessage(1, 1, SimulatedDecisionEventKind.PromptRemoved, sample.Prompt, sample.ChallengeId, null, null, null, null, null, false));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionEventMessage(1, 1, SimulatedDecisionEventKind.ResyncRequired, null, null, null, null, null, null, null, false));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new SimulatedDecisionEventMessage(1, 1, (SimulatedDecisionEventKind)99, null, null, null, null, null, null, null, true));
+
+        var outcome = sample.RuleOutcome;
+        _ = new SimulatedDecisionResultMessage(1, 10, sample.ChallengeId, SimulatedDecisionChoice.AllowOnce, SimulatedDecisionItemState.AllowedOnce, "allowed-once", false, null, false, 1);
+        _ = new SimulatedDecisionResultMessage(1, 11, sample.ChallengeId, SimulatedDecisionChoice.BlockCurrent, SimulatedDecisionItemState.BlockedCurrent, "blocked-current", false, null, false, 2);
+        _ = new SimulatedDecisionResultMessage(1, 12, sample.ChallengeId, SimulatedDecisionChoice.RememberFor30Days, SimulatedDecisionItemState.Remembered, "remembered", false, outcome, false, 3);
+        _ = new SimulatedDecisionResultMessage(1, 13, sample.ChallengeId, SimulatedDecisionChoice.RememberFor30Days, SimulatedDecisionItemState.FailedOpen, "ticket-failed-open", true, outcome, false, 4);
+        _ = new SimulatedDecisionResultMessage(1, 14, sample.ChallengeId, SimulatedDecisionChoice.RememberFor30Days, SimulatedDecisionItemState.AwaitingDecision, "sim-ui-rule-id-retention-capacity-exhausted", false, null, false, 5);
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionResultMessage(1, 1, sample.ChallengeId, SimulatedDecisionChoice.AllowOnce, SimulatedDecisionItemState.AllowedOnce, "allowed", false, outcome, false, 1));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionResultMessage(1, 1, sample.ChallengeId, SimulatedDecisionChoice.RememberFor30Days, SimulatedDecisionItemState.Remembered, "remembered", false, null, false, 1));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionResultMessage(1, 1, sample.ChallengeId, SimulatedDecisionChoice.RememberFor30Days, SimulatedDecisionItemState.FailedOpen, "failed", false, outcome, false, 1));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedDecisionResultMessage(1, 1, sample.ChallengeId, SimulatedDecisionChoice.RememberFor30Days, SimulatedDecisionItemState.Remembered, "remembered", false, new SimulatedRememberedRuleOutcome(sample.RuleId, 1, SimulatedDecisionItemState.Revoked, "revoked"), false, 1));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new SimulatedDecisionResultMessage(1, 1, sample.ChallengeId, (SimulatedDecisionChoice)99, SimulatedDecisionItemState.AllowedOnce, "allowed", false, null, false, 1));
+        AssertThrows<ArgumentException>(() => _ = new SimulatedCriticalAlertProjection(1, sample.AlertId, sample.IntentId, sample.GroupSubject, "fail", sample.Now, 0, 0, true, "wrong", 1));
+        _ = new SimulatedRuleMutationResultMessage(1, 15, sample.RuleId, 3, SimulatedRuleMutationKind.Revoke, SimulatedDecisionItemState.Revoked, "revoked", false, 6);
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new SimulatedRuleMutationResultMessage(1, 1, sample.RuleId, 0, (SimulatedRuleMutationKind)99, SimulatedDecisionItemState.Revoked, "revoked", false, 1));
+        AssertThrows<ArgumentOutOfRangeException>(() => _ = new SimulatedRuleMutationResultMessage(1, 1, sample.RuleId, 0, SimulatedRuleMutationKind.Revoke, SimulatedDecisionItemState.Remembered, "wrong state", false, 1));
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimulatedDecisionProtocolJsonRoundTripAsync()
+    {
+        var sample = CreateSimulatedProtocolSample();
+        var snapshot = new SimulatedDecisionSnapshotMessage(1, 1, true, sample.Authorization, [sample.Prompt], [sample.Reconnect], [sample.Rule], [sample.Status], [sample.Alert], sample.Capacity, sample.Counters);
+        var events = new object[]
+        {
+            new SimulatedDecisionEventMessage(1, 1, SimulatedDecisionEventKind.PromptUpserted, sample.Prompt, null, null, null, null, null, null, false),
+            new SimulatedDecisionEventMessage(1, 2, SimulatedDecisionEventKind.ResyncRequired, null, null, null, null, null, null, null, true)
+        };
+        var values = new object[]
+        {
+            new GetSimulatedDecisionSnapshotMessage(1),
+            new SubscribeSimulatedDecisionEventsMessage(1, 0),
+            new SubmitSimulatedDecisionMessage(1, sample.ChallengeId, SimulatedDecisionChoice.RememberFor30Days),
+            new RevokeSimulatedRememberedRuleMessage(1, sample.RuleId, 3),
+            sample.File,
+            sample.ProcessSubject,
+            sample.Destination,
+            sample.ActiveExpiry,
+            sample.Prompt,
+            sample.Reconnect,
+            sample.Rule,
+            sample.Status,
+            sample.Alert,
+            sample.Authorization,
+            sample.Capacity,
+            sample.Counters,
+            snapshot,
+            events[0],
+            events[1],
+            sample.RuleOutcome,
+            new SimulatedDecisionResultMessage(1, 3, sample.ChallengeId, SimulatedDecisionChoice.RememberFor30Days, SimulatedDecisionItemState.FailedOpen, "ticket-failed-open", true, sample.RuleOutcome, false, 4),
+            new SimulatedRuleMutationResultMessage(1, 4, sample.RuleId, 3, SimulatedRuleMutationKind.Revoke, SimulatedDecisionItemState.Revoked, "revoked", false, 5)
+        };
+        foreach (var value in values)
+        {
+            var json = JsonSerializer.Serialize(value, value.GetType(), JsonDefaults.Options);
+            var roundTripped = JsonSerializer.Deserialize(json, value.GetType(), JsonDefaults.Options);
+            AssertTrue(roundTripped is not null, $"{value.GetType().Name} did not JSON round-trip.");
+            AssertEqual(json, JsonSerializer.Serialize(roundTripped, value.GetType(), JsonDefaults.Options));
+        }
+
+        var messages = new (string Type, object Payload)[]
+        {
+            (OutboundGateMessageTypes.GetSimulatedDecisionSnapshot, new GetSimulatedDecisionSnapshotMessage(1)),
+            (OutboundGateMessageTypes.SimulatedDecisionSnapshot, snapshot),
+            (OutboundGateMessageTypes.SubscribeSimulatedDecisionEvents, new SubscribeSimulatedDecisionEventsMessage(1, 0)),
+            (OutboundGateMessageTypes.SimulatedDecisionEvent, events[0]),
+            (OutboundGateMessageTypes.SubmitSimulatedDecision, new SubmitSimulatedDecisionMessage(1, sample.ChallengeId, SimulatedDecisionChoice.AllowOnce)),
+            (OutboundGateMessageTypes.SimulatedDecisionResult, new SimulatedDecisionResultMessage(1, 3, sample.ChallengeId, SimulatedDecisionChoice.RememberFor30Days, SimulatedDecisionItemState.FailedOpen, "ticket-failed-open", true, sample.RuleOutcome, false, 4)),
+            (OutboundGateMessageTypes.RevokeSimulatedRememberedRule, new RevokeSimulatedRememberedRuleMessage(1, sample.RuleId, 3)),
+            (OutboundGateMessageTypes.SimulatedRuleMutationResult, new SimulatedRuleMutationResultMessage(1, 4, sample.RuleId, 3, SimulatedRuleMutationKind.Revoke, SimulatedDecisionItemState.Revoked, "revoked", false, 5))
+        };
+        foreach (var (type, payload) in messages)
+        {
+            var envelope = MessageEnvelope.Create(type, payload, sample.CorrelationId);
+            var json = JsonSerializer.Serialize(envelope, JsonDefaults.Options);
+            var roundTripped = JsonSerializer.Deserialize<MessageEnvelope>(json, JsonDefaults.Options);
+            AssertEqual(type, roundTripped?.Type);
+            AssertEqual(sample.CorrelationId, roundTripped?.CorrelationId);
+        }
+
+        var serializedContracts = string.Join('\n', values.Select(value => JsonSerializer.Serialize(value, value.GetType(), JsonDefaults.Options)));
+        foreach (var forbidden in new[] { "VolumeId", "FileId", "RawPath", "FilePath", "Content", "Payload", "Packet", "Buffer", "TicketSecret", "AuthenticatorProof", "OneTimeTicket", "EphemeralFlowGrant", "RequestedPersistentScope", "UserDecision", "Nonce", "Caller" })
+            AssertTrue(!serializedContracts.Contains(forbidden, StringComparison.OrdinalIgnoreCase), $"Serialized UI contract exposed forbidden field {forbidden}.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSimulatedDecisionProtocolMaximumSnapshotAsync()
+    {
+        var sample = CreateSimulatedProtocolSample();
+        var maximumTime = sample.Now.AddTicks(1_234_567);
+        var maximumLabel = new string('l', SimulatedDecisionProtocolLimits.MaximumRedactedFileLabelLength);
+        var maximumVersionToken = new string('v', OutboundGateLimits.MaximumIdentifierLength);
+        var maximumDomain = MaximumCanonicalDomain();
+        var maximumReason = new string('r', OutboundGateLimits.MaximumReasonLength);
+        var maximumLimitation = new string('m', OutboundGateLimits.MaximumReasonLength);
+        var maximumPresentationText = new string('p', OutboundGateLimits.MaximumReasonLength);
+        var maximumFile = new SimulatedFileVersionProjection(1, maximumVersionToken, OutboundGateLimits.MaximumFileSizeBytes, maximumTime, maximumTime, long.MaxValue);
+        var maximumDestination = new SimulatedDestinationProjection(1, IPAddress.Parse("febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff%4294967295"), IpVersion.IPv6, 65535, TransportProtocol.Tcp, maximumDomain, DomainEvidenceProvenance.DnsObservation, maximumTime);
+        var maximumAuthorization = new SimulatedDecisionAuthorizationProjection(false, false, false, false, false, maximumReason);
+        var maximumExpiry = new SimulatedDecisionExpiryProjection(1, SimulatedDecisionProtocolLimits.MaximumDecisionRemainingMilliseconds, maximumTime, true);
+        var groupSubjects = Enumerable.Range(0, SimulatedDecisionProtocolLimits.MaximumPromptCount / SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject)
+            .Select(index => CreateMaximumGroupSubject(maximumTime, index))
+            .ToArray();
+        var prompts = groupSubjects
+            .SelectMany((subject, groupIndex) => Enumerable.Range(0, SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject)
+                .Select(promptIndex => CreateMaximumPrompt(maximumFile, maximumDestination, subject, maximumExpiry, groupIndex * SimulatedDecisionProtocolLimits.MaximumPromptsPerSubject + promptIndex, MaximumApplicationIdentity(groupIndex), maximumLabel, maximumReason, maximumLimitation)))
+            .ToArray();
+        var rules = Enumerable.Range(0, SimulatedDecisionProtocolLimits.MaximumRememberedRuleCount)
+            .Select(index => CreateRule(maximumTime, maximumFile, maximumDestination, index, MaximumApplicationIdentity(100 + index / SimulatedDecisionProtocolLimits.MaximumRememberedRulesPerApplication), maximumLabel, maximumReason))
+            .ToArray();
+        var reconnectNotices = Enumerable.Range(0, SimulatedDecisionProtocolLimits.MaximumReconnectNoticeCount)
+            .Select(index => new SimulatedReconnectRequiredProjection(1, StableGuid("41000000", index + 1), maximumLabel, maximumFile, MaximumApplicationIdentity(200 + index), groupSubjects[index % groupSubjects.Length], maximumDestination, maximumReason, maximumLimitation, maximumTime, MaximumOrderedRevision(index, SimulatedDecisionProtocolLimits.MaximumReconnectNoticeCount)))
+            .ToArray();
+        var statuses = Enumerable.Range(0, SimulatedDecisionProtocolLimits.MaximumStatusCount)
+            .Select(index => new SimulatedGateStatusProjection(1, StableGuid("51000000", index + 1), GateRuntimeState.Blocked, maximumReason, maximumTime, false, OutboundGateLimits.MaximumDiagnosticCounter, OutboundGateLimits.MaximumDiagnosticCounter, MaximumOrderedRevision(index, SimulatedDecisionProtocolLimits.MaximumStatusCount)))
+            .ToArray();
+        var alerts = Enumerable.Range(0, SimulatedDecisionProtocolLimits.MaximumCriticalAlertCount)
+            .Select(index => new SimulatedCriticalAlertProjection(1, StableGuid("61000000", index + 1), StableGuid("62000000", index + 1), groupSubjects[index % groupSubjects.Length], maximumReason, maximumTime, OutboundGateLimits.MaximumDiagnosticCounter, OutboundGateLimits.MaximumDiagnosticCounter, false, maximumPresentationText, MaximumOrderedRevision(index, SimulatedDecisionProtocolLimits.MaximumCriticalAlertCount)))
+            .ToArray();
+        var capacity = new SimulatedDecisionCapacitySnapshot(2, 2, 8, 8, 2, 2, 256, 256);
+        var snapshot = new SimulatedDecisionSnapshotMessage(1, long.MaxValue, true, maximumAuthorization, prompts, reconnectNotices, rules, statuses, alerts, capacity, new SimulatedDecisionCounterSnapshot(OutboundGateLimits.MaximumDiagnosticCounter, OutboundGateLimits.MaximumDiagnosticCounter, OutboundGateLimits.MaximumDiagnosticCounter, OutboundGateLimits.MaximumDiagnosticCounter));
+        var envelope = MessageEnvelope.Create(OutboundGateMessageTypes.SimulatedDecisionSnapshot, snapshot, sample.CorrelationId);
+        var serialized = JsonSerializer.SerializeToUtf8Bytes(envelope, JsonDefaults.Options);
+        AssertTrue(prompts.Length == SimulatedDecisionProtocolLimits.MaximumPromptCount, "Maximum prompt snapshot was not constructed.");
+        AssertTrue(rules.Length == SimulatedDecisionProtocolLimits.MaximumRememberedRuleCount, "Maximum remembered-rule snapshot was not constructed.");
+        AssertEqual(SimulatedDecisionProtocolLimits.MaximumReconnectNoticeCount, reconnectNotices.Length);
+        AssertEqual(SimulatedDecisionProtocolLimits.MaximumStatusCount, statuses.Length);
+        AssertEqual(SimulatedDecisionProtocolLimits.MaximumCriticalAlertCount, alerts.Length);
+        AssertTrue(snapshot.SimulationEnabled, "A maximum snapshot with active prompts must keep simulation enabled.");
+        AssertTrue(!snapshot.Authorization.CanView && !snapshot.Authorization.CanAllowOnce && !snapshot.Authorization.CanRememberFor30Days && !snapshot.Authorization.CanBlockCurrent && !snapshot.Authorization.CanRevoke, "Maximum authorization booleans must use the longer valid false representation.");
+        AssertTrue(prompts.All(prompt => prompt.FileVersion.Usn is not null && prompt.Destination.DomainEvidence is not null && prompt.Destination.DomainObservedAtUtc is not null && prompt.LimitationReason?.Length == OutboundGateLimits.MaximumReasonLength), "Maximum prompts did not populate every optional bounded field.");
+        AssertEqual(4_294_967_295L, maximumDestination.Address.ScopeId);
+        AssertEqual(50, maximumDestination.Address.ToString().Length);
+        AssertTrue(reconnectNotices.All(notice => notice.LimitationReason?.Length == OutboundGateLimits.MaximumReasonLength && notice.Revision >= long.MaxValue - SimulatedDecisionProtocolLimits.MaximumReconnectNoticeCount), "Maximum reconnect notices did not populate optional text and 19-digit revisions.");
+        AssertTrue(statuses.All(status => !status.TrafficFailedOpen && status.State == GateRuntimeState.Blocked && status.IntentId is not null && status.Revision >= long.MaxValue - SimulatedDecisionProtocolLimits.MaximumStatusCount), "Maximum statuses must use a compatible non-fail-open state, present IntentId and 19-digit revisions.");
+        AssertTrue(alerts.All(alert => !alert.TrafficFailedOpen && alert.PresentationText.Length == OutboundGateLimits.MaximumReasonLength && alert.IntentId is not null && alert.Subject is not null && alert.Revision >= long.MaxValue - SimulatedDecisionProtocolLimits.MaximumCriticalAlertCount), "Maximum alerts must use non-fail-open semantics, maximum presentation text, present optionals and 19-digit revisions.");
+        const string allowedWireCharacters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ._():-";
+        _ = new SimulatedDecisionAuthorizationProjection(true, false, false, false, false, allowedWireCharacters);
+        AssertEqual(allowedWireCharacters.Length + 2, JsonSerializer.SerializeToUtf8Bytes(allowedWireCharacters, JsonDefaults.Options).Length);
+        Console.WriteLine($"INFO  Phase 5B-05 maximum snapshot envelope bytes: {serialized.Length}");
+        AssertEqual(908_824, serialized.Length);
+        AssertTrue(serialized.Length < ProtocolConstants.MaximumMessageBytes, "Maximum simulated-decision snapshot exceeded the framing limit.");
+        AssertTrue(ProtocolConstants.MaximumMessageBytes - serialized.Length >= 131_072, "Maximum simulated-decision snapshot did not retain the locked 128 KiB reserve.");
+        return Task.CompletedTask;
+    }
+
+    private static SimulatedDecisionPromptProjection CreatePrompt(SimulatedProtocolSample sample, SimulatedSubjectProjection subject, int index, string applicationIdentity) =>
+        new(1, StableGuid("13000000", index + 1), StableGuid("23000000", index + 1), "report.txt", sample.File, applicationIdentity, subject, sample.Destination, false, GateRuntimeState.AwaitingDecision, "awaiting-decision", "Simulation", sample.ActiveExpiry, index + 1);
+
+    private static SimulatedDecisionPromptProjection CreateMaximumPrompt(SimulatedFileVersionProjection file, SimulatedDestinationProjection destination, SimulatedSubjectProjection subject, SimulatedDecisionExpiryProjection expiry, int index, string applicationIdentity, string label, string reason, string limitation) =>
+        new(1, StableGuid("11000000", index + 1), StableGuid("12000000", index + 1), label, file, applicationIdentity, subject, destination, false, GateRuntimeState.AwaitingDecision, reason, limitation, expiry, long.MaxValue - index);
+
+    private static SimulatedRememberedRuleProjection CreateRule(SimulatedProtocolSample sample, int index, string applicationIdentity) =>
+        new(1, StableGuid("31000000", index + 1), "report.txt", sample.File, applicationIdentity, sample.Destination, sample.Now, sample.Now.AddDays(30).AddSeconds(index), SimulatedDecisionItemState.Remembered, "remembered", index + 1);
+
+    private static SimulatedRememberedRuleProjection CreateRule(DateTimeOffset now, SimulatedFileVersionProjection file, SimulatedDestinationProjection destination, int index, string applicationIdentity, string label, string reason) =>
+        new(1, StableGuid("31000000", index + 1), label, file, applicationIdentity, destination, now, now.AddDays(30).AddSeconds(index), SimulatedDecisionItemState.Remembered, reason, long.MaxValue - index);
+
+    private static SimulatedSubjectProjection CreateMaximumGroupSubject(DateTimeOffset now, int index)
+    {
+        var members = Enumerable.Range(0, SimulatedDecisionProtocolLimits.MaximumGroupMembers)
+            .Select(memberIndex => new ProcessIdentity(1_000_000_000 + index * SimulatedDecisionProtocolLimits.MaximumGroupMembers + memberIndex, now.AddSeconds(index * 60 + memberIndex)))
+            .ToArray();
+        return new SimulatedSubjectProjection(1, SimulatedDecisionSubjectKind.ExactProcessGroup, members[0], StableGuid("71000000", index + 1), members, true, SimulatedDecisionProtocolLimits.GroupCollateralWarning);
+    }
+
+    private static Guid StableGuid(string prefix, int value) => Guid.Parse($"{prefix}-0000-0000-0000-{value:D12}");
+
+    private static string MaximumApplicationIdentity(int value)
+    {
+        var prefix = $"app-{value:D4}-";
+        return prefix + new string('a', OutboundGateLimits.MaximumIdentifierLength - prefix.Length);
+    }
+
+    private static string MaximumCanonicalDomain() => string.Join('.', new string('d', 63), new string('d', 63), new string('d', 63), new string('d', 61));
+
+    private static long MaximumOrderedRevision(int index, int count) => long.MaxValue - count + 1 + index;
+
+    private static SimulatedProtocolSample CreateSimulatedProtocolSample()
+    {
+        var now = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var process = new ProcessIdentity(42, now);
+        var groupMember = new ProcessIdentity(43, now.AddSeconds(1));
+        var processSubject = new SimulatedSubjectProjection(1, SimulatedDecisionSubjectKind.ExactProcess, process, null, [process], false, null);
+        var groupSubject = new SimulatedSubjectProjection(1, SimulatedDecisionSubjectKind.ExactProcessGroup, process, Guid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"), [process, groupMember], true, SimulatedDecisionProtocolLimits.GroupCollateralWarning);
+        var file = new SimulatedFileVersionProjection(1, "version-token-1", 512, now, now.AddSeconds(1), 7);
+        var destination = new SimulatedDestinationProjection(1, IPAddress.Loopback, IpVersion.IPv4, 5050, TransportProtocol.Tcp, "localhost", DomainEvidenceProvenance.DnsObservation, now);
+        var activeExpiry = new SimulatedDecisionExpiryProjection(1, 15_000, now, true);
+        var closedExpiry = new SimulatedDecisionExpiryProjection(1, 0, now, false);
+        var prompt = new SimulatedDecisionPromptProjection(1, Guid.Parse("10000000-0000-0000-0000-000000000001"), Guid.Parse("20000000-0000-0000-0000-000000000002"), "report.txt", file, "sha256:application", processSubject, destination, false, GateRuntimeState.AwaitingDecision, "awaiting-decision", "Simulation", activeExpiry, 1);
+        var reconnect = new SimulatedReconnectRequiredProjection(1, prompt.IntentId, "report.txt", file, "sha256:application", processSubject, destination, "reconnect-required", "Simulation", now, 2);
+        var rule = new SimulatedRememberedRuleProjection(1, Guid.Parse("30000000-0000-0000-0000-000000000003"), "report.txt", file, "sha256:application", destination, now, now.AddDays(30), SimulatedDecisionItemState.Remembered, "remembered", 3);
+        var status = new SimulatedGateStatusProjection(1, prompt.IntentId, GateRuntimeState.FailedOpen, "ticket-failed-open", now, true, 0, 0, 4);
+        var alert = new SimulatedCriticalAlertProjection(1, Guid.Parse("40000000-0000-0000-0000-000000000004"), prompt.IntentId, groupSubject, "ticket-failed-open", now, 0, 0, true, SimulatedDecisionProtocolLimits.FailOpenPresentationText, 5);
+        var authorization = new SimulatedDecisionAuthorizationProjection(true, true, true, true, true, "authorized");
+        var capacity = new SimulatedDecisionCapacitySnapshot(0, 2, 0, 8, 0, 2, 0, 256);
+        var counters = new SimulatedDecisionCounterSnapshot(0, 0, 0, 0);
+        var outcome = new SimulatedRememberedRuleOutcome(rule.RuleId, rule.Revision, SimulatedDecisionItemState.Remembered, "remembered");
+        return new SimulatedProtocolSample(now, process, groupMember, groupSubject, file, destination, activeExpiry, closedExpiry, prompt, reconnect, rule, status, alert, authorization, capacity, counters, outcome, prompt.ChallengeId, prompt.IntentId, rule.RuleId, alert.AlertId, Guid.Parse("50000000-0000-0000-0000-000000000005"));
+    }
+
+    private sealed record SimulatedProtocolSample(
+        DateTimeOffset Now,
+        ProcessIdentity Process,
+        ProcessIdentity GroupMember,
+        SimulatedSubjectProjection GroupSubject,
+        SimulatedFileVersionProjection File,
+        SimulatedDestinationProjection Destination,
+        SimulatedDecisionExpiryProjection ActiveExpiry,
+        SimulatedDecisionExpiryProjection ClosedExpiry,
+        SimulatedDecisionPromptProjection Prompt,
+        SimulatedReconnectRequiredProjection Reconnect,
+        SimulatedRememberedRuleProjection Rule,
+        SimulatedGateStatusProjection Status,
+        SimulatedCriticalAlertProjection Alert,
+        SimulatedDecisionAuthorizationProjection Authorization,
+        SimulatedDecisionCapacitySnapshot Capacity,
+        SimulatedDecisionCounterSnapshot Counters,
+        SimulatedRememberedRuleOutcome RuleOutcome,
+        Guid ChallengeId,
+        Guid IntentId,
+        Guid RuleId,
+        Guid AlertId,
+        Guid CorrelationId)
+    {
+        public SimulatedSubjectProjection ProcessSubject => Prompt.Subject;
     }
 
     private static Task TestOutboundGateContractRoundTripAsync()
