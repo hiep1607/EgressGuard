@@ -11,12 +11,14 @@
 
     The script stops at the first failing step and exits with that step's
     exit code. It determines the repository root from its own location,
-    requires no administrator rights, changes no firewall, Defender,
-    registry, service or user data state, never modifies source or other
-    Git-tracked files, performs no network calls of its own, and never uses
-    Invoke-Expression or command lines composed from untrusted data. Tool
-    restore, build and tests may create Git-ignored bin/obj artifacts.
-    Matched secret values are never printed.
+    requires no administrator rights and no GitHub access token, never
+    reads or updates GitHub issues, and changes no firewall, Defender,
+    registry, service or user data state. It never modifies source or
+    other Git-tracked files and never uses Invoke-Expression or command
+    lines composed from untrusted data. The tool restore, locked restore
+    and vulnerable-package audit steps may reach NuGet over the network;
+    tool restore, build and tests may create Git-ignored bin/obj
+    artifacts. Matched secret values are never printed.
 
 .PARAMETER RequireClean
     Requires the working tree to be clean at the end of the run, including
@@ -184,18 +186,18 @@ if ($RequireClean) {
     $trackedChanges = @(git status --porcelain | Where-Object { $_ -notmatch '^\?\?' })
     if ($trackedChanges.Count -gt 0) {
         Write-Host ''
-        Write-Host '[fail] -RequireClean: unexpected tracked changes appeared during validation:'
+        Write-Host '[fail] -RequireClean: Git-tracked changes were present at the end of validation:'
         foreach ($change in $trackedChanges) {
             Write-Host ('       ' + $change)
         }
-        $script:StepResults.Add(('FAIL -RequireClean (' + $trackedChanges.Count + ' tracked change(s))'))
+        $script:StepResults.Add(('FAIL -RequireClean (' + $trackedChanges.Count + ' Git-tracked change(s) present at the end of validation)'))
         $script:FailedStepName = '-RequireClean tracked-change check'
         $script:FailedStepCode = 10
         Write-SummaryAndExit -ExitCode 10
     }
-    $script:StepResults.Add('ok   -RequireClean (no tracked changes appeared)')
+    $script:StepResults.Add('ok   -RequireClean (no Git-tracked changes at the end of validation)')
     Write-Host ''
-    Write-Host '[ok  ] -RequireClean: no tracked changes appeared during validation'
+    Write-Host '[ok  ] -RequireClean: no Git-tracked changes were present at the end of validation'
 }
 
 Write-SummaryAndExit -ExitCode 0

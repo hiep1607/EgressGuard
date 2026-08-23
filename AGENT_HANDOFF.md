@@ -25,7 +25,7 @@ The coordination issue body must stay within:
 - Only the 5 most recent completed sessions; delete the oldest when adding the sixth.
 - No secrets, long logs, dumps, personal data or machine-local paths.
 
-Git keeps the full history of removed sessions.
+Removed sessions are not relied upon afterwards; the current Git/GitHub state remains the authoritative evidence.
 
 ## Report template
 
@@ -45,7 +45,9 @@ Status is IN_PROGRESS, READY_FOR_REVIEW or BLOCKED.
 
 Before writing to the coordination issue:
 
-1. Reload its body and note the newest "Updated UTC" you find there.
-2. If another agent changed it during your session and the change contradicts your plan, stop and coordinate instead of overwriting.
-3. Append only your own session entry; never rewrite other agents' entries.
-4. Never force-push branches to erase another agent's records.
+1. Reload its body and read the `Updated UTC` line at its top.
+2. Compare it with the issue's GitHub `updated_at` timestamp; a mismatch means someone wrote in between.
+3. If another agent changed it during your session and the change contradicts your plan, stop and coordinate instead of overwriting.
+4. Set a fresh `Updated UTC` (current UTC) in every update you save.
+5. Append only your own session entry; never rewrite other agents' entries.
+6. Never force-push branches to erase another agent's records.

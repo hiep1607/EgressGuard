@@ -37,7 +37,7 @@ Run the complete local validation with one command (tool restore, locked restore
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\Validate-EgressGuard.ps1 -RequireClean
 ```
 
-The script requires no administrator rights and touches no firewall, Defender, registry or service state. It never modifies source or other Git-tracked files, but tool restore, build and tests create Git-ignored `bin/`, `obj/` and package-cache artifacts. Details are in the [testing guide](docs/testing.md). It covers the default test suite only; the opt-in Administrator Windows scenarios remain separate tasks.
+The script requires no administrator rights, neither reads nor updates GitHub issues, and needs no GitHub access token. It touches no firewall, Defender, registry or service state and never modifies source or other Git-tracked files, while `dotnet tool restore`, `dotnet restore` and the package audit may reach NuGet over the network, and restore/build/tests create Git-ignored `bin/`, `obj/` and package-cache artifacts. Details are in the [testing guide](docs/testing.md). It covers the default test suite only; the opt-in Administrator Windows scenarios remain separate tasks.
 
 `-RequireClean` requires the working tree to be clean when the run ends, including tracked changes that already existed before the run; untracked and Git-ignored output never counts. Omit it while actively developing; always pass it in CI and whenever verifying a supposedly clean checkout.
 
