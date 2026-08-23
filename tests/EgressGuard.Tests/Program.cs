@@ -225,6 +225,14 @@ internal static class Program
             ("Phase 5B-04 deterministic driver simulator acceptance suite", TestOutboundGateSimulatorAcceptanceAsync),
             ("Default UI clients honor configured pipe name", TestConfiguredPipeNameAsync),
             ("File correlation IPC stays compatible and bounded", TestFileCorrelationProtocolAsync),
+            ("File tracking preference contract is boolean and legacy compatible", TestFileCorrelationPreferenceContractAsync),
+            ("File tracking preference persistence is explicit idempotent and toggleable", TestFileCorrelationPreferencePersistenceAsync),
+            ("File tracking preference save does not change active state", TestFileCorrelationPreferenceActiveStateAsync),
+            ("File tracking preference reports restart requirement exactly", TestFileCorrelationPreferenceRestartAsync),
+            ("File tracking preference database failure cannot report success", TestFileCorrelationPreferenceFailureAsync),
+            ("File tracking preference remains visible when the UI is reopened", TestFileCorrelationPreferenceUiReopenAsync),
+            ("File tracking preference matches active state after restart", TestFileCorrelationPreferenceRestartApplyAsync),
+            ("Local startup script isolates data pipe and owned process cleanup", TestLocalStartupScriptAsync),
             ("UI correlation refresh coalesces updates and cancels stale selection", TestUiCorrelationRefreshAsync),
             ("Protocol rejects oversized message", TestOversizedMessageAsync),
             ("Protocol handles disconnect", TestProtocolDisconnectAsync),
@@ -6413,6 +6421,131 @@ internal static class Program
         var legacyJson = """{"mode":1,"isRunning":true,"activeFlowCount":0,"droppedEvents":0,"databasePath":"test.db","timestamp":"2026-01-01T00:00:00Z"}""";
         var legacyStatus = System.Text.Json.JsonSerializer.Deserialize<ServiceStatusMessage>(legacyJson, JsonDefaults.Options);
         AssertTrue(legacyStatus is not null && legacyStatus.FileSensor is null && !legacyStatus.FileCorrelationEnabled, "Legacy status payload was not backward compatible.");
+    }
+
+    private static Task TestFileCorrelationPreferenceContractAsync()
+    {
+        var request = new SetFileCorrelationPreferenceMessage(true);
+        var requestJson = JsonSerializer.Serialize(request, JsonDefaults.Options);
+        var roundTrip = JsonSerializer.Deserialize<SetFileCorrelationPreferenceMessage>(requestJson, JsonDefaults.Options);
+        AssertTrue(roundTrip is not null && roundTrip.Enabled, "The preference request did not round-trip its boolean value.");
+        AssertEqual(typeof(bool), typeof(SetFileCorrelationPreferenceMessage).GetProperty(nameof(SetFileCorrelationPreferenceMessage.Enabled))!.PropertyType);
+        AssertEqual(1, typeof(SetFileCorrelationPreferenceMessage).GetProperties().Length);
+        AssertEqual(3, typeof(FileCorrelationPreferenceResultMessage).GetProperties().Length);
+
+        var legacy = JsonSerializer.Deserialize<FileCorrelationPreferenceResultMessage>("{\"SavedEnabled\":true}", JsonDefaults.Options);
+        AssertTrue(legacy is not null && legacy.SavedEnabled && !legacy.ActiveEnabled && !legacy.RestartRequired, "A legacy preference projection was not tolerant of appended fields.");
+        _ = JsonSerializer.Deserialize<GetFileCorrelationPreferenceMessage>("{}", JsonDefaults.Options);
+        return Task.CompletedTask;
+    }
+
+    private static async Task TestFileCorrelationPreferencePersistenceAsync()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "EgressGuard-FilePreference-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var database = new EgressGuardDatabase(Path.Combine(directory, "settings.db"));
+            await database.InitializeAsync().ConfigureAwait(false);
+            AssertEqual(null, await database.GetFileCorrelationPreferenceAsync().ConfigureAwait(false));
+            await database.SetFileCorrelationPreferenceAsync(true).ConfigureAwait(false);
+            await database.SetFileCorrelationPreferenceAsync(true).ConfigureAwait(false);
+            AssertEqual(true, await database.GetFileCorrelationPreferenceAsync().ConfigureAwait(false));
+            await database.SetFileCorrelationPreferenceAsync(false).ConfigureAwait(false);
+            await database.SetFileCorrelationPreferenceAsync(false).ConfigureAwait(false);
+            AssertEqual(false, await database.GetFileCorrelationPreferenceAsync().ConfigureAwait(false));
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    private static async Task TestFileCorrelationPreferenceActiveStateAsync()
+    {
+        var active = false;
+        var saved = false;
+        var result = await FileCorrelationPreferenceCoordinator.SaveAsync(
+            true,
+            active,
+            (enabled, _) =>
+            {
+                saved = enabled;
+                return Task.CompletedTask;
+            },
+            CancellationToken.None).ConfigureAwait(false);
+        AssertTrue(saved && result.SavedEnabled, "Saving true did not persist the requested value.");
+        AssertTrue(!result.ActiveEnabled && !active, "Saving a preference changed the active Service state.");
+        AssertTrue(result.RestartRequired, "Saving a value different from active did not require restart.");
+    }
+
+    private static Task TestFileCorrelationPreferenceRestartAsync()
+    {
+        var active = false;
+        AssertTrue(FileCorrelationPreferenceCoordinator.Read(true, active).RestartRequired, "Pending enable did not require restart.");
+        AssertTrue(!FileCorrelationPreferenceCoordinator.Read(false, active).RestartRequired, "Saving the active disable state incorrectly required restart.");
+        AssertTrue(!FileCorrelationPreferenceCoordinator.Read(null, active).RestartRequired, "An unset legacy preference incorrectly required restart.");
+        return Task.CompletedTask;
+    }
+
+    private static async Task TestFileCorrelationPreferenceFailureAsync()
+    {
+        var active = false;
+        var successReported = false;
+        await AssertThrowsAsync<InvalidOperationException>(async () =>
+        {
+            _ = await FileCorrelationPreferenceCoordinator.SaveAsync(
+                true,
+                active,
+                (_, _) => Task.FromException(new InvalidOperationException("controlled database failure")),
+                CancellationToken.None).ConfigureAwait(false);
+            successReported = true;
+        }).ConfigureAwait(false);
+        AssertTrue(!successReported && !active, "A failed preference write produced success or changed active state.");
+    }
+
+    private static async Task TestFileCorrelationPreferenceUiReopenAsync()
+    {
+        await RunStaAsync(async () =>
+        {
+            await using var requestSession = new MainWindowRequestSession($"{ProtocolConstants.PipeName}.PreferenceUi.{Guid.NewGuid():N}");
+            await using var first = new MainWindowViewModel(requestSession, pipeName: null);
+            first.UpdateFileCorrelationPreference(new FileCorrelationPreferenceResultMessage(true, false, true));
+            AssertTrue(first.FileCorrelationPreferenceEnabled && first.FileCorrelationSavedStatus.Contains("enabled", StringComparison.OrdinalIgnoreCase), "The first UI session did not show the saved enable choice.");
+            AssertTrue(first.FileCorrelationRestartStatus.Contains("restart required", StringComparison.OrdinalIgnoreCase), "The first UI session hid the pending restart.");
+
+            await using var reopened = new MainWindowViewModel(requestSession, pipeName: null);
+            reopened.UpdateFileCorrelationPreference(new FileCorrelationPreferenceResultMessage(true, false, true));
+            AssertTrue(reopened.FileCorrelationPreferenceEnabled && reopened.FileCorrelationSavedStatus.Contains("enabled", StringComparison.OrdinalIgnoreCase), "The reopened UI session lost the saved choice.");
+            AssertTrue(reopened.FileCorrelationActiveStatus.Contains("disabled", StringComparison.OrdinalIgnoreCase), "The reopened UI session confused saved and active state.");
+        }).ConfigureAwait(false);
+    }
+
+    private static Task TestFileCorrelationPreferenceRestartApplyAsync()
+    {
+        var saved = true;
+        var afterRestart = FileCorrelationPreferenceCoordinator.Read(saved, activeEnabled: saved);
+        AssertTrue(afterRestart.SavedEnabled && afterRestart.ActiveEnabled && !afterRestart.RestartRequired, "A restarted Service did not apply the saved choice.");
+        saved = false;
+        afterRestart = FileCorrelationPreferenceCoordinator.Read(saved, activeEnabled: saved);
+        AssertTrue(!afterRestart.SavedEnabled && !afterRestart.ActiveEnabled && !afterRestart.RestartRequired, "A restarted Service did not apply the saved disable choice.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestLocalStartupScriptAsync()
+    {
+        var repository = new DirectoryInfo(AppContext.BaseDirectory);
+        while (repository is not null && !File.Exists(Path.Combine(repository.FullName, "AGENTS.md")))
+            repository = repository.Parent;
+        AssertTrue(repository is not null, "Could not locate the repository for local startup script checks.");
+        var script = File.ReadAllText(Path.Combine(repository!.FullName, "tools", "Start-EgressGuardLocal.ps1"));
+        foreach (var required in new[] { "$dataRoot", "EgressGuard.Local.", "ReadyTimeoutSeconds", "Wait-ForLocalPipe", "Get-DescendantProcesses", "Stop-OwnedProcessTree" })
+            AssertTrue(script.Contains(required, StringComparison.Ordinal), $"Local startup script is missing '{required}'.");
+        foreach (var forbidden in new[] { "New-Service", "Install-WindowsService", "sc.exe create", "Set-NetFirewall", "New-NetFirewall", "Set-ItemProperty", "reg.exe", "Set-MpPreference", "Add-MpPreference" })
+            AssertTrue(!script.Contains(forbidden, StringComparison.OrdinalIgnoreCase), $"Local startup script contains forbidden command '{forbidden}'.");
+        AssertTrue(script.Contains("$Root.Kill($true)", StringComparison.Ordinal), "Local startup script does not clean its owned process tree.");
+        return Task.CompletedTask;
     }
 
     private static async Task TestUiCorrelationRefreshAsync()

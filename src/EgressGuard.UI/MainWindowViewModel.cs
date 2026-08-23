@@ -42,6 +42,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     private string _observedFileSensorStatus = "File correlation status unavailable";
     private FileSensorState? _fileSensorState;
     private bool _fileCorrelationEnabled;
+    private bool _fileCorrelationPreferenceEnabled;
+    private bool _fileCorrelationSavedEnabled;
+    private bool _fileCorrelationRestartRequired;
     private bool _fileCorrelationLoading;
     private bool _fileCorrelationLoadFailed;
     private bool _disposed;
@@ -79,6 +82,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         UndoRuleCommand = new AsyncCommand(UndoRuleAsync);
         ResetRulesCommand = new AsyncCommand(() => ConfirmAndSendAsync("Reset every EgressGuard-owned firewall rule?", MessageTypes.ResetOwnedRules, new { }));
         ApplyModeCommand = new AsyncCommand(() => SendMutationAsync(MessageTypes.SetProtectionMode, new SetProtectionModeMessage(ProtectionMode)));
+        SaveFileCorrelationPreferenceCommand = new AsyncCommand(SaveFileCorrelationPreferenceAsync);
         ClearHistoryCommand = new AsyncCommand(() => ConfirmAndSendAsync("Delete local flow and alert history?", MessageTypes.ClearHistory, new { }));
         ResetBaselineCommand = new AsyncCommand(() => SendMutationAsync(MessageTypes.ResetBaseline, new ResetBaselineMessage(SelectedFlow?.Flow.Executable?.Sha256)));
     }
@@ -106,6 +110,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     public ICommand UndoRuleCommand { get; }
     public ICommand ResetRulesCommand { get; }
     public ICommand ApplyModeCommand { get; }
+    public ICommand SaveFileCorrelationPreferenceCommand { get; }
     public ICommand ClearHistoryCommand { get; }
     public ICommand ResetBaselineCommand { get; }
     public int ActiveCount => Flows.Count;
@@ -117,6 +122,12 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     public string DatabasePath { get => _databasePath; private set => Set(ref _databasePath, value); }
     public string FileSensorStatus { get => _fileSensorStatus; private set => Set(ref _fileSensorStatus, value); }
     public bool FileCorrelationEnabled { get => _fileCorrelationEnabled; private set => Set(ref _fileCorrelationEnabled, value); }
+    public bool FileCorrelationPreferenceEnabled { get => _fileCorrelationPreferenceEnabled; set => Set(ref _fileCorrelationPreferenceEnabled, value); }
+    public string FileCorrelationActiveStatus => _fileCorrelationEnabled ? "Applied now: enabled" : "Applied now: disabled";
+    public string FileCorrelationSavedStatus => _fileCorrelationSavedEnabled ? "Saved choice: enabled" : "Saved choice: disabled";
+    public string FileCorrelationRestartStatus => _fileCorrelationRestartRequired
+        ? "Service restart required to apply the saved choice."
+        : "No Service restart required; the saved choice is applied.";
     public string FileCorrelationEmptyState
     {
         get
@@ -212,6 +223,23 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
             ProtectionMode = status.Mode;
             DatabasePath = status.DatabasePath;
             UpdateFileSensor(status);
+            var preferenceResponse = await _requestSession.SendAsync(
+                MessageEnvelope.Create(MessageTypes.GetFileCorrelationPreference, new GetFileCorrelationPreferenceMessage()),
+                TimeSpan.FromSeconds(3),
+                CancellationToken.None).ConfigureAwait(true);
+            if (preferenceResponse.Type == MessageTypes.GetFileCorrelationPreference)
+            {
+                UpdateFileCorrelationPreference(preferenceResponse.ReadPayload<FileCorrelationPreferenceResultMessage>());
+            }
+            else
+            {
+                // An older service has no preference endpoint. Keep the legacy
+                // active status visible without inventing a saved choice.
+                UpdateFileCorrelationPreference(new FileCorrelationPreferenceResultMessage(
+                    status.FileCorrelationEnabled,
+                    status.FileCorrelationEnabled,
+                    false));
+            }
             ServiceStatus = $"Service online · {status.Mode} · dropped {status.DroppedEvents}";
             NotifyCounts();
         }
@@ -359,6 +387,34 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         return response.ReadPayload<FileCorrelationsMessage>();
     }
 
+    private async Task SaveFileCorrelationPreferenceAsync()
+    {
+        try
+        {
+            var response = await _requestSession.SendAsync(
+                MessageEnvelope.Create(
+                    MessageTypes.SetFileCorrelationPreference,
+                    new SetFileCorrelationPreferenceMessage(FileCorrelationPreferenceEnabled)),
+                TimeSpan.FromSeconds(10),
+                CancellationToken.None).ConfigureAwait(true);
+            if (response.Type == MessageTypes.Error)
+            {
+                LastOperation = response.ReadPayload<ErrorMessage>().Message;
+                return;
+            }
+
+            var result = response.ReadPayload<FileCorrelationPreferenceResultMessage>();
+            UpdateFileCorrelationPreference(result);
+            LastOperation = result.RestartRequired
+                ? "File activity tracking choice saved. Service restart required to apply it."
+                : "File activity tracking choice saved and is applied.";
+        }
+        catch (Exception exception)
+        {
+            LastOperation = exception.Message;
+        }
+    }
+
     private void ApplyFileCorrelations(string flowId, FileCorrelationsMessage payload)
     {
         var selectedFlowId = SelectedFlow?.Flow.Id;
@@ -400,9 +456,21 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     internal void UpdateFileSensor(ServiceStatusMessage status)
     {
         FileCorrelationEnabled = status.FileCorrelationEnabled;
+        OnPropertyChanged(nameof(FileCorrelationActiveStatus));
         _fileSensorState = status.FileSensor?.State;
         _observedFileSensorStatus = status.FileSensor is null ? "File correlation status unavailable" : FormatFileSensor(status.FileSensor);
         RefreshFileCorrelationPresentation();
+    }
+
+    internal void UpdateFileCorrelationPreference(FileCorrelationPreferenceResultMessage result)
+    {
+        FileCorrelationEnabled = result.ActiveEnabled;
+        FileCorrelationPreferenceEnabled = result.SavedEnabled;
+        if (Set(ref _fileCorrelationSavedEnabled, result.SavedEnabled))
+            OnPropertyChanged(nameof(FileCorrelationSavedStatus));
+        if (Set(ref _fileCorrelationRestartRequired, result.RestartRequired))
+            OnPropertyChanged(nameof(FileCorrelationRestartStatus));
+        OnPropertyChanged(nameof(FileCorrelationActiveStatus));
     }
 
     private void RefreshFileCorrelationPresentation()

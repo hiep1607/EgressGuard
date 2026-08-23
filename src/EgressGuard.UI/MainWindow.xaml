@@ -144,7 +144,18 @@
                     <TextBlock Text="Retention (days)"/><TextBox Text="{Binding RetentionDays}" />
                     <TextBlock Text="Database"/><TextBlock Text="{Binding DatabasePath}" TextWrapping="Wrap" Margin="4,8" />
                     <CheckBox Content="Enable notifications" IsChecked="{Binding NotificationsEnabled}" Foreground="#E8EEF5" Margin="4,12" />
-                    <WrapPanel><Button Content="Apply mode" Command="{Binding ApplyModeCommand}"/><Button Content="Clear history" Command="{Binding ClearHistoryCommand}"/><Button Content="Reset baseline" Command="{Binding ResetBaselineCommand}"/></WrapPanel>
+                    <Separator Margin="0,12,0,12" />
+                    <TextBlock Text="Enable file activity tracking" FontSize="16" FontWeight="SemiBold" />
+                    <TextBlock Text="This choice is saved for the next Service start; the running tracker is not changed here." Foreground="#B9C9D8" TextWrapping="Wrap" Margin="0,4,0,8" />
+                    <CheckBox Content="Enable file activity tracking" IsChecked="{Binding FileCorrelationPreferenceEnabled}" Foreground="#E8EEF5" Margin="4,4,4,8"
+                              AutomationProperties.AutomationId="FileCorrelationPreferenceToggle" />
+                    <TextBlock Text="{Binding FileCorrelationActiveStatus}" Foreground="#E8EEF5" AutomationProperties.AutomationId="FileCorrelationActiveStatus" />
+                    <TextBlock Text="{Binding FileCorrelationSavedStatus}" Foreground="#E8EEF5" AutomationProperties.AutomationId="FileCorrelationSavedStatus" />
+                    <TextBlock Text="{Binding FileCorrelationRestartStatus}" Foreground="#FFD166" TextWrapping="Wrap" Margin="0,2,0,8"
+                               AutomationProperties.AutomationId="FileCorrelationRestartStatus" />
+                    <Button Content="Save file tracking choice" Command="{Binding SaveFileCorrelationPreferenceCommand}" HorizontalAlignment="Left"
+                            AutomationProperties.AutomationId="SaveFileCorrelationPreferenceButton" />
+                    <WrapPanel Margin="0,12,0,0"><Button Content="Apply mode" Command="{Binding ApplyModeCommand}"/><Button Content="Clear history" Command="{Binding ClearHistoryCommand}"/><Button Content="Reset baseline" Command="{Binding ResetBaselineCommand}"/></WrapPanel>
                 </StackPanel>
             </TabItem>
             <TabItem Header="Simulation Decisions" AutomationProperties.AutomationId="SimulationDecisionTab"

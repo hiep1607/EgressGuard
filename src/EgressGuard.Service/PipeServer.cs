@@ -229,7 +229,7 @@ public sealed partial class PipeServer : BackgroundService
         if (IsSimulatedDecisionRequest(request.Type))
             return DispatchSimulatedDecision(pipe, request);
 
-        if (IsMutating(request.Type) && !IsAdministratorClient(pipe))
+        if (RequiresAdministrator(request.Type) && !IsAdministratorClient(pipe))
         {
             throw new UnauthorizedAccessException("The connected Windows identity is not authorized to modify protection state.");
         }
@@ -248,6 +248,22 @@ public sealed partial class PipeServer : BackgroundService
                 return MessageEnvelope.Create(
                     MessageTypes.ServiceStatusChanged,
                     new ServiceStatusMessage(_state.Mode, true, _state.ActiveFlowCount, _state.DroppedEvents, _database.DatabasePath, DateTimeOffset.UtcNow, _state.FileSensorStatus, _state.FileCorrelationEnabled),
+                    request.CorrelationId);
+            case MessageTypes.GetFileCorrelationPreference:
+                var savedPreference = await _database.GetFileCorrelationPreferenceAsync(cancellationToken).ConfigureAwait(false);
+                return MessageEnvelope.Create(
+                    MessageTypes.GetFileCorrelationPreference,
+                    FileCorrelationPreferenceCoordinator.Read(savedPreference, _state.FileCorrelationEnabled),
+                    request.CorrelationId);
+            case MessageTypes.SetFileCorrelationPreference:
+                var requestedPreference = request.ReadPayload<SetFileCorrelationPreferenceMessage>().Enabled;
+                return MessageEnvelope.Create(
+                    MessageTypes.SetFileCorrelationPreference,
+                    await FileCorrelationPreferenceCoordinator.SaveAsync(
+                        requestedPreference,
+                        _state.FileCorrelationEnabled,
+                        _database.SetFileCorrelationPreferenceAsync,
+                        cancellationToken).ConfigureAwait(false),
                     request.CorrelationId);
             case MessageTypes.GetActiveFlows:
                 return MessageEnvelope.Create(MessageTypes.GetActiveFlows, new ActiveFlowsMessage(_state.Snapshot(), _eventHub.CurrentSequence), request.CorrelationId);
@@ -311,7 +327,7 @@ public sealed partial class PipeServer : BackgroundService
         }
     }
 
-    private static bool IsMutating(string type) => type is MessageTypes.CreateRule
+    private static bool RequiresAdministrator(string type) => type is MessageTypes.CreateRule
         or MessageTypes.DeleteRule
         or MessageTypes.SetProtectionMode
         or MessageTypes.ResetOwnedRules

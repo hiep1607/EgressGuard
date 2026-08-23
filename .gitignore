@@ -33,6 +33,7 @@ Desktop.ini
 *.etl
 logs/
 runtime/
+.local/
 
 # Certificates and private keys must never be committed
 *.pfx
