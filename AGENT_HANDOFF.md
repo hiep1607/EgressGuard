@@ -45,9 +45,10 @@ Status is IN_PROGRESS, READY_FOR_REVIEW or BLOCKED.
 
 Before writing to the coordination issue:
 
-1. Reload its body and read the `Updated UTC` line at its top.
-2. Compare it with the issue's GitHub `updated_at` timestamp; a mismatch means someone wrote in between.
-3. If another agent changed it during your session and the change contradicts your plan, stop and coordinate instead of overwriting.
-4. Set a fresh `Updated UTC` (current UTC) in every update you save.
-5. Append only your own session entry; never rewrite other agents' entries.
-6. Never force-push branches to erase another agent's records.
+1. At session start, read the issue once and record its GitHub `updated_at` timestamp as your baseline.
+2. Immediately before saving, re-read the issue from GitHub and compare the fresh `updated_at` with your baseline: identical means it is safe to update; different means someone else wrote in between, so read their changes and merge them into your update instead of overwriting.
+3. The `Updated UTC` line inside the body is for human readers only and is never compared with `updated_at`; still set a fresh `Updated UTC` (current UTC) every time you save.
+4. Append only your own session entry; never rewrite other agents' entries.
+5. Never force-push branches to erase another agent's records.
+
+GitHub tooling offers no conditional-update primitive, so this baseline-and-recheck procedure mitigates overwrite risk but is not fully atomic.
