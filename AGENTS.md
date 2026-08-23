@@ -2,8 +2,10 @@
 
 Read `docs/threat-model.md` and `docs/architecture.md` before modifying behavior.
 
-- Read `AGENT_HANDOFF.md` at the start of every session and re-verify its claims against Git/GitHub state; do not trust stale entries blindly.
-- Sessions with repository write access must update `AGENT_HANDOFF.md` before finishing; read-only sessions must not modify it and report results in conversation instead.
+- At session start read `AGENT_HANDOFF.md`, then the coordination issue it links to; re-verify both against Git/GitHub before acting.
+- Sessions with GitHub write access must update the coordination issue before finishing; read-only sessions report results in conversation only.
+- Ordinary work is owned by Ox Alpha. Escalate to Sol only for genuine architecture or safety blockers, or when Ox cannot complete the work within a reasonable fix loop.
+- Never edit per-branch `AGENT_HANDOFF.md` copies to record session logs; they are static guides pointing to the coordination issue.
 
 - Keep implementations minimal and within the phase explicitly requested.
 - Do not implement ETW, a driver, kernel code, payload inspection, or unrelated security features without explicit scope.

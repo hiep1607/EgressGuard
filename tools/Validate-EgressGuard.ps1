@@ -12,14 +12,16 @@
     The script stops at the first failing step and exits with that step's
     exit code. It determines the repository root from its own location,
     requires no administrator rights, changes no firewall, Defender,
-    registry, service or user data state, writes nothing into the
-    repository, and never uses Invoke-Expression or command lines composed
-    from untrusted data. Matched secret values are never printed.
+    registry, service or user data state, never modifies source or other
+    Git-tracked files, performs no network calls of its own, and never uses
+    Invoke-Expression or command lines composed from untrusted data. Tool
+    restore, build and tests may create Git-ignored bin/obj artifacts.
+    Matched secret values are never printed.
 
 .PARAMETER RequireClean
-    Fails when tracked repository files changed during validation. Files
-    ignored through .gitignore (for example build output) do not fail the
-    run because git status excludes them.
+    Requires the working tree to be clean at the end of the run, including
+    tracked changes that already existed before the run started. Untracked
+    files and Git-ignored output (for example bin/obj) do not fail the run.
 
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File tools\Validate-EgressGuard.ps1 -RequireClean
@@ -34,6 +36,12 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $repoRoot
+
+$solutionPath = Join-Path -Path $repoRoot -ChildPath 'EgressGuard.sln'
+if (-not (Test-Path -LiteralPath $solutionPath -PathType Leaf)) {
+    Write-Host '[fail] EgressGuard.sln was not found in the repository root.'
+    exit 20
+}
 
 $script:StepResults = New-Object System.Collections.Generic.List[string]
 $script:FailedStepName = ''
@@ -98,22 +106,20 @@ function Get-AgentHandoffViolations {
         [void]$issues.Add(('File has ' + $lines.Count + ' lines; the limit is 180.'))
     }
 
-    $sessionCount = 0
-    foreach ($line in $lines) {
-        if ($line -match '^### Session') {
-            $sessionCount++
-        }
-    }
-    if ($sessionCount -gt 5) {
-        [void]$issues.Add(('Found ' + $sessionCount + ' session headings; keep at most 5 completed sessions.'))
+    $text = [System.IO.File]::ReadAllText($handoffPath)
+
+    if ($text -notmatch 'https://github\.com/hiep1607/EgressGuard/issues/[0-9]+') {
+        [void]$issues.Add('Missing the required coordination issue link.')
     }
 
-    $text = [System.IO.File]::ReadAllText($handoffPath)
-    if ($text -notmatch '## Current snapshot') {
-        [void]$issues.Add('Missing required section "## Current snapshot".')
+    foreach ($section in @('## Handoff rules', '## Limits', '## Report template', '## Concurrent changes')) {
+        if ($text -notmatch [regex]::Escape($section)) {
+            [void]$issues.Add(('Missing required section "' + $section + '".'))
+        }
     }
-    if ($text -notmatch '## Recent sessions') {
-        [void]$issues.Add('Missing required section "## Recent sessions".')
+
+    if (-not [regex]::IsMatch($text, '\r?\n\z')) {
+        [void]$issues.Add('File must end with a single final newline.')
     }
 
     $secretChecks = @(
@@ -139,7 +145,7 @@ Write-Host ('Repository root: ' + $repoRoot)
 
 Invoke-ValidationStep -Name 'dotnet tool restore' -Action { dotnet tool restore }
 Invoke-ValidationStep -Name 'restore solution (locked mode)' -Action { dotnet restore EgressGuard.sln --locked-mode }
-& dotnet build-server shutdown | Out-Null
+Invoke-ValidationStep -Name 'shutdown build servers' -Action { dotnet build-server shutdown }
 Invoke-ValidationStep -Name 'verify formatting (no rewrite)' -Action { dotnet format EgressGuard.sln --verify-no-changes --no-restore }
 Invoke-ValidationStep -Name 'build Release' -Action { dotnet build EgressGuard.sln -c Release --no-restore }
 Invoke-ValidationStep -Name 'run executable test suite' -Action { dotnet run --project tests\EgressGuard.Tests\EgressGuard.Tests.csproj -c Release --no-build }
