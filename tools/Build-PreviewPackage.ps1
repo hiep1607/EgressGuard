@@ -159,6 +159,17 @@ $publishCommon = @(
     '--nologo'
 )
 
+Write-Step 'detaching package lock files for RID-specific publish'
+$lockBackups = @()
+foreach ($lockRelative in @(git ls-files '*packages.lock.json')) {
+    $lockPath = Join-Path $repoRoot $lockRelative
+    if (Test-Path -LiteralPath $lockPath) {
+        $backupPath = $lockPath + '.preview-backup'
+        Copy-Item -LiteralPath $lockPath -Destination $backupPath -Force
+        $lockBackups += ,@($lockPath, $backupPath)
+    }
+}
+
 Write-Step 'publishing launcher (self-contained win-x64)'
 & dotnet publish (Join-Path $repoRoot 'src\EgressGuard.Launcher\EgressGuard.Launcher.csproj') @publishCommon -o $stage
 if ($LASTEXITCODE -ne 0) { Write-Host '[fail] launcher publish failed.'; exit 10 }
@@ -170,6 +181,13 @@ if ($LASTEXITCODE -ne 0) { Write-Host '[fail] service publish failed.'; exit 11 
 Write-Step 'publishing UI (self-contained win-x64)'
 & dotnet publish (Join-Path $repoRoot 'src\EgressGuard.UI\EgressGuard.UI.csproj') @publishCommon -o (Join-Path $stage 'ui')
 if ($LASTEXITCODE -ne 0) { Write-Host '[fail] UI publish failed.'; exit 12 }
+
+Write-Step 'restoring package lock files'
+foreach ($pair in $lockBackups) {
+    Copy-Item -LiteralPath $pair[1] -Destination $pair[0] -Force
+    Remove-Item -LiteralPath $pair[1] -Force
+}
+Write-Host ("[ok  ] restored " + $lockBackups.Count + " package lock file(s).")
 
 Write-Step 'writing Vietnamese quick-start guide and commit information'
 $guideText = @"
