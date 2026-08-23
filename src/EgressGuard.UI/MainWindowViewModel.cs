@@ -20,6 +20,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     private readonly CancellationTokenSource _lifetimeCancellation = new();
     private readonly DispatcherTimer _batchTimer;
     private readonly BoundedSelectionRefresh<FileCorrelationsMessage> _correlationRefresh;
+    private readonly Func<GetFileActivityHistoryMessage, CancellationToken, Task<FileActivityHistoryMessage>> _historyFetcher;
+    private readonly Func<string?> _historyPathPicker;
+    private readonly Func<string, IReadOnlyList<FileCorrelationHistoryItem>, CancellationToken, Task> _historyWriter;
     private Task? _subscriptionTask;
     private long _lastSequence;
     private int _resyncRequested;
@@ -31,6 +34,10 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     private string _ipFilter = "All IP versions";
     private string _riskFilter = "All risks";
     private string _fileActivityFilter = FileActivityFilterAll;
+    private string _historySearchText = string.Empty;
+    private string _historyRange = FileHistoryRange24Hours;
+    private string _historyOperationFilter = FileHistoryOperationAll;
+    private string _historyConfidenceFilter = FileHistoryConfidenceAll;
     private FlowRow? _selectedFlow;
     private FirewallRule? _selectedRule;
     private SecurityAlert? _selectedAlert;
@@ -47,6 +54,20 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     private bool _fileCorrelationRestartRequired;
     private bool _fileCorrelationLoading;
     private bool _fileCorrelationLoadFailed;
+    private HistoryRequestHandle? _historyRequestCancellation;
+    private Task _historyRefreshTask = Task.CompletedTask;
+    private long _historyGeneration;
+    private DateTimeOffset _historyEndUtc;
+    private FileActivityHistoryCursorMessage? _historyCursor;
+    private readonly HashSet<Guid> _historySeenIds = [];
+    private readonly HashSet<string> _historyUsedCursors = new(StringComparer.Ordinal);
+    private bool _historyHasMore;
+    private bool _historyLoading;
+    private bool _historyLoadFailed;
+    private bool _historyStarted;
+    private bool _historyExporting;
+    private FileSensorState? _historySensorState;
+    private string _historyExportStatus = string.Empty;
     private bool _disposed;
 
     public MainWindowViewModel()
@@ -59,7 +80,10 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         string? pipeName,
         bool ownsRequestSession = false,
         Func<string, CancellationToken, Task<FileCorrelationsMessage>>? fileCorrelationFetcher = null,
-        TimeSpan? fileCorrelationMinimumInterval = null)
+        TimeSpan? fileCorrelationMinimumInterval = null,
+        Func<GetFileActivityHistoryMessage, CancellationToken, Task<FileActivityHistoryMessage>>? historyFetcher = null,
+        Func<string?>? historyPathPicker = null,
+        Func<string, IReadOnlyList<FileCorrelationHistoryItem>, CancellationToken, Task>? historyWriter = null)
     {
         _requestSession = requestSession ?? throw new ArgumentNullException(nameof(requestSession));
         _eventClient = new EgressGuardEventClient(pipeName);
@@ -68,12 +92,16 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         FlowView.Filter = FilterFlow;
         FileCorrelationView = CollectionViewSource.GetDefaultView(FileCorrelations);
         FileCorrelationView.Filter = FilterFileCorrelation;
+        FileActivityHistoryView = CollectionViewSource.GetDefaultView(FileActivityHistory);
         _batchTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(_refreshIntervalMilliseconds) };
         _correlationRefresh = new BoundedSelectionRefresh<FileCorrelationsMessage>(
             fileCorrelationFetcher ?? FetchFileCorrelationsAsync,
             ApplyFileCorrelations,
             HandleFileCorrelationFailure,
             fileCorrelationMinimumInterval ?? TimeSpan.FromSeconds(1));
+        _historyFetcher = historyFetcher ?? FetchFileActivityHistoryAsync;
+        _historyPathPicker = historyPathPicker ?? PickFileActivityHistoryPath;
+        _historyWriter = historyWriter ?? FileActivityHistoryCsvExporter.WriteAsync;
         _batchTimer.Tick += OnBatchTimerTick;
         RefreshCommand = new AsyncCommand(RefreshAsync);
         AllowCommand = new AsyncCommand(() => CreateRuleAsync(FirewallAction.Allow));
@@ -83,6 +111,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         ResetRulesCommand = new AsyncCommand(() => ConfirmAndSendAsync("Reset every EgressGuard-owned firewall rule?", MessageTypes.ResetOwnedRules, new { }));
         ApplyModeCommand = new AsyncCommand(() => SendMutationAsync(MessageTypes.SetProtectionMode, new SetProtectionModeMessage(ProtectionMode)));
         SaveFileCorrelationPreferenceCommand = new AsyncCommand(SaveFileCorrelationPreferenceAsync);
+        RefreshFileActivityHistoryCommand = new AsyncCommand(RefreshFileActivityHistoryAsync);
+        LoadMoreFileActivityHistoryCommand = new AsyncCommand(LoadMoreFileActivityHistoryAsync);
+        ExportFileActivityHistoryCommand = new AsyncCommand(ExportFileActivityHistoryAsync);
         ClearHistoryCommand = new AsyncCommand(() => ConfirmAndSendAsync("Delete local flow and alert history?", MessageTypes.ClearHistory, new { }));
         ResetBaselineCommand = new AsyncCommand(() => SendMutationAsync(MessageTypes.ResetBaseline, new ResetBaselineMessage(SelectedFlow?.Flow.Executable?.Sha256)));
     }
@@ -92,16 +123,25 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     internal bool OwnsRequestSession => _ownsRequestSession;
     internal bool FileCorrelationLoading => _fileCorrelationLoading;
     internal bool FileCorrelationLoadFailed => _fileCorrelationLoadFailed;
+    internal bool FileActivityHistoryLoading => _historyLoading;
+    internal bool FileActivityHistoryLoadFailed => _historyLoadFailed;
+    internal bool FileActivityHistoryExporting => _historyExporting;
+    internal Task FileActivityHistoryRefreshTask => _historyRefreshTask;
     public ObservableCollection<FlowRow> Flows { get; } = [];
     public ObservableCollection<FirewallRule> Rules { get; } = [];
     public ObservableCollection<SecurityAlert> Alerts { get; } = [];
     public ObservableCollection<FileCorrelationRow> FileCorrelations { get; } = [];
+    public ObservableCollection<FileActivityHistoryRow> FileActivityHistory { get; } = [];
     public ICollectionView FlowView { get; }
     public ICollectionView FileCorrelationView { get; }
+    public ICollectionView FileActivityHistoryView { get; }
     public IReadOnlyList<string> ProtocolFilters { get; } = ["All protocols", "TCP", "UDP"];
     public IReadOnlyList<string> IpFilters { get; } = ["All IP versions", "IPv4", "IPv6"];
     public IReadOnlyList<string> RiskFilters { get; } = ["All risks", "Low", "Medium", "High", "Critical"];
     public IReadOnlyList<string> FileActivityFilters { get; } = [FileActivityFilterAll, FileActivityFilterReadOpen, FileActivityFilterModify];
+    public IReadOnlyList<string> FileHistoryRanges { get; } = [FileHistoryRange24Hours, FileHistoryRange7Days, FileHistoryRange30Days];
+    public IReadOnlyList<string> FileHistoryOperationFilters { get; } = [FileHistoryOperationAll, "Open / create", "Read", "Write", "Rename", "Delete"];
+    public IReadOnlyList<string> FileHistoryConfidenceFilters { get; } = [FileHistoryConfidenceAll, "Low", "Medium", "High"];
     public IReadOnlyList<ProtectionMode> ProtectionModes { get; } = Enum.GetValues<ProtectionMode>();
     public ICommand RefreshCommand { get; }
     public ICommand AllowCommand { get; }
@@ -111,6 +151,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     public ICommand ResetRulesCommand { get; }
     public ICommand ApplyModeCommand { get; }
     public ICommand SaveFileCorrelationPreferenceCommand { get; }
+    public ICommand RefreshFileActivityHistoryCommand { get; }
+    public ICommand LoadMoreFileActivityHistoryCommand { get; }
+    public ICommand ExportFileActivityHistoryCommand { get; }
     public ICommand ClearHistoryCommand { get; }
     public ICommand ResetBaselineCommand { get; }
     public int ActiveCount => Flows.Count;
@@ -121,6 +164,33 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     public string LastOperation { get => _lastOperation; private set => Set(ref _lastOperation, value); }
     public string DatabasePath { get => _databasePath; private set => Set(ref _databasePath, value); }
     public string FileSensorStatus { get => _fileSensorStatus; private set => Set(ref _fileSensorStatus, value); }
+    public string FileActivityHistoryStatus => _historyLoading
+        ? "Loading file activity history…"
+        : _historyExporting
+            ? "Exporting file activity history…"
+            : _historyLoadFailed
+                ? "Service error while loading file activity history."
+                : _historySensorState is { } state
+                    ? FormatHistorySensor(state)
+                    : "File activity sensor status unavailable.";
+    public string FileActivityHistoryEmptyState
+    {
+        get
+        {
+            if (_historyLoading) return "Loading file activity history…";
+            if (_historyLoadFailed) return "File activity history is unavailable because the Service returned an error.";
+            if (FileActivityHistory.Count > 0) return string.Empty;
+            return _historySensorState switch
+            {
+                FileSensorState.Disabled => "File activity sensor is turned off.",
+                FileSensorState.AccessDenied => "File activity sensor permission was denied.",
+                FileSensorState.ProviderUnavailable or FileSensorState.Failed => "File activity sensor is unavailable.",
+                FileSensorState.Stopped => "File activity sensor has stopped.",
+                _ => "No file activity related to an observed network connection was found."
+            };
+        }
+    }
+    public string FileActivityHistoryExportStatus { get => _historyExportStatus; private set => Set(ref _historyExportStatus, value); }
     public bool FileCorrelationEnabled { get => _fileCorrelationEnabled; private set => Set(ref _fileCorrelationEnabled, value); }
     public bool FileCorrelationPreferenceEnabled { get => _fileCorrelationPreferenceEnabled; set => Set(ref _fileCorrelationPreferenceEnabled, value); }
     public string FileCorrelationActiveStatus => _fileCorrelationEnabled ? "Applied now: enabled" : "Applied now: disabled";
@@ -196,12 +266,204 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         }
     }
 
+    public string FileHistorySearchText { get => _historySearchText; set { var next = value.Length > 96 ? value[..96] : value; if (Set(ref _historySearchText, next)) QueueFileActivityHistoryRefresh(); } }
+    public string FileHistoryRange { get => _historyRange; set { if (Set(ref _historyRange, value)) QueueFileActivityHistoryRefresh(); } }
+    public string FileHistoryOperationFilter { get => _historyOperationFilter; set { if (Set(ref _historyOperationFilter, value)) QueueFileActivityHistoryRefresh(); } }
+    public string FileHistoryConfidenceFilter { get => _historyConfidenceFilter; set { if (Set(ref _historyConfidenceFilter, value)) QueueFileActivityHistoryRefresh(); } }
+
+    internal const string FileHistoryRange24Hours = "24 hours";
+    internal const string FileHistoryRange7Days = "7 days";
+    internal const string FileHistoryRange30Days = "30 days";
+    internal const string FileHistoryOperationAll = "All activities";
+    internal const string FileHistoryConfidenceAll = "All relevance";
+
     public async Task StartAsync()
     {
         await RefreshAsync().ConfigureAwait(true);
+        _historyStarted = true;
+        await RefreshFileActivityHistoryAsync().ConfigureAwait(true);
         _batchTimer.Start();
         _subscriptionTask = RunSubscriptionLoopAsync(_lifetimeCancellation.Token);
     }
+
+    private void QueueFileActivityHistoryRefresh()
+    {
+        if (!_historyStarted || _disposed)
+            return;
+
+        _historyRefreshTask = RefreshFileActivityHistoryAsync();
+    }
+
+    internal async Task RefreshFileActivityHistoryForTestAsync()
+    {
+        _historyStarted = true;
+        await RefreshFileActivityHistoryAsync().ConfigureAwait(true);
+    }
+
+    private async Task RefreshFileActivityHistoryAsync()
+    {
+        CancelHistoryRequest();
+        var requestCancellation = new HistoryRequestHandle(_lifetimeCancellation.Token);
+        _historyRequestCancellation = requestCancellation;
+        var generation = Interlocked.Increment(ref _historyGeneration);
+        _historyEndUtc = DateTimeOffset.UtcNow;
+        _historyCursor = null;
+        _historyHasMore = false;
+        _historyLoading = true;
+        _historyLoadFailed = false;
+        _historySensorState = null;
+        _historySeenIds.Clear();
+        _historyUsedCursors.Clear();
+        FileActivityHistoryExportStatus = string.Empty;
+        Replace(FileActivityHistory, []);
+        RefreshFileActivityHistoryPresentation();
+        try
+        {
+            await LoadFileActivityHistoryPageAsync(generation, reset: true, cancellationToken: requestCancellation.Token).ConfigureAwait(true);
+        }
+        catch (OperationCanceledException) when (requestCancellation.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception) when (exception is IOException or TimeoutException or InvalidDataException or UnauthorizedAccessException or OperationCanceledException)
+        {
+            HandleFileActivityHistoryFailure(generation, exception);
+        }
+        finally
+        {
+            Interlocked.CompareExchange(ref _historyRequestCancellation, null, requestCancellation);
+            requestCancellation.Dispose();
+        }
+    }
+
+    private async Task LoadMoreFileActivityHistoryAsync()
+    {
+        if (!_historyStarted || _historyLoading || !_historyHasMore || _historyCursor is null)
+            return;
+
+        CancelHistoryRequest();
+        var requestCancellation = new HistoryRequestHandle(_lifetimeCancellation.Token);
+        _historyRequestCancellation = requestCancellation;
+        var generation = Interlocked.Read(ref _historyGeneration);
+        _historyLoading = true;
+        RefreshFileActivityHistoryPresentation();
+        try
+        {
+            await LoadFileActivityHistoryPageAsync(generation, reset: false, cancellationToken: requestCancellation.Token).ConfigureAwait(true);
+        }
+        catch (OperationCanceledException) when (requestCancellation.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception) when (exception is IOException or TimeoutException or InvalidDataException or UnauthorizedAccessException or OperationCanceledException)
+        {
+            HandleFileActivityHistoryFailure(generation, exception);
+        }
+        finally
+        {
+            Interlocked.CompareExchange(ref _historyRequestCancellation, null, requestCancellation);
+            requestCancellation.Dispose();
+        }
+    }
+
+    private async Task LoadFileActivityHistoryPageAsync(long generation, bool reset, CancellationToken cancellationToken)
+    {
+        var request = BuildFileActivityHistoryRequest(_historyCursor, _historyEndUtc, limit: 100);
+        var response = await _historyFetcher(request, cancellationToken).ConfigureAwait(true);
+        if (generation != Interlocked.Read(ref _historyGeneration) || cancellationToken.IsCancellationRequested)
+            return;
+
+        var nextCursor = FileActivityHistoryPaginationValidator.Validate(request, response, _historySeenIds, _historyUsedCursors);
+        foreach (var item in response.Items)
+            FileActivityHistory.Add(new FileActivityHistoryRow(item));
+
+        _historyCursor = nextCursor;
+        _historyHasMore = response.HasMore;
+        _historySensorState = response.SensorStatus.State;
+        _historyLoading = false;
+        _historyLoadFailed = false;
+        RefreshFileActivityHistoryPresentation();
+    }
+
+    private void HandleFileActivityHistoryFailure(long generation, Exception exception)
+    {
+        if (generation != Interlocked.Read(ref _historyGeneration))
+            return;
+        _historyLoading = false;
+        _historyLoadFailed = true;
+        _historySensorState = null;
+        LastOperation = "File activity history Service error.";
+        RefreshFileActivityHistoryPresentation();
+    }
+
+    private GetFileActivityHistoryMessage BuildFileActivityHistoryRequest(
+        FileActivityHistoryCursorMessage? cursor,
+        DateTimeOffset endUtc,
+        int limit)
+    {
+        return BuildFileActivityHistoryRequest(
+            cursor,
+            endUtc,
+            limit,
+            string.IsNullOrWhiteSpace(FileHistorySearchText) ? null : FileHistorySearchText,
+            ParseFileHistoryOperation(FileHistoryOperationFilter),
+            ParseFileHistoryConfidence(FileHistoryConfidenceFilter),
+            HistoryRangeSpan(FileHistoryRange));
+    }
+
+    private static GetFileActivityHistoryMessage BuildFileActivityHistoryRequest(
+        FileActivityHistoryCursorMessage? cursor,
+        DateTimeOffset endUtc,
+        int limit,
+        string? search,
+        FileActivityOperation? operation,
+        CorrelationConfidence? confidence,
+        TimeSpan span) => new(
+            endUtc - span,
+            endUtc,
+            search,
+            operation,
+            confidence,
+            limit,
+            cursor);
+
+    private static TimeSpan HistoryRangeSpan(string range) => range switch
+    {
+        FileHistoryRange7Days => TimeSpan.FromDays(7),
+        FileHistoryRange30Days => TimeSpan.FromDays(30),
+        _ => TimeSpan.FromHours(24)
+    };
+
+    private static FileActivityOperation? ParseFileHistoryOperation(string filter) => filter switch
+    {
+        "Open / create" => FileActivityOperation.OpenCreate,
+        "Read" => FileActivityOperation.Read,
+        "Write" => FileActivityOperation.Write,
+        "Rename" => FileActivityOperation.Rename,
+        "Delete" => FileActivityOperation.Delete,
+        _ => null
+    };
+
+    private static CorrelationConfidence? ParseFileHistoryConfidence(string filter) => filter switch
+    {
+        "Low" => CorrelationConfidence.Low,
+        "Medium" => CorrelationConfidence.Medium,
+        "High" => CorrelationConfidence.High,
+        _ => null
+    };
+
+    private void RefreshFileActivityHistoryPresentation()
+    {
+        OnPropertyChanged(nameof(FileActivityHistoryStatus));
+        OnPropertyChanged(nameof(FileActivityHistoryEmptyState));
+        OnPropertyChanged(nameof(FileActivityHistoryCanLoadMore));
+    }
+
+    private void CancelHistoryRequest()
+    {
+        var previous = Interlocked.Exchange(ref _historyRequestCancellation, null);
+        previous?.Cancel();
+    }
+
+    public bool FileActivityHistoryCanLoadMore => _historyHasMore && _historyCursor is not null && !_historyLoading;
 
     private async Task RefreshAsync()
     {
@@ -379,6 +641,113 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         return -1;
     }
 
+    private async Task<FileActivityHistoryMessage> FetchFileActivityHistoryAsync(
+        GetFileActivityHistoryMessage request,
+        CancellationToken cancellationToken)
+    {
+        var response = await _requestSession.SendAsync(
+            MessageEnvelope.Create(MessageTypes.GetFileActivityHistory, request),
+            TimeSpan.FromSeconds(5),
+            cancellationToken).ConfigureAwait(true);
+        if (response.Type == MessageTypes.Error)
+        {
+            var error = response.ReadPayload<ErrorMessage>();
+            throw new InvalidDataException(error.Message);
+        }
+
+        return response.ReadPayload<FileActivityHistoryMessage>();
+    }
+
+    internal Task ExportFileActivityHistoryForTestAsync() => ExportFileActivityHistoryAsync();
+
+    private static string? PickFileActivityHistoryPath()
+    {
+        var dialog = new Microsoft.Win32.SaveFileDialog
+        {
+            Title = "Export file activity history",
+            Filter = "CSV files (*.csv)|*.csv|All files (*.*)|*.*",
+            DefaultExt = ".csv",
+            AddExtension = true,
+            FileName = "egressguard-file-activity-history.csv"
+        };
+        return dialog.ShowDialog() == true ? dialog.FileName : null;
+    }
+
+    private async Task ExportFileActivityHistoryAsync()
+    {
+        var path = _historyPathPicker();
+        if (path is null)
+            return;
+
+        await ExportFileActivityHistoryToPathAsync(path).ConfigureAwait(true);
+    }
+
+    private async Task ExportFileActivityHistoryToPathAsync(string path)
+    {
+        var endUtc = DateTimeOffset.UtcNow;
+        var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellation.Token);
+        _historyExporting = true;
+        FileActivityHistoryExportStatus = "Exporting…";
+        OnPropertyChanged(nameof(FileActivityHistoryStatus));
+        try
+        {
+            var rows = new List<FileCorrelationHistoryItem>(capacity: 200);
+            var seenIds = new HashSet<Guid>();
+            var usedCursors = new HashSet<string>(StringComparer.Ordinal);
+            FileActivityHistoryCursorMessage? cursor = null;
+            var truncated = false;
+            var search = string.IsNullOrWhiteSpace(FileHistorySearchText) ? null : FileHistorySearchText;
+            var operation = ParseFileHistoryOperation(FileHistoryOperationFilter);
+            var confidence = ParseFileHistoryConfidence(FileHistoryConfidenceFilter);
+            var range = HistoryRangeSpan(FileHistoryRange);
+            while (rows.Count < FileActivityHistoryCsvExporter.MaximumRows)
+            {
+                var request = BuildFileActivityHistoryRequest(cursor, endUtc, 200, search, operation, confidence, range);
+                var page = await _historyFetcher(request, cancellation.Token).ConfigureAwait(true);
+                var nextCursor = FileActivityHistoryPaginationValidator.Validate(request, page, seenIds, usedCursors);
+                var remaining = FileActivityHistoryCsvExporter.MaximumRows - rows.Count;
+                if (page.Items.Count > remaining)
+                    truncated = true;
+                rows.AddRange(page.Items.Take(remaining));
+
+                if (!page.HasMore)
+                    break;
+                if (rows.Count == FileActivityHistoryCsvExporter.MaximumRows)
+                {
+                    truncated = true;
+                    break;
+                }
+
+                cursor = nextCursor ?? throw new InvalidDataException("A history response with more pages did not provide a cursor.");
+            }
+
+            await _historyWriter(path, rows, cancellation.Token).ConfigureAwait(true);
+            FileActivityHistoryExportStatus = truncated
+                ? $"Export complete; report limited to {FileActivityHistoryCsvExporter.MaximumRows.ToString(CultureInfo.InvariantCulture)} rows."
+                : $"Export complete; {rows.Count.ToString(CultureInfo.InvariantCulture)} rows written.";
+            LastOperation = FileActivityHistoryExportStatus;
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested && _lifetimeCancellation.IsCancellationRequested)
+        {
+        }
+        catch (OperationCanceledException) when (!cancellation.IsCancellationRequested)
+        {
+            FileActivityHistoryExportStatus = "Export failed; the report was not confirmed as written.";
+            LastOperation = "File activity history export failed.";
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException or TimeoutException)
+        {
+            FileActivityHistoryExportStatus = "Export failed; the report was not confirmed as written.";
+            LastOperation = "File activity history export failed.";
+        }
+        finally
+        {
+            cancellation.Dispose();
+            _historyExporting = false;
+            OnPropertyChanged(nameof(FileActivityHistoryStatus));
+        }
+    }
+
     private async Task<FileCorrelationsMessage> FetchFileCorrelationsAsync(string flowId, CancellationToken cancellationToken)
     {
         var response = await _requestSession.SendAsync(
@@ -458,8 +827,10 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         FileCorrelationEnabled = status.FileCorrelationEnabled;
         OnPropertyChanged(nameof(FileCorrelationActiveStatus));
         _fileSensorState = status.FileSensor?.State;
+        _historySensorState = status.FileSensor?.State;
         _observedFileSensorStatus = status.FileSensor is null ? "File correlation status unavailable" : FormatFileSensor(status.FileSensor);
         RefreshFileCorrelationPresentation();
+        RefreshFileActivityHistoryPresentation();
     }
 
     internal void UpdateFileCorrelationPreference(FileCorrelationPreferenceResultMessage result)
@@ -499,6 +870,18 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         };
         return $"File activity tracker: {state} · dropped {Math.Max(0, status.DroppedEvents)}";
     }
+
+    private static string FormatHistorySensor(FileSensorState state) => state switch
+    {
+        FileSensorState.Disabled => "File activity sensor: off",
+        FileSensorState.AccessDenied => "File activity sensor: permission denied",
+        FileSensorState.ProviderUnavailable or FileSensorState.Failed => "File activity sensor: unavailable",
+        FileSensorState.Stopped => "File activity sensor: stopped",
+        FileSensorState.OverflowDegraded => "File activity sensor: active with dropped events",
+        FileSensorState.Starting => "File activity sensor: starting",
+        FileSensorState.Running => "File activity sensor: active",
+        _ => "File activity sensor: unavailable"
+    };
 
     private async Task CreateRuleAsync(FirewallAction action)
     {
@@ -588,6 +971,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         if (_disposed)
             return;
         _disposed = true;
+        CancelHistoryRequest();
         _batchTimer.Stop();
         _lifetimeCancellation.Cancel();
         await _correlationRefresh.DisposeAsync().ConfigureAwait(false);
@@ -663,6 +1047,45 @@ public sealed class FileCorrelationRow
     public string Reason { get; }
 }
 
+public sealed class FileActivityHistoryRow
+{
+    public FileActivityHistoryRow(FileCorrelationHistoryItem item)
+    {
+        ArgumentNullException.ThrowIfNull(item);
+        Id = item.Id;
+        ActivityTime = item.ActivityTimestampUtc.ToLocalTime().ToString("G", CultureInfo.CurrentCulture);
+        ProcessName = item.ProcessName;
+        Operation = item.Operation switch
+        {
+            FileActivityOperation.OpenCreate => "Open / create",
+            FileActivityOperation.Read => "Read",
+            FileActivityOperation.Write => "Write",
+            FileActivityOperation.Rename => "Rename",
+            FileActivityOperation.Delete => "Delete",
+            _ => "Unknown"
+        };
+        DisplayPath = item.DisplayPath;
+        Extension = item.Extension;
+        Relevance = item.Confidence.ToString();
+        TimeDistance = Math.Abs(item.TimeDeltaSeconds) < 0.0005
+            ? "At connection time"
+            : $"{Math.Abs(item.TimeDeltaSeconds):0.###} s {(item.TimeDeltaSeconds < 0 ? "before" : "after")} connection";
+        Reason = item.Reason;
+        ConnectionCode = item.FlowId;
+    }
+
+    public Guid Id { get; }
+    public string ActivityTime { get; }
+    public string ProcessName { get; }
+    public string Operation { get; }
+    public string DisplayPath { get; }
+    public string Extension { get; }
+    public string Relevance { get; }
+    public string TimeDistance { get; }
+    public string Reason { get; }
+    public string ConnectionCode { get; }
+}
+
 internal sealed class AsyncCommand(Func<Task> execute) : ICommand
 {
     private bool _running;
@@ -675,5 +1098,101 @@ internal sealed class AsyncCommand(Func<Task> execute) : ICommand
         CanExecuteChanged?.Invoke(this, EventArgs.Empty);
         try { await execute().ConfigureAwait(true); }
         finally { _running = false; CanExecuteChanged?.Invoke(this, EventArgs.Empty); }
+    }
+}
+
+/// <summary>
+/// Owns one history request cancellation source so that cancel and dispose can
+/// never overlap on the same object, cancellation of a superseded request still
+/// reaches its owner, and every source is disposed exactly once.
+/// </summary>
+internal sealed class HistoryRequestHandle
+{
+    private readonly object _gate = new();
+    private readonly CancellationTokenSource _source;
+    private bool _canceled;
+    private bool _disposed;
+
+    public HistoryRequestHandle(CancellationToken linkedToken)
+    {
+        _source = CancellationTokenSource.CreateLinkedTokenSource(linkedToken);
+    }
+
+    public CancellationToken Token
+    {
+        get
+        {
+            lock (_gate)
+            {
+                ObjectDisposedException.ThrowIf(_disposed, _source);
+                return _source.Token;
+            }
+        }
+    }
+
+    public bool IsCancellationRequested
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _canceled || (!_disposed && _source.IsCancellationRequested);
+            }
+        }
+    }
+
+    public bool Disposed
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _disposed;
+            }
+        }
+    }
+
+    public void Cancel()
+    {
+        lock (_gate)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _canceled = true;
+            _source.Cancel();
+        }
+    }
+
+    public void Dispose() => DisposeCore(null, null, null);
+
+    internal void DisposeForTest(
+        TaskCompletionSource entered,
+        TaskCompletionSource release,
+        TaskCompletionSource disposingSource) => DisposeCore(entered, release, disposingSource);
+
+    private void DisposeCore(
+        TaskCompletionSource? entered,
+        TaskCompletionSource? release,
+        TaskCompletionSource? disposingSource)
+    {
+        CancellationTokenSource source;
+        lock (_gate)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            entered?.TrySetResult();
+            release?.Task.Wait();
+            _disposed = true;
+            source = _source;
+        }
+
+        disposingSource?.TrySetResult();
+        source.Dispose();
     }
 }

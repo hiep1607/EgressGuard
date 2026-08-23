@@ -64,6 +64,34 @@ public sealed record FileCorrelation(
     string Reason,
     DateTimeOffset CreatedAtUtc);
 
+public sealed record FileCorrelationHistoryCursor(DateTimeOffset ActivityTimestampUtc, Guid Id);
+
+public sealed record FileCorrelationHistoryQuery(
+    DateTimeOffset StartUtc,
+    DateTimeOffset EndUtc,
+    string? Search,
+    FileActivityOperation? Operation,
+    CorrelationConfidence? Confidence,
+    int Limit,
+    FileCorrelationHistoryCursor? Cursor = null);
+
+public sealed record FileCorrelationHistoryItem(
+    Guid Id,
+    string FlowId,
+    string ProcessName,
+    FileActivityOperation Operation,
+    string DisplayPath,
+    string Extension,
+    DateTimeOffset ActivityTimestampUtc,
+    double TimeDeltaSeconds,
+    CorrelationConfidence Confidence,
+    string Reason);
+
+public sealed record FileCorrelationHistoryPage(
+    IReadOnlyList<FileCorrelationHistoryItem> Items,
+    bool HasMore,
+    FileCorrelationHistoryCursor? NextCursor);
+
 public static class FileCorrelationPrivacy
 {
     public const int MaximumExtensionLength = 16;
@@ -100,6 +128,22 @@ public static class FileCorrelationPrivacy
             Extension = extension,
             Reason = reason
         };
+    }
+
+    public static FileCorrelationHistoryItem ProjectForHistory(FileCorrelation correlation)
+    {
+        var protectedCorrelation = ProtectForBoundary(correlation);
+        return new FileCorrelationHistoryItem(
+            protectedCorrelation.Id,
+            protectedCorrelation.FlowId,
+            protectedCorrelation.ProcessName,
+            protectedCorrelation.Operation,
+            protectedCorrelation.DisplayPath,
+            protectedCorrelation.Extension,
+            protectedCorrelation.ActivityTimestampUtc,
+            protectedCorrelation.TimeDeltaSeconds,
+            protectedCorrelation.Confidence,
+            protectedCorrelation.Reason);
     }
 
     private static bool IsSha256(string? value) =>

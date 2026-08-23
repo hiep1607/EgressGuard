@@ -115,6 +115,47 @@
                 </StackPanel></ScrollViewer>
             </TabItem>
 
+            <TabItem Header="File Activity History">
+                <Grid Margin="14">
+                    <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+                    <StackPanel>
+                        <TextBlock Text="File Activity History" FontSize="22" FontWeight="SemiBold" />
+                        <TextBlock Text="Only file activity correlated with an observed network connection is shown; this is not a complete list of files on the computer."
+                                   Foreground="#FFD166" TextWrapping="Wrap" Margin="0,4,0,10" />
+                        <WrapPanel>
+                            <TextBox Width="210" Text="{Binding FileHistorySearchText, UpdateSourceTrigger=PropertyChanged}" ToolTip="Search process, redacted file name, or extension" />
+                            <ComboBox Width="145" ItemsSource="{Binding FileHistoryOperationFilters}" SelectedItem="{Binding FileHistoryOperationFilter}" />
+                            <ComboBox Width="135" ItemsSource="{Binding FileHistoryConfidenceFilters}" SelectedItem="{Binding FileHistoryConfidenceFilter}" />
+                            <ComboBox Width="110" ItemsSource="{Binding FileHistoryRanges}" SelectedItem="{Binding FileHistoryRange}" />
+                            <Button Content="Refresh" Command="{Binding RefreshFileActivityHistoryCommand}" />
+                            <Button Content="Load more" Command="{Binding LoadMoreFileActivityHistoryCommand}" IsEnabled="{Binding FileActivityHistoryCanLoadMore}" />
+                            <Button Content="Export CSV" Command="{Binding ExportFileActivityHistoryCommand}" />
+                        </WrapPanel>
+                        <TextBlock Text="{Binding FileActivityHistoryStatus}" Foreground="#B9C9D8" TextWrapping="Wrap" Margin="0,8,0,2"
+                                   AutomationProperties.AutomationId="FileActivityHistoryStatus" />
+                        <TextBlock Text="{Binding FileActivityHistoryExportStatus}" Foreground="#B9C9D8" TextWrapping="Wrap" Margin="0,0,0,6"
+                                   AutomationProperties.AutomationId="FileActivityHistoryExportStatus" />
+                    </StackPanel>
+                    <DataGrid Grid.Row="1" ItemsSource="{Binding FileActivityHistory}" AutoGenerateColumns="False" IsReadOnly="True"
+                              EnableRowVirtualization="True" VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+                              Background="#111A23" Foreground="#E8EEF5" RowBackground="#18212B" AlternatingRowBackground="#202C38">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="Time" Binding="{Binding ActivityTime}" Width="150" />
+                            <DataGridTextColumn Header="Process" Binding="{Binding ProcessName}" Width="140" />
+                            <DataGridTextColumn Header="Activity" Binding="{Binding Operation}" Width="110" />
+                            <DataGridTextColumn Header="File (redacted)" Binding="{Binding DisplayPath}" Width="180" />
+                            <DataGridTextColumn Header="Extension" Binding="{Binding Extension}" Width="85" />
+                            <DataGridTextColumn Header="Relevance" Binding="{Binding Relevance}" Width="95" />
+                            <DataGridTextColumn Header="Time distance" Binding="{Binding TimeDistance}" Width="150" />
+                            <DataGridTextColumn Header="Reason" Binding="{Binding Reason}" Width="2*" />
+                            <DataGridTextColumn Header="Connection code" Binding="{Binding ConnectionCode}" Width="180" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+                    <TextBlock Grid.Row="2" Text="{Binding FileActivityHistoryEmptyState}" Foreground="#B9C9D8" TextWrapping="Wrap" Margin="2,8,2,0"
+                               AutomationProperties.AutomationId="FileActivityHistoryEmptyState" />
+                </Grid>
+            </TabItem>
+
             <TabItem Header="Alerts">
                 <Grid Margin="14">
                     <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
