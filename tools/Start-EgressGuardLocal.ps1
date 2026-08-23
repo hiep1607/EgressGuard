@@ -36,59 +36,32 @@ $exitCode = 0
 $previousDataRoot = [Environment]::GetEnvironmentVariable("EGRESSGUARD_DATA_DIR", "Process")
 $previousPipeName = [Environment]::GetEnvironmentVariable("EGRESSGUARD_PIPE_NAME", "Process")
 
-function Get-DescendantProcesses {
-    param([int]$RootProcessId)
-
-    $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
-    $byParent = @{}
-    foreach ($item in $all) {
-        $parent = [int]$item.ParentProcessId
-        if (-not $byParent.ContainsKey($parent)) {
-            $byParent[$parent] = [System.Collections.Generic.List[object]]::new()
-        }
-        $byParent[$parent].Add($item)
-    }
-
-    $queue = [System.Collections.Generic.Queue[int]]::new()
-    $queue.Enqueue($RootProcessId)
-    $result = [System.Collections.Generic.List[object]]::new()
-    while ($queue.Count -gt 0) {
-        $parentId = $queue.Dequeue()
-        foreach ($child in @($byParent[$parentId])) {
-            $result.Add($child)
-            $queue.Enqueue([int]$child.ProcessId)
-        }
-    }
-    return $result
-}
-
 function Stop-OwnedProcessTree {
     param([System.Diagnostics.Process]$Root)
 
     if ($null -eq $Root) { return }
-    # Resolve descendants before stopping the root so only this script's tree
-    # is addressed. No service, firewall, registry, or security policy command
-    # is used here.
-    $descendants = @(Get-DescendantProcesses -RootProcessId $Root.Id)
-    foreach ($child in @($descendants | Sort-Object { $_.ProcessId } -Descending)) {
-        try {
-            $process = [System.Diagnostics.Process]::GetProcessById([int]$child.ProcessId)
-            if (-not $process.HasExited) {
-                $process.Kill($true)
-                $process.WaitForExit(5000)
-            }
-            $process.Dispose()
-        } catch [ArgumentException] { }
-          catch [System.ComponentModel.Win32Exception] { }
-    }
-
     try {
-        if (-not $Root.HasExited) {
-            $Root.Kill($true)
-            $Root.WaitForExit(5000)
+        if ($Root.HasExited) { return }
+        $Root.Kill($true)
+        if (-not $Root.WaitForExit(5000)) {
+            Write-Warning "Timed out waiting for owned process tree $($Root.Id) to exit."
         }
     } catch [InvalidOperationException] { }
       catch [System.ComponentModel.Win32Exception] { }
+      finally { $Root.Dispose() }
+}
+
+function Quote-ProcessArgument {
+    param([Parameter(Mandatory = $true)][string]$Value)
+
+    # Start-Process in Windows PowerShell 5.1 joins ArgumentList arrays into
+    # one string. Build the command line explicitly so --project receives one
+    # quoted argument even when the repository path contains spaces. Double
+    # backslashes before a closing quote and escape embedded quotes according
+    # to the Windows command-line parsing rules.
+    $escaped = $Value -replace '(\\*)"', '$1$1\\"'
+    $escaped = $escaped -replace '(\\+)$', '$1$1'
+    return '"' + $escaped + '"'
 }
 
 function Wait-ForLocalPipe {
@@ -120,18 +93,14 @@ function Wait-ForLocalPipe {
 try {
     $env:EGRESSGUARD_DATA_DIR = $dataRoot
     $env:EGRESSGUARD_PIPE_NAME = $pipeName
-    $serviceArguments = @(
-        "run", "--project", $serviceProject, "--configuration", "Release", "--no-launch-profile"
-    )
+    $serviceArguments = "run --project $(Quote-ProcessArgument $serviceProject) --configuration Release --no-launch-profile"
     $service = Start-Process -FilePath $dotnet.Source -ArgumentList $serviceArguments -WorkingDirectory $repoRoot `
         -WindowStyle Hidden -PassThru -RedirectStandardOutput $serviceLog -RedirectStandardError $serviceErrorLog
     $ownedProcesses.Add($service)
 
     Wait-ForLocalPipe -Name $pipeName -Service $service -TimeoutSeconds $ReadyTimeoutSeconds
 
-    $uiArguments = @(
-        "run", "--project", $uiProject, "--configuration", "Release", "--no-launch-profile"
-    )
+    $uiArguments = "run --project $(Quote-ProcessArgument $uiProject) --configuration Release --no-launch-profile"
     $ui = Start-Process -FilePath $dotnet.Source -ArgumentList $uiArguments -WorkingDirectory $repoRoot `
         -PassThru -RedirectStandardOutput $uiLog -RedirectStandardError $uiErrorLog
     $ownedProcesses.Add($ui)
@@ -143,7 +112,6 @@ try {
 } finally {
     foreach ($process in @($ownedProcesses | Select-Object -Reverse)) {
         Stop-OwnedProcessTree -Root $process
-        $process.Dispose()
     }
     if ($null -eq $previousDataRoot) { Remove-Item Env:EGRESSGUARD_DATA_DIR -ErrorAction SilentlyContinue }
     else { $env:EGRESSGUARD_DATA_DIR = $previousDataRoot }

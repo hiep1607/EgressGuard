@@ -6540,11 +6540,50 @@ internal static class Program
             repository = repository.Parent;
         AssertTrue(repository is not null, "Could not locate the repository for local startup script checks.");
         var script = File.ReadAllText(Path.Combine(repository!.FullName, "tools", "Start-EgressGuardLocal.ps1"));
-        foreach (var required in new[] { "$dataRoot", "EgressGuard.Local.", "ReadyTimeoutSeconds", "Wait-ForLocalPipe", "Get-DescendantProcesses", "Stop-OwnedProcessTree" })
+        foreach (var required in new[]
+        {
+            "$dataRoot",
+            "EgressGuard.Local.",
+            "ReadyTimeoutSeconds",
+            "Wait-ForLocalPipe",
+            "Stop-OwnedProcessTree",
+            "function Quote-ProcessArgument",
+            "$Root.HasExited",
+            "$Root.Kill($true)",
+            "$Root.WaitForExit(5000)",
+            "$Root.Dispose()"
+        })
             AssertTrue(script.Contains(required, StringComparison.Ordinal), $"Local startup script is missing '{required}'.");
-        foreach (var forbidden in new[] { "New-Service", "Install-WindowsService", "sc.exe create", "Set-NetFirewall", "New-NetFirewall", "Set-ItemProperty", "reg.exe", "Set-MpPreference", "Add-MpPreference" })
+        foreach (var forbidden in new[]
+        {
+            "Get-CimInstance",
+            "GetProcessById",
+            "ProcessId",
+            "ParentProcessId",
+            "taskkill",
+            "$child",
+            "$descendants",
+            "$process.Kill(",
+            "$process.Dispose()",
+            "New-Service",
+            "Install-WindowsService",
+            "sc.exe create",
+            "Set-NetFirewall",
+            "New-NetFirewall",
+            "Set-ItemProperty",
+            "reg.exe",
+            "Set-MpPreference",
+            "Add-MpPreference"
+        })
             AssertTrue(!script.Contains(forbidden, StringComparison.OrdinalIgnoreCase), $"Local startup script contains forbidden command '{forbidden}'.");
-        AssertTrue(script.Contains("$Root.Kill($true)", StringComparison.Ordinal), "Local startup script does not clean its owned process tree.");
+        AssertEqual(1, script.Split(".Kill(", StringSplitOptions.None).Length - 1);
+        AssertTrue(script.Contains("$service = Start-Process", StringComparison.Ordinal) && script.Contains("$ui = Start-Process", StringComparison.Ordinal), "The script did not create both owned root processes.");
+        AssertEqual(2, script.Split("-PassThru", StringSplitOptions.None).Length - 1);
+        AssertTrue(script.Contains("$ownedProcesses.Add($service)", StringComparison.Ordinal) && script.Contains("$ownedProcesses.Add($ui)", StringComparison.Ordinal), "The script did not retain only the current run's root Process objects.");
+        AssertTrue(script.Contains("run --project $(Quote-ProcessArgument $serviceProject) --configuration Release", StringComparison.Ordinal), "The Service project path is not explicitly quoted for Start-Process.");
+        AssertTrue(script.Contains("run --project $(Quote-ProcessArgument $uiProject) --configuration Release", StringComparison.Ordinal), "The UI project path is not explicitly quoted for Start-Process.");
+        AssertTrue(script.Contains("-ArgumentList $serviceArguments", StringComparison.Ordinal) && script.Contains("-ArgumentList $uiArguments", StringComparison.Ordinal), "Start-Process does not receive the explicitly constructed command line.");
+        AssertTrue(!script.Contains("$serviceArguments = @(", StringComparison.Ordinal) && !script.Contains("$uiArguments = @(", StringComparison.Ordinal), "The script still relies on Start-Process ArgumentList arrays.");
         return Task.CompletedTask;
     }
 
