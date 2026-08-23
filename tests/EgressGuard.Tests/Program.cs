@@ -139,6 +139,8 @@ internal static class Program
             ("SQLite persists every bounded correlation batch", TestCorrelationPersistenceBatchAsync),
             ("File history query is bounded stable filtered and private", TestFileHistoryQueryAsync),
             ("File history CSV uses BOM escaping and formula neutralization", TestFileHistoryCsvAsync),
+            ("File history pagination validation rejects malformed and repeated pages", TestFileHistoryPaginationValidationAsync),
+            ("File history export validates pages and enforces bounds", TestFileHistoryExportBoundariesAsync),
             ("SQLite lock fails without unsafe fallback", TestDatabaseLockAsync),
             ("Service graceful cancellation completes without failure logs", TestGracefulCancellationAsync),
             ("Automatic firewall rule rolls back on persistence failure", TestAutomaticRuleRollbackAsync),
@@ -2249,6 +2251,177 @@ internal static class Program
         }
     }
 
+    private static Task TestFileHistoryPaginationValidationAsync()
+    {
+        var start = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var end = start.AddDays(1);
+        var timestamp = start.AddHours(12);
+        var first = HistoryItemForTest(2, timestamp);
+        var second = HistoryItemForTest(1, timestamp);
+        var third = HistoryItemForTest(0, timestamp);
+        var request = new GetFileActivityHistoryMessage(start, end, Limit: 2);
+        var sensor = new FileSensorStatus(FileSensorState.Running, 0, null, timestamp);
+        var seen = new HashSet<Guid>();
+        var used = new HashSet<string>(StringComparer.Ordinal);
+
+        var firstPage = new FileActivityHistoryMessage(start, end, [first, second], true,
+            new FileActivityHistoryCursorMessage(second.ActivityTimestampUtc, second.Id), sensor);
+        var cursor = FileActivityHistoryPaginationValidator.Validate(request, firstPage, seen, used);
+        AssertEqual(second.Id, cursor!.Id);
+        var secondRequest = request with { Cursor = cursor };
+        var secondPage = new FileActivityHistoryMessage(start, end, [third], false, null, sensor);
+        FileActivityHistoryPaginationValidator.Validate(secondRequest, secondPage, seen, used);
+        AssertEqual(3, seen.Count);
+
+        AssertThrows<InvalidDataException>(() => FileActivityHistoryPaginationValidator.Validate(
+            request,
+            firstPage with { StartUtc = start.AddMinutes(1) },
+            new HashSet<Guid>(),
+            new HashSet<string>(StringComparer.Ordinal)));
+        AssertThrows<InvalidDataException>(() => FileActivityHistoryPaginationValidator.Validate(
+            request,
+            firstPage with { Items = [first, second, third] },
+            new HashSet<Guid>(),
+            new HashSet<string>(StringComparer.Ordinal)));
+        AssertThrows<InvalidDataException>(() => FileActivityHistoryPaginationValidator.Validate(
+            request,
+            firstPage with { Items = [second, first] },
+            new HashSet<Guid>(),
+            new HashSet<string>(StringComparer.Ordinal)));
+        AssertThrows<InvalidDataException>(() => FileActivityHistoryPaginationValidator.Validate(
+            request,
+            firstPage with { HasMore = true, NextCursor = null },
+            new HashSet<Guid>(),
+            new HashSet<string>(StringComparer.Ordinal)));
+        AssertThrows<InvalidDataException>(() => FileActivityHistoryPaginationValidator.Validate(
+            request,
+            firstPage with { HasMore = true, Items = [] },
+            new HashSet<Guid>(),
+            new HashSet<string>(StringComparer.Ordinal)));
+        var repeatedCursor = new HashSet<string>(StringComparer.Ordinal)
+        {
+            FileActivityHistoryPaginationValidator.CursorKey(firstPage.NextCursor!)
+        };
+        AssertThrows<InvalidDataException>(() => FileActivityHistoryPaginationValidator.Validate(
+            request,
+            firstPage,
+            new HashSet<Guid>(),
+            repeatedCursor));
+        return Task.CompletedTask;
+    }
+
+    private static async Task TestFileHistoryExportBoundariesAsync()
+    {
+        var exact = await RunHistoryExportFixtureAsync(5_000).ConfigureAwait(false);
+        AssertEqual(5_000, exact.WrittenCount);
+        AssertTrue(!exact.Status.Contains("limited", StringComparison.OrdinalIgnoreCase), "Exactly 5,000 rows were incorrectly reported as truncated.");
+
+        var over = await RunHistoryExportFixtureAsync(5_201).ConfigureAwait(false);
+        AssertEqual(FileActivityHistoryCsvExporter.MaximumRows, over.WrittenCount);
+        AssertTrue(over.Status.Contains("limited", StringComparison.OrdinalIgnoreCase), "An export over 5,000 rows did not report truncation.");
+
+        var sameTimestamp = await RunHistoryExportFixtureAsync(401, sameTimestamp: true).ConfigureAwait(false);
+        AssertEqual(401, sameTimestamp.WrittenCount);
+        AssertEqual(401, sameTimestamp.WrittenIds!.Distinct().Count());
+
+        var canceledRequests = 0;
+        var canceledWrites = 0;
+        async Task<FileActivityHistoryMessage> UnexpectedFetch(GetFileActivityHistoryMessage request, CancellationToken cancellationToken)
+        {
+            canceledRequests++;
+            await Task.Yield();
+            throw new TestFailureException("A canceled file picker still fetched history.");
+        }
+
+        await using (var session = new MainWindowRequestSession("history-cancel-" + Guid.NewGuid().ToString("N")))
+        await using (var viewModel = new MainWindowViewModel(
+            session,
+            null,
+            historyFetcher: UnexpectedFetch,
+            historyPathPicker: () => null,
+            historyWriter: (_, _, _) =>
+            {
+                canceledWrites++;
+                return Task.CompletedTask;
+            }))
+        {
+            await viewModel.ExportFileActivityHistoryForTestAsync().ConfigureAwait(false);
+        }
+
+        AssertEqual(0, canceledRequests);
+        AssertEqual(0, canceledWrites);
+
+        var writeFailure = await RunHistoryExportFixtureAsync(1, failWrite: true).ConfigureAwait(false);
+        AssertEqual(0, writeFailure.WrittenCount);
+        AssertTrue(writeFailure.Status.Contains("failed", StringComparison.OrdinalIgnoreCase), "A write failure was not reported.");
+        AssertTrue(!writeFailure.Status.Contains("complete", StringComparison.OrdinalIgnoreCase), "A write failure was reported as successful.");
+
+        var invalidResponse = await RunHistoryExportFixtureAsync(1, invalidResponse: true).ConfigureAwait(false);
+        AssertEqual(0, invalidResponse.WrittenCount);
+        AssertTrue(invalidResponse.Status.Contains("failed", StringComparison.OrdinalIgnoreCase), "An invalid page was not reported as an export failure.");
+    }
+
+    private static async Task<(int WrittenCount, IReadOnlyList<Guid>? WrittenIds, string Status)> RunHistoryExportFixtureAsync(
+        int total,
+        bool failWrite = false,
+        bool invalidResponse = false,
+        bool sameTimestamp = false)
+    {
+        var fixtureTimestamp = DateTimeOffset.UtcNow;
+        var ordered = Enumerable.Range(0, total)
+            .Select(index => HistoryItemForTest(index, sameTimestamp ? fixtureTimestamp : DateTimeOffset.UtcNow))
+            .OrderByDescending(item => item.ActivityTimestampUtc)
+            .ThenByDescending(item => item.Id)
+            .ToArray();
+        var fetchCount = 0;
+        var written = new List<FileCorrelationHistoryItem>();
+        async Task<FileActivityHistoryMessage> FetchAsync(GetFileActivityHistoryMessage request, CancellationToken cancellationToken)
+        {
+            fetchCount++;
+            await Task.Yield();
+            if (invalidResponse)
+            {
+                return new FileActivityHistoryMessage(request.StartUtc.AddSeconds(1), request.EndUtc, [], false, null,
+                    new FileSensorStatus(FileSensorState.Running, 0, null, request.EndUtc));
+            }
+
+            var offset = request.Cursor is null
+                ? 0
+                : Array.FindIndex(ordered, item => item.Id == request.Cursor.Id && item.ActivityTimestampUtc == request.Cursor.ActivityTimestampUtc) + 1;
+            AssertTrue(offset > 0 || request.Cursor is null, "The export cursor did not identify a record.");
+            var items = ordered.Skip(offset).Take(request.Limit).ToArray();
+            var hasMore = offset + items.Length < ordered.Length;
+            var nextCursor = hasMore
+                ? new FileActivityHistoryCursorMessage(items[^1].ActivityTimestampUtc, items[^1].Id)
+                : null;
+            return new FileActivityHistoryMessage(request.StartUtc, request.EndUtc, items, hasMore, nextCursor,
+                new FileSensorStatus(FileSensorState.Running, 0, null, request.EndUtc));
+        }
+
+        async Task WriteAsync(string path, IReadOnlyList<FileCorrelationHistoryItem> items, CancellationToken cancellationToken)
+        {
+            if (failWrite)
+                throw new IOException("controlled write failure");
+            written.AddRange(items);
+            await Task.CompletedTask.ConfigureAwait(false);
+        }
+
+        await using var session = new MainWindowRequestSession("history-export-" + Guid.NewGuid().ToString("N"));
+        await using var viewModel = new MainWindowViewModel(
+            session,
+            null,
+            historyFetcher: FetchAsync,
+            historyPathPicker: () => "controlled-history.csv",
+            historyWriter: WriteAsync);
+        await viewModel.ExportFileActivityHistoryForTestAsync().ConfigureAwait(false);
+        AssertTrue(fetchCount > 0, "The export did not request any history pages.");
+        return (written.Count, written.Select(item => item.Id).ToArray(), viewModel.FileActivityHistoryExportStatus);
+    }
+
+    private static FileCorrelationHistoryItem HistoryItemForTest(int index, DateTimeOffset timestamp) =>
+        new(Guid.Parse($"00000000-0000-0000-0000-{index + 1:D12}"), "history-flow", $"process-{index}",
+            FileActivityOperation.Read, $"file-{index}.txt", ".txt", timestamp, 0, CorrelationConfidence.High, "controlled test");
+
     private static async Task TestUiFileHistoryStaleResponseAsync()
     {
         var requests = new List<(GetFileActivityHistoryMessage Request, TaskCompletionSource<FileActivityHistoryMessage> Response)>();
@@ -2281,7 +2454,7 @@ internal static class Program
             await Task.Delay(10).ConfigureAwait(false);
         }
 
-        var fresh = new FileCorrelationHistoryItem(Guid.NewGuid(), "new-flow", "new-process", FileActivityOperation.Read, "file-new.txt", ".txt", DateTimeOffset.UtcNow, 0, CorrelationConfidence.High, "safe");
+        var fresh = new FileCorrelationHistoryItem(Guid.NewGuid(), "new-flow", "new-process", FileActivityOperation.Read, "file-new.txt", ".txt", requests[1].Request.EndUtc, 0, CorrelationConfidence.High, "safe");
         lock (requests)
         {
             requests[1].Response.SetResult(new FileActivityHistoryMessage(requests[1].Request.StartUtc, requests[1].Request.EndUtc, [fresh], false, null, new FileSensorStatus(FileSensorState.Running, 0, null, DateTimeOffset.UtcNow)));

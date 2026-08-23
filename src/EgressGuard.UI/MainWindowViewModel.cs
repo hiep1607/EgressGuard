@@ -21,6 +21,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     private readonly DispatcherTimer _batchTimer;
     private readonly BoundedSelectionRefresh<FileCorrelationsMessage> _correlationRefresh;
     private readonly Func<GetFileActivityHistoryMessage, CancellationToken, Task<FileActivityHistoryMessage>> _historyFetcher;
+    private readonly Func<string?> _historyPathPicker;
+    private readonly Func<string, IReadOnlyList<FileCorrelationHistoryItem>, CancellationToken, Task> _historyWriter;
     private Task? _subscriptionTask;
     private long _lastSequence;
     private int _resyncRequested;
@@ -56,6 +58,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     private long _historyGeneration;
     private DateTimeOffset _historyEndUtc;
     private FileActivityHistoryCursorMessage? _historyCursor;
+    private readonly HashSet<Guid> _historySeenIds = [];
+    private readonly HashSet<string> _historyUsedCursors = new(StringComparer.Ordinal);
     private bool _historyHasMore;
     private bool _historyLoading;
     private bool _historyLoadFailed;
@@ -76,7 +80,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         bool ownsRequestSession = false,
         Func<string, CancellationToken, Task<FileCorrelationsMessage>>? fileCorrelationFetcher = null,
         TimeSpan? fileCorrelationMinimumInterval = null,
-        Func<GetFileActivityHistoryMessage, CancellationToken, Task<FileActivityHistoryMessage>>? historyFetcher = null)
+        Func<GetFileActivityHistoryMessage, CancellationToken, Task<FileActivityHistoryMessage>>? historyFetcher = null,
+        Func<string?>? historyPathPicker = null,
+        Func<string, IReadOnlyList<FileCorrelationHistoryItem>, CancellationToken, Task>? historyWriter = null)
     {
         _requestSession = requestSession ?? throw new ArgumentNullException(nameof(requestSession));
         _eventClient = new EgressGuardEventClient(pipeName);
@@ -93,6 +99,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
             HandleFileCorrelationFailure,
             fileCorrelationMinimumInterval ?? TimeSpan.FromSeconds(1));
         _historyFetcher = historyFetcher ?? FetchFileActivityHistoryAsync;
+        _historyPathPicker = historyPathPicker ?? PickFileActivityHistoryPath;
+        _historyWriter = historyWriter ?? FileActivityHistoryCsvExporter.WriteAsync;
         _batchTimer.Tick += OnBatchTimerTick;
         RefreshCommand = new AsyncCommand(RefreshAsync);
         AllowCommand = new AsyncCommand(() => CreateRuleAsync(FirewallAction.Allow));
@@ -299,6 +307,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         _historyLoading = true;
         _historyLoadFailed = false;
         _historySensorState = null;
+        _historySeenIds.Clear();
+        _historyUsedCursors.Clear();
         FileActivityHistoryExportStatus = string.Empty;
         Replace(FileActivityHistory, []);
         RefreshFileActivityHistoryPresentation();
@@ -306,7 +316,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         {
             await LoadFileActivityHistoryPageAsync(generation, reset: true, cancellationToken: requestCancellation.Token).ConfigureAwait(true);
         }
-        catch (OperationCanceledException) when (requestCancellation.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
         }
         catch (Exception exception) when (exception is IOException or TimeoutException or InvalidDataException or UnauthorizedAccessException)
@@ -337,7 +347,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         {
             await LoadFileActivityHistoryPageAsync(generation, reset: false, cancellationToken: requestCancellation.Token).ConfigureAwait(true);
         }
-        catch (OperationCanceledException) when (requestCancellation.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
         }
         catch (Exception exception) when (exception is IOException or TimeoutException or InvalidDataException or UnauthorizedAccessException)
@@ -360,13 +370,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         if (generation != Interlocked.Read(ref _historyGeneration) || cancellationToken.IsCancellationRequested)
             return;
 
+        var nextCursor = FileActivityHistoryPaginationValidator.Validate(request, response, _historySeenIds, _historyUsedCursors);
         foreach (var item in response.Items)
-        {
-            if (FileActivityHistory.All(row => row.Id != item.Id))
-                FileActivityHistory.Add(new FileActivityHistoryRow(item));
-        }
+            FileActivityHistory.Add(new FileActivityHistoryRow(item));
 
-        _historyCursor = response.NextCursor;
+        _historyCursor = nextCursor;
         _historyHasMore = response.HasMore;
         _historySensorState = response.SensorStatus.State;
         _historyLoading = false;
@@ -454,10 +462,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         if (previous is null)
             return;
         previous.Cancel();
-        previous.Dispose();
     }
 
-    public bool FileActivityHistoryCanLoadMore => _historyHasMore && !_historyLoading;
+    public bool FileActivityHistoryCanLoadMore => _historyHasMore && _historyCursor is not null && !_historyLoading;
 
     private async Task RefreshAsync()
     {
@@ -652,7 +659,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         return response.ReadPayload<FileActivityHistoryMessage>();
     }
 
-    private async Task ExportFileActivityHistoryAsync()
+    internal Task ExportFileActivityHistoryForTestAsync() => ExportFileActivityHistoryAsync();
+
+    private static string? PickFileActivityHistoryPath()
     {
         var dialog = new Microsoft.Win32.SaveFileDialog
         {
@@ -662,9 +671,20 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
             AddExtension = true,
             FileName = "egressguard-file-activity-history.csv"
         };
-        if (dialog.ShowDialog() != true)
+        return dialog.ShowDialog() == true ? dialog.FileName : null;
+    }
+
+    private async Task ExportFileActivityHistoryAsync()
+    {
+        var path = _historyPathPicker();
+        if (path is null)
             return;
 
+        await ExportFileActivityHistoryToPathAsync(path).ConfigureAwait(true);
+    }
+
+    private async Task ExportFileActivityHistoryToPathAsync(string path)
+    {
         var endUtc = DateTimeOffset.UtcNow;
         var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellation.Token);
         _historyExporting = true;
@@ -673,6 +693,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         try
         {
             var rows = new List<FileCorrelationHistoryItem>(capacity: 200);
+            var seenIds = new HashSet<Guid>();
+            var usedCursors = new HashSet<string>(StringComparer.Ordinal);
             FileActivityHistoryCursorMessage? cursor = null;
             var truncated = false;
             var search = string.IsNullOrWhiteSpace(FileHistorySearchText) ? null : FileHistorySearchText;
@@ -683,17 +705,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
             {
                 var request = BuildFileActivityHistoryRequest(cursor, endUtc, 200, search, operation, confidence, range);
                 var page = await _historyFetcher(request, cancellation.Token).ConfigureAwait(true);
-                foreach (var item in page.Items)
-                {
-                    if (rows.Count == FileActivityHistoryCsvExporter.MaximumRows)
-                    {
-                        truncated = true;
-                        break;
-                    }
-
-                    if (rows.All(existing => existing.Id != item.Id))
-                        rows.Add(item);
-                }
+                var nextCursor = FileActivityHistoryPaginationValidator.Validate(request, page, seenIds, usedCursors);
+                var remaining = FileActivityHistoryCsvExporter.MaximumRows - rows.Count;
+                if (page.Items.Count > remaining)
+                    truncated = true;
+                rows.AddRange(page.Items.Take(remaining));
 
                 if (!page.HasMore)
                     break;
@@ -703,12 +719,10 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
                     break;
                 }
 
-                cursor = page.NextCursor;
-                if (cursor is null)
-                    break;
+                cursor = nextCursor ?? throw new InvalidDataException("A history response with more pages did not provide a cursor.");
             }
 
-            await FileActivityHistoryCsvExporter.WriteAsync(dialog.FileName, rows, cancellation.Token).ConfigureAwait(true);
+            await _historyWriter(path, rows, cancellation.Token).ConfigureAwait(true);
             FileActivityHistoryExportStatus = truncated
                 ? $"Export complete; report limited to {FileActivityHistoryCsvExporter.MaximumRows.ToString(CultureInfo.InvariantCulture)} rows."
                 : $"Export complete; {rows.Count.ToString(CultureInfo.InvariantCulture)} rows written.";
