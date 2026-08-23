@@ -55,6 +55,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     private bool _fileCorrelationLoading;
     private bool _fileCorrelationLoadFailed;
     private CancellationTokenSource? _historyRequestCancellation;
+    private Task _historyRefreshTask = Task.CompletedTask;
     private long _historyGeneration;
     private DateTimeOffset _historyEndUtc;
     private FileActivityHistoryCursorMessage? _historyCursor;
@@ -122,6 +123,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     internal bool OwnsRequestSession => _ownsRequestSession;
     internal bool FileCorrelationLoading => _fileCorrelationLoading;
     internal bool FileCorrelationLoadFailed => _fileCorrelationLoadFailed;
+    internal bool FileActivityHistoryLoading => _historyLoading;
+    internal bool FileActivityHistoryLoadFailed => _historyLoadFailed;
+    internal Task FileActivityHistoryRefreshTask => _historyRefreshTask;
     public ObservableCollection<FlowRow> Flows { get; } = [];
     public ObservableCollection<FirewallRule> Rules { get; } = [];
     public ObservableCollection<SecurityAlert> Alerts { get; } = [];
@@ -286,7 +290,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         if (!_historyStarted || _disposed)
             return;
 
-        _ = RefreshFileActivityHistoryAsync();
+        _historyRefreshTask = RefreshFileActivityHistoryAsync();
     }
 
     internal async Task RefreshFileActivityHistoryForTestAsync()
@@ -316,19 +320,17 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         {
             await LoadFileActivityHistoryPageAsync(generation, reset: true, cancellationToken: requestCancellation.Token).ConfigureAwait(true);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (requestCancellation.IsCancellationRequested)
         {
         }
-        catch (Exception exception) when (exception is IOException or TimeoutException or InvalidDataException or UnauthorizedAccessException)
+        catch (Exception exception) when (exception is IOException or TimeoutException or InvalidDataException or UnauthorizedAccessException or OperationCanceledException)
         {
             HandleFileActivityHistoryFailure(generation, exception);
         }
         finally
         {
-            if (ReferenceEquals(Interlocked.CompareExchange(ref _historyRequestCancellation, null, requestCancellation), requestCancellation))
-            {
-                requestCancellation.Dispose();
-            }
+            Interlocked.CompareExchange(ref _historyRequestCancellation, null, requestCancellation);
+            requestCancellation.Dispose();
         }
     }
 
@@ -347,19 +349,17 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         {
             await LoadFileActivityHistoryPageAsync(generation, reset: false, cancellationToken: requestCancellation.Token).ConfigureAwait(true);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (requestCancellation.IsCancellationRequested)
         {
         }
-        catch (Exception exception) when (exception is IOException or TimeoutException or InvalidDataException or UnauthorizedAccessException)
+        catch (Exception exception) when (exception is IOException or TimeoutException or InvalidDataException or UnauthorizedAccessException or OperationCanceledException)
         {
             HandleFileActivityHistoryFailure(generation, exception);
         }
         finally
         {
-            if (ReferenceEquals(Interlocked.CompareExchange(ref _historyRequestCancellation, null, requestCancellation), requestCancellation))
-            {
-                requestCancellation.Dispose();
-            }
+            Interlocked.CompareExchange(ref _historyRequestCancellation, null, requestCancellation);
+            requestCancellation.Dispose();
         }
     }
 

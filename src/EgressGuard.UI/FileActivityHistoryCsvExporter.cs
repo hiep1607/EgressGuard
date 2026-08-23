@@ -97,10 +97,10 @@ internal static class FileActivityHistoryPaginationValidator
             throw new InvalidDataException("The history response exceeded the requested limit.");
         if (response.HasMore && response.Items.Count == 0)
             throw new InvalidDataException("A history response with more pages must contain records.");
-        if (!response.HasMore && response.NextCursor is not null)
-            throw new InvalidDataException("A final history response must not contain a cursor.");
         if (response.HasMore && response.NextCursor is null)
             throw new InvalidDataException("A history response with more pages must contain a cursor.");
+        if (response.NextCursor is not null && response.Items.Count == 0)
+            throw new InvalidDataException("A history response cursor must point to a record.");
 
         var pageIds = new HashSet<Guid>();
         for (var index = 0; index < response.Items.Count; index++)
