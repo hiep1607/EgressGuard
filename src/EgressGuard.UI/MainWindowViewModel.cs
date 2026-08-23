@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Globalization;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Windows.Data;
@@ -29,6 +30,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     private string _protocolFilter = "All protocols";
     private string _ipFilter = "All IP versions";
     private string _riskFilter = "All risks";
+    private string _fileActivityFilter = FileActivityFilterAll;
     private FlowRow? _selectedFlow;
     private FirewallRule? _selectedRule;
     private SecurityAlert? _selectedAlert;
@@ -37,7 +39,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     private int _retentionDays = 30;
     private string _databasePath = "Unavailable until connected";
     private string _fileSensorStatus = "File correlation status unavailable";
+    private string _observedFileSensorStatus = "File correlation status unavailable";
+    private FileSensorState? _fileSensorState;
     private bool _fileCorrelationEnabled;
+    private bool _fileCorrelationLoading;
+    private bool _fileCorrelationLoadFailed;
     private bool _disposed;
 
     public MainWindowViewModel()
@@ -48,19 +54,23 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     internal MainWindowViewModel(
         MainWindowRequestSession requestSession,
         string? pipeName,
-        bool ownsRequestSession = false)
+        bool ownsRequestSession = false,
+        Func<string, CancellationToken, Task<FileCorrelationsMessage>>? fileCorrelationFetcher = null,
+        TimeSpan? fileCorrelationMinimumInterval = null)
     {
         _requestSession = requestSession ?? throw new ArgumentNullException(nameof(requestSession));
         _eventClient = new EgressGuardEventClient(pipeName);
         _ownsRequestSession = ownsRequestSession;
         FlowView = CollectionViewSource.GetDefaultView(Flows);
         FlowView.Filter = FilterFlow;
+        FileCorrelationView = CollectionViewSource.GetDefaultView(FileCorrelations);
+        FileCorrelationView.Filter = FilterFileCorrelation;
         _batchTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(_refreshIntervalMilliseconds) };
         _correlationRefresh = new BoundedSelectionRefresh<FileCorrelationsMessage>(
-            FetchFileCorrelationsAsync,
+            fileCorrelationFetcher ?? FetchFileCorrelationsAsync,
             ApplyFileCorrelations,
             HandleFileCorrelationFailure,
-            TimeSpan.FromSeconds(1));
+            fileCorrelationMinimumInterval ?? TimeSpan.FromSeconds(1));
         _batchTimer.Tick += OnBatchTimerTick;
         RefreshCommand = new AsyncCommand(RefreshAsync);
         AllowCommand = new AsyncCommand(() => CreateRuleAsync(FirewallAction.Allow));
@@ -76,14 +86,18 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     public event PropertyChangedEventHandler? PropertyChanged;
     internal MainWindowRequestSession RequestSession => _requestSession;
     internal bool OwnsRequestSession => _ownsRequestSession;
+    internal bool FileCorrelationLoading => _fileCorrelationLoading;
+    internal bool FileCorrelationLoadFailed => _fileCorrelationLoadFailed;
     public ObservableCollection<FlowRow> Flows { get; } = [];
     public ObservableCollection<FirewallRule> Rules { get; } = [];
     public ObservableCollection<SecurityAlert> Alerts { get; } = [];
-    public ObservableCollection<FileCorrelation> FileCorrelations { get; } = [];
+    public ObservableCollection<FileCorrelationRow> FileCorrelations { get; } = [];
     public ICollectionView FlowView { get; }
+    public ICollectionView FileCorrelationView { get; }
     public IReadOnlyList<string> ProtocolFilters { get; } = ["All protocols", "TCP", "UDP"];
     public IReadOnlyList<string> IpFilters { get; } = ["All IP versions", "IPv4", "IPv6"];
     public IReadOnlyList<string> RiskFilters { get; } = ["All risks", "Low", "Medium", "High", "Critical"];
+    public IReadOnlyList<string> FileActivityFilters { get; } = [FileActivityFilterAll, FileActivityFilterReadOpen, FileActivityFilterModify];
     public IReadOnlyList<ProtectionMode> ProtectionModes { get; } = Enum.GetValues<ProtectionMode>();
     public ICommand RefreshCommand { get; }
     public ICommand AllowCommand { get; }
@@ -103,9 +117,24 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     public string DatabasePath { get => _databasePath; private set => Set(ref _databasePath, value); }
     public string FileSensorStatus { get => _fileSensorStatus; private set => Set(ref _fileSensorStatus, value); }
     public bool FileCorrelationEnabled { get => _fileCorrelationEnabled; private set => Set(ref _fileCorrelationEnabled, value); }
-    public string FileCorrelationEmptyState => FileCorrelations.Count == 0
-        ? FileCorrelationEnabled ? "No related file activity was observed for this connection." : "File correlation is disabled."
-        : string.Empty;
+    public string FileCorrelationEmptyState
+    {
+        get
+        {
+            if (_fileCorrelationLoading) return "Loading file activity for this connection…";
+            if (_fileCorrelationLoadFailed) return "File activity is unavailable for this connection.";
+            if (!FileCorrelationEnabled) return "File activity tracking is disabled.";
+            if (!FileCorrelationView.IsEmpty) return string.Empty;
+            if (FileCorrelations.Count > 0) return "No related file activity matches the selected filter.";
+            return _fileSensorState switch
+            {
+                FileSensorState.AccessDenied => "File activity tracking permission was denied.",
+                FileSensorState.ProviderUnavailable or FileSensorState.Failed => "File activity tracking is unavailable.",
+                FileSensorState.Stopped => "File activity tracking has stopped.",
+                _ => "No related file activity was observed for this connection."
+            };
+        }
+    }
     public bool NotificationsEnabled { get; set; } = true;
     public int RetentionDays { get => _retentionDays; set => Set(ref _retentionDays, Math.Clamp(value, 1, 3650)); }
     public int RefreshIntervalMilliseconds { get => _refreshIntervalMilliseconds; set { if (Set(ref _refreshIntervalMilliseconds, Math.Clamp(value, 100, 1000))) _batchTimer.Interval = TimeSpan.FromMilliseconds(_refreshIntervalMilliseconds); } }
@@ -117,11 +146,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         {
             if (Set(ref _selectedFlow, value))
             {
-                if (value is null)
-                {
-                    Replace(FileCorrelations, []);
-                    OnPropertyChanged(nameof(FileCorrelationEmptyState));
-                }
+                Replace(FileCorrelations, []);
+                FileCorrelationView.Refresh();
+                _fileCorrelationLoading = value is not null;
+                _fileCorrelationLoadFailed = false;
+                RefreshFileCorrelationPresentation();
 
                 _correlationRefresh.Select(value?.Flow.Id);
             }
@@ -145,6 +174,16 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     public string ProtocolFilter { get => _protocolFilter; set { if (Set(ref _protocolFilter, value)) FlowView.Refresh(); } }
     public string IpFilter { get => _ipFilter; set { if (Set(ref _ipFilter, value)) FlowView.Refresh(); } }
     public string RiskFilter { get => _riskFilter; set { if (Set(ref _riskFilter, value)) FlowView.Refresh(); } }
+    public string FileActivityFilter
+    {
+        get => _fileActivityFilter;
+        set
+        {
+            if (!Set(ref _fileActivityFilter, value)) return;
+            FileCorrelationView.Refresh();
+            OnPropertyChanged(nameof(FileCorrelationEmptyState));
+        }
+    }
 
     public async Task StartAsync()
     {
@@ -322,31 +361,76 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
 
     private void ApplyFileCorrelations(string flowId, FileCorrelationsMessage payload)
     {
-        if (SelectedFlow?.Flow.Id != flowId) return;
-        Replace(FileCorrelations, payload.Correlations);
-        FileSensorStatus = FormatFileSensor(payload.SensorStatus);
-        OnPropertyChanged(nameof(FileCorrelationEmptyState));
+        var selectedFlowId = SelectedFlow?.Flow.Id;
+        var identifiersMatch = string.Equals(flowId, selectedFlowId, StringComparison.Ordinal)
+            && string.Equals(selectedFlowId, payload.FlowId, StringComparison.Ordinal)
+            && string.Equals(payload.FlowId, flowId, StringComparison.Ordinal);
+        if (!identifiersMatch)
+        {
+            if (string.Equals(flowId, selectedFlowId, StringComparison.Ordinal))
+            {
+                HandleFileCorrelationFailure(
+                    flowId,
+                    new InvalidDataException("File correlation response did not match the selected connection."));
+            }
+            return;
+        }
+
+        Replace(FileCorrelations, payload.Correlations.Select(item => new FileCorrelationRow(item)));
+        _fileSensorState = payload.SensorStatus.State;
+        _observedFileSensorStatus = FormatFileSensor(payload.SensorStatus);
+        _fileCorrelationLoading = false;
+        _fileCorrelationLoadFailed = false;
+        FileCorrelationView.Refresh();
+        RefreshFileCorrelationPresentation();
     }
 
-    private void HandleFileCorrelationFailure(Exception exception)
+    private void HandleFileCorrelationFailure(string flowId, Exception exception)
     {
         if (exception is not (IOException or TimeoutException or InvalidDataException)) return;
+        if (!string.Equals(SelectedFlow?.Flow.Id, flowId, StringComparison.Ordinal)) return;
         Replace(FileCorrelations, []);
-        FileSensorStatus = "File correlation unavailable";
+        FileCorrelationView.Refresh();
+        _fileCorrelationLoading = false;
+        _fileCorrelationLoadFailed = true;
         LastOperation = exception.Message;
-        OnPropertyChanged(nameof(FileCorrelationEmptyState));
+        RefreshFileCorrelationPresentation();
     }
 
-    private void UpdateFileSensor(ServiceStatusMessage status)
+    internal void UpdateFileSensor(ServiceStatusMessage status)
     {
         FileCorrelationEnabled = status.FileCorrelationEnabled;
-        FileSensorStatus = status.FileSensor is null ? "File correlation status unavailable" : FormatFileSensor(status.FileSensor);
+        _fileSensorState = status.FileSensor?.State;
+        _observedFileSensorStatus = status.FileSensor is null ? "File correlation status unavailable" : FormatFileSensor(status.FileSensor);
+        RefreshFileCorrelationPresentation();
+    }
+
+    private void RefreshFileCorrelationPresentation()
+    {
+        FileSensorStatus = _fileCorrelationLoading
+            ? "File activity for this connection is loading…"
+            : _fileCorrelationLoadFailed
+                ? "File activity is unavailable for this connection."
+                : _observedFileSensorStatus;
         OnPropertyChanged(nameof(FileCorrelationEmptyState));
     }
 
-    private static string FormatFileSensor(FileSensorStatus status) => status.Detail is null
-        ? $"File sensor: {status.State} · dropped {status.DroppedEvents}"
-        : $"File sensor: {status.State} · dropped {status.DroppedEvents} · {status.Detail}";
+    internal static string FormatFileSensor(FileSensorStatus status)
+    {
+        ArgumentNullException.ThrowIfNull(status);
+        var state = status.State switch
+        {
+            FileSensorState.Disabled => "disabled",
+            FileSensorState.Starting => "starting",
+            FileSensorState.Running => "active",
+            FileSensorState.AccessDenied => "permission denied",
+            FileSensorState.ProviderUnavailable or FileSensorState.Failed => "unavailable",
+            FileSensorState.OverflowDegraded => "active with dropped events",
+            FileSensorState.Stopped => "stopped",
+            _ => "unavailable"
+        };
+        return $"File activity tracker: {state} · dropped {Math.Max(0, status.DroppedEvents)}";
+    }
 
     private async Task CreateRuleAsync(FirewallAction action)
     {
@@ -397,6 +481,21 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
             && (IpFilter == "All IP versions" || row.Flow.IpVersion.ToString() == IpFilter)
             && (RiskFilter == "All risks" || row.Risk.Equals(RiskFilter, StringComparison.OrdinalIgnoreCase));
     }
+
+    private bool FilterFileCorrelation(object item) =>
+        item is FileCorrelationRow row && MatchesFileActivityFilter(row.Operation, FileActivityFilter);
+
+    internal static bool MatchesFileActivityFilter(FileActivityOperation operation, string filter) => filter switch
+    {
+        FileActivityFilterAll => true,
+        FileActivityFilterReadOpen => operation is FileActivityOperation.Read or FileActivityOperation.OpenCreate,
+        FileActivityFilterModify => operation is FileActivityOperation.Write or FileActivityOperation.Rename or FileActivityOperation.Delete,
+        _ => false
+    };
+
+    internal const string FileActivityFilterAll = "All file activity";
+    internal const string FileActivityFilterReadOpen = "Read / open";
+    internal const string FileActivityFilterModify = "Write / rename / delete";
 
     private static void Replace<T>(ObservableCollection<T> target, IEnumerable<T> values)
     {
@@ -457,6 +556,43 @@ public sealed class FlowRow
     public string Parent => $"Parent PID: {Flow.ParentProcessId?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "Unavailable"}";
     public string Destination => $"Destination: {Remote}; domain evidence: {Flow.Destination?.DomainEvidence ?? "Unavailable"}";
     public string Reasons => "Risk reasons: " + string.Join(" | ", Flow.Risk?.Reasons.Select(reason => $"{reason.Code} ({reason.Points:+#;-#;0}): {reason.Message}") ?? []);
+}
+
+public sealed class FileCorrelationRow
+{
+    public FileCorrelationRow(FileCorrelation correlation)
+    {
+        ArgumentNullException.ThrowIfNull(correlation);
+        var protectedCorrelation = FileCorrelationPrivacy.ProtectForBoundary(correlation);
+        Operation = protectedCorrelation.Operation;
+        OperationLabel = protectedCorrelation.Operation switch
+        {
+            FileActivityOperation.OpenCreate => "Open / create",
+            FileActivityOperation.Read => "Read",
+            FileActivityOperation.Write => "Write",
+            FileActivityOperation.Rename => "Rename",
+            FileActivityOperation.Delete => "Delete",
+            _ => "Unknown"
+        };
+        RedactedFileLabel = protectedCorrelation.DisplayPath;
+        ActivityTimestampUtc = protectedCorrelation.ActivityTimestampUtc;
+        ActivityTime = protectedCorrelation.ActivityTimestampUtc.ToLocalTime().ToString("G", CultureInfo.CurrentCulture);
+        var absoluteDelta = Math.Abs(protectedCorrelation.TimeDeltaSeconds);
+        RelativeTiming = absoluteDelta < 0.0005
+            ? "At connection time"
+            : $"{absoluteDelta:0.###} s {(protectedCorrelation.TimeDeltaSeconds < 0 ? "before" : "after")} connection";
+        Confidence = protectedCorrelation.Confidence.ToString();
+        Reason = protectedCorrelation.Reason;
+    }
+
+    public FileActivityOperation Operation { get; }
+    public string OperationLabel { get; }
+    public string RedactedFileLabel { get; }
+    public DateTimeOffset ActivityTimestampUtc { get; }
+    public string ActivityTime { get; }
+    public string RelativeTiming { get; }
+    public string Confidence { get; }
+    public string Reason { get; }
 }
 
 internal sealed class AsyncCommand(Func<Task> execute) : ICommand

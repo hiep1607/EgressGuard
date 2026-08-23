@@ -12,7 +12,7 @@ internal sealed class BoundedSelectionRefresh<T> : IAsyncDisposable
     });
     private readonly Func<string, CancellationToken, Task<T>> _fetch;
     private readonly Action<string, T> _apply;
-    private readonly Action<Exception> _failed;
+    private readonly Action<string, Exception> _failed;
     private readonly TimeSpan _minimumInterval;
     private readonly CancellationTokenSource _lifetime = new();
     private readonly object _sync = new();
@@ -25,7 +25,7 @@ internal sealed class BoundedSelectionRefresh<T> : IAsyncDisposable
     public BoundedSelectionRefresh(
         Func<string, CancellationToken, Task<T>> fetch,
         Action<string, T> apply,
-        Action<Exception> failed,
+        Action<string, Exception> failed,
         TimeSpan? minimumInterval = null)
     {
         _fetch = fetch;
@@ -114,7 +114,12 @@ internal sealed class BoundedSelectionRefresh<T> : IAsyncDisposable
             }
             catch (Exception exception)
             {
-                _failed(exception);
+                lock (_sync)
+                {
+                    if (!IsCurrent(request) || requestCancellation.IsCancellationRequested) continue;
+                }
+
+                _failed(request.FlowId, exception);
             }
         }
     }

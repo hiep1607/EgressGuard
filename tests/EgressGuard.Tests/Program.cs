@@ -110,6 +110,11 @@ internal static class Program
             ("Promoted correlation cleanup work is bounded", TestPromotedCorrelationCleanupAsync),
             ("ETW ownership reclaims only an exact verified orphan", TestEtwOwnershipAsync),
             ("AccessDenied file sensor does not crash network service", TestFileSensorDegradedServiceAsync),
+            ("File activity UI presents operations filters status and limitation", TestFileActivityUiPresentationAsync),
+            ("File activity selection clears stale data and rejects mismatched responses", TestFileActivitySelectionIsolationAsync),
+            ("File activity request failures stay unavailable and recover", TestFileActivityFailureRecoveryAsync),
+            ("File activity drop totals include every bounded observation buffer", TestFileActivityDropAggregationAsync),
+            ("File activity evidence stays redacted through protocol persistence and UI", TestFileActivityPrivacyBoundariesAsync),
             ("Native port conversion", TestPortConversionAsync),
             ("Endpoint formatting", TestEndpointFormattingAsync),
             ("Executable metadata hashes and caches", TestExecutableMetadataAsync),
@@ -1014,6 +1019,370 @@ internal static class Program
         {
             SqliteConnection.ClearAllPools();
             Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    private static async Task TestFileActivityUiPresentationAsync()
+    {
+        var flow = SampleFlow();
+        FileActivityOperation[] operations =
+        [
+            FileActivityOperation.Read,
+            FileActivityOperation.OpenCreate,
+            FileActivityOperation.Write,
+            FileActivityOperation.Rename,
+            FileActivityOperation.Delete
+        ];
+        var correlations = operations.Select((operation, index) => new FileCorrelation(
+            Guid.NewGuid(), flow.Id, flow.ProcessIdentity!.Value, flow.ProcessName, operation,
+            $"{index:X64}", $"file-{index:X12}.egfixture", ".egfixture",
+            flow.FirstSeen.AddSeconds(index - 2), index - 2,
+            CorrelationConfidence.Medium,
+            $"Same process identity; file {operation} near outbound flow first-seen.",
+            flow.FirstSeen)).ToArray();
+        var rows = correlations.Select(item => new FileCorrelationRow(item)).ToArray();
+
+        AssertTrue(
+            rows.Select(row => row.OperationLabel).SequenceEqual(["Read", "Open / create", "Write", "Rename", "Delete"]),
+            "File activity operations were not presented with the expected labels.");
+        AssertEqual("2 s before connection", rows[0].RelativeTiming);
+        AssertEqual("At connection time", rows[2].RelativeTiming);
+        AssertEqual("2 s after connection", rows[4].RelativeTiming);
+        AssertTrue(rows.All(row => row.RedactedFileLabel.StartsWith("file-", StringComparison.Ordinal)), "A UI row did not use a redacted file label.");
+
+        var pipeName = $"{ProtocolConstants.PipeName}.FileUi.{Guid.NewGuid():N}";
+        await RunStaAsync(async () =>
+        {
+            await using var requestSession = new MainWindowRequestSession(pipeName);
+            await using var viewModel = new MainWindowViewModel(requestSession, pipeName);
+            foreach (var row in rows) viewModel.FileCorrelations.Add(row);
+
+            viewModel.FileActivityFilter = MainWindowViewModel.FileActivityFilterReadOpen;
+            AssertTrue(
+                viewModel.FileCorrelationView.Cast<FileCorrelationRow>().Select(row => row.Operation)
+                    .SequenceEqual([FileActivityOperation.Read, FileActivityOperation.OpenCreate]),
+                "Read/open filter included the wrong operations.");
+            viewModel.FileActivityFilter = MainWindowViewModel.FileActivityFilterModify;
+            AssertTrue(
+                viewModel.FileCorrelationView.Cast<FileCorrelationRow>().Select(row => row.Operation)
+                    .SequenceEqual([FileActivityOperation.Write, FileActivityOperation.Rename, FileActivityOperation.Delete]),
+                "Write/rename/delete filter included the wrong operations.");
+            viewModel.FileActivityFilter = MainWindowViewModel.FileActivityFilterAll;
+            AssertEqual(5, viewModel.FileCorrelationView.Cast<FileCorrelationRow>().Count());
+            AssertEqual(0, requestSession.PendingOperationCount);
+            AssertTrue(!requestSession.IsConnected, "A presentation-only UI test opened a request connection.");
+        }).ConfigureAwait(false);
+
+        AssertEqual(
+            "File activity tracker: active · dropped 0",
+            MainWindowViewModel.FormatFileSensor(new FileSensorStatus(FileSensorState.Running, 0, null, flow.FirstSeen)));
+        AssertTrue(
+            MainWindowViewModel.FormatFileSensor(new FileSensorStatus(FileSensorState.AccessDenied, 2, null, flow.FirstSeen)).Contains("permission denied · dropped 2", StringComparison.Ordinal),
+            "AccessDenied was not presented truthfully.");
+        AssertTrue(
+            MainWindowViewModel.FormatFileSensor(new FileSensorStatus(FileSensorState.ProviderUnavailable, 3, null, flow.FirstSeen)).Contains("unavailable · dropped 3", StringComparison.Ordinal),
+            "ProviderUnavailable was not presented truthfully.");
+        AssertTrue(
+            MainWindowViewModel.FormatFileSensor(new FileSensorStatus(FileSensorState.Stopped, 4, null, flow.FirstSeen)).Contains("stopped · dropped 4", StringComparison.Ordinal),
+            "Stopped was not presented truthfully.");
+
+        var repositoryRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", ".."));
+        var xaml = await File.ReadAllTextAsync(Path.Combine(repositoryRoot, "src", "EgressGuard.UI", "MainWindow.xaml")).ConfigureAwait(false);
+        AssertTrue(xaml.Contains("AutomationProperties.AutomationId=\"FileActivityFilter\"", StringComparison.Ordinal), "File activity filter was not exposed in the connection detail UI.");
+        AssertTrue(xaml.Contains("Related activity does not prove that file contents were transmitted.", StringComparison.Ordinal), "The file-correlation limitation is not always present in the UI markup.");
+        AssertTrue(!xaml.Contains("file was uploaded", StringComparison.OrdinalIgnoreCase), "The UI makes an unsupported upload claim.");
+    }
+
+    private static async Task TestFileActivitySelectionIsolationAsync()
+    {
+        var now = new DateTimeOffset(2026, 2, 1, 0, 0, 0, TimeSpan.Zero);
+        var flowA = SampleFlow() with { Id = "file-flow-a", FirstSeen = now, LastSeen = now.AddSeconds(1) };
+        var flowB = SampleFlow() with { Id = "file-flow-b", FirstSeen = now, LastSeen = now.AddSeconds(1) };
+        var flowC = SampleFlow() with { Id = "file-flow-c", FirstSeen = now, LastSeen = now.AddSeconds(1) };
+        var requests = new Dictionary<string, (TaskCompletionSource<bool> Started, TaskCompletionSource<FileCorrelationsMessage> Response)>(StringComparer.Ordinal)
+        {
+            [flowA.Id] = NewControlledFileCorrelationRequest(),
+            [flowB.Id] = NewControlledFileCorrelationRequest(),
+            [flowC.Id] = NewControlledFileCorrelationRequest()
+        };
+
+        Task<FileCorrelationsMessage> FetchAsync(string flowId, CancellationToken cancellationToken)
+        {
+            _ = cancellationToken;
+            var request = requests[flowId];
+            request.Started.TrySetResult(true);
+            return request.Response.Task;
+        }
+
+        await RunStaAsync(async () =>
+        {
+            var pipeName = $"{ProtocolConstants.PipeName}.FileSelection.{Guid.NewGuid():N}";
+            await using var requestSession = new MainWindowRequestSession(pipeName);
+            await using var viewModel = new MainWindowViewModel(
+                requestSession,
+                pipeName,
+                fileCorrelationFetcher: FetchAsync,
+                fileCorrelationMinimumInterval: TimeSpan.Zero);
+            viewModel.UpdateFileSensor(EnabledFileCorrelationStatus(now));
+
+            viewModel.SelectedFlow = new FlowRow(flowA);
+            await requests[flowA.Id].Started.Task.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(true);
+            viewModel.FileCorrelations.Add(new FileCorrelationRow(CreateUiFileCorrelation(flowA, 1, FileActivityOperation.Read)));
+            viewModel.FileCorrelationView.Refresh();
+            AssertEqual(1, viewModel.FileCorrelations.Count);
+
+            viewModel.SelectedFlow = new FlowRow(flowB);
+            AssertEqual(0, viewModel.FileCorrelations.Count);
+            AssertTrue(viewModel.FileCorrelationLoading, "Selecting B did not enter the loading state immediately.");
+            AssertTrue(viewModel.FileCorrelationEmptyState.Contains("Loading", StringComparison.Ordinal), "The selected-flow empty state did not report loading.");
+            AssertTrue(!viewModel.FileCorrelationEmptyState.Contains("No related file activity", StringComparison.Ordinal), "Loading B incorrectly reported a successful empty result.");
+
+            requests[flowA.Id].Response.SetResult(FileCorrelationPayload(flowA, now, (1, FileActivityOperation.Read)));
+            await requests[flowB.Id].Started.Task.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(true);
+            AssertEqual(0, viewModel.FileCorrelations.Count);
+            AssertTrue(viewModel.FileCorrelationLoading, "A late result ended B's loading state.");
+
+            requests[flowB.Id].Response.SetResult(FileCorrelationPayload(flowB, now, (2, FileActivityOperation.Write)));
+            await WaitForDispatcherConditionAsync(
+                () => !viewModel.FileCorrelationLoading && viewModel.FileCorrelations.Count == 1,
+                TimeSpan.FromSeconds(3),
+                "B's valid file-activity result was not applied.").ConfigureAwait(true);
+            AssertEqual("file-000000000002.txt", viewModel.FileCorrelations[0].RedactedFileLabel);
+
+            viewModel.SelectedFlow = new FlowRow(flowC);
+            await requests[flowC.Id].Started.Task.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(true);
+            requests[flowC.Id].Response.SetResult(FileCorrelationPayload(flowA, now, (3, FileActivityOperation.Delete)));
+            await WaitForDispatcherConditionAsync(
+                () => viewModel.FileCorrelationLoadFailed,
+                TimeSpan.FromSeconds(3),
+                "A mismatched payload FlowId was not rejected.").ConfigureAwait(true);
+            AssertEqual(0, viewModel.FileCorrelations.Count);
+            AssertTrue(viewModel.FileSensorStatus.Contains("unavailable", StringComparison.OrdinalIgnoreCase), "A mismatched payload did not make the status unavailable.");
+        }).ConfigureAwait(false);
+    }
+
+    private static async Task TestFileActivityFailureRecoveryAsync()
+    {
+        var now = new DateTimeOffset(2026, 2, 2, 0, 0, 0, TimeSpan.Zero);
+        var failureFlows = new[]
+        {
+            SampleFlow() with { Id = "file-flow-io", FirstSeen = now, LastSeen = now.AddSeconds(1) },
+            SampleFlow() with { Id = "file-flow-timeout", FirstSeen = now, LastSeen = now.AddSeconds(1) },
+            SampleFlow() with { Id = "file-flow-invalid", FirstSeen = now, LastSeen = now.AddSeconds(1) }
+        };
+        var successFlow = SampleFlow() with { Id = "file-flow-recovery", FirstSeen = now, LastSeen = now.AddSeconds(1) };
+        var allFlows = failureFlows.Append(successFlow).ToArray();
+        var requests = allFlows.ToDictionary(
+            flow => flow.Id,
+            _ => NewControlledFileCorrelationRequest(),
+            StringComparer.Ordinal);
+
+        Task<FileCorrelationsMessage> FetchAsync(string flowId, CancellationToken cancellationToken)
+        {
+            _ = cancellationToken;
+            var request = requests[flowId];
+            request.Started.TrySetResult(true);
+            return request.Response.Task;
+        }
+
+        Exception[] failures =
+        [
+            new IOException("Controlled file activity I/O failure."),
+            new TimeoutException("Controlled file activity timeout."),
+            new InvalidDataException("Controlled invalid file activity payload.")
+        ];
+
+        await RunStaAsync(async () =>
+        {
+            var pipeName = $"{ProtocolConstants.PipeName}.FileFailure.{Guid.NewGuid():N}";
+            await using var requestSession = new MainWindowRequestSession(pipeName);
+            await using var viewModel = new MainWindowViewModel(
+                requestSession,
+                pipeName,
+                fileCorrelationFetcher: FetchAsync,
+                fileCorrelationMinimumInterval: TimeSpan.Zero);
+            viewModel.UpdateFileSensor(EnabledFileCorrelationStatus(now));
+
+            for (var index = 0; index < failures.Length; index++)
+            {
+                var flow = failureFlows[index];
+                viewModel.SelectedFlow = new FlowRow(flow);
+                AssertTrue(viewModel.FileCorrelationLoading, "A new file-activity request did not enter loading state.");
+                AssertTrue(!viewModel.FileCorrelationLoadFailed, "A new request retained the previous failure state.");
+                await requests[flow.Id].Started.Task.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(true);
+                requests[flow.Id].Response.SetException(failures[index]);
+                await WaitForDispatcherConditionAsync(
+                    () => viewModel.FileCorrelationLoadFailed,
+                    TimeSpan.FromSeconds(3),
+                    $"{failures[index].GetType().Name} did not produce the unavailable state.").ConfigureAwait(true);
+
+                AssertTrue(!viewModel.FileCorrelationLoading, "A failed file-activity request remained loading.");
+                AssertEqual(0, viewModel.FileCorrelations.Count);
+                AssertTrue(viewModel.FileSensorStatus.Contains("unavailable", StringComparison.OrdinalIgnoreCase), "The status line did not report unavailable data.");
+                AssertTrue(viewModel.FileCorrelationEmptyState.Contains("unavailable", StringComparison.OrdinalIgnoreCase), "The list area did not report unavailable data.");
+                AssertTrue(!viewModel.FileCorrelationEmptyState.Contains("No related file activity", StringComparison.Ordinal), "A failed request was presented as a successful empty result.");
+            }
+
+            viewModel.UpdateFileSensor(EnabledFileCorrelationStatus(now.AddMinutes(1), droppedEvents: 7));
+            AssertTrue(viewModel.FileSensorStatus.Contains("unavailable", StringComparison.OrdinalIgnoreCase), "Global tracker status masked the current request failure.");
+
+            viewModel.SelectedFlow = new FlowRow(successFlow);
+            await requests[successFlow.Id].Started.Task.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(true);
+            requests[successFlow.Id].Response.SetResult(FileCorrelationPayload(
+                successFlow,
+                now,
+                (4, FileActivityOperation.Read),
+                (5, FileActivityOperation.Write)));
+            await WaitForDispatcherConditionAsync(
+                () => !viewModel.FileCorrelationLoading && viewModel.FileCorrelations.Count == 2,
+                TimeSpan.FromSeconds(3),
+                "A valid request after failure did not recover.").ConfigureAwait(true);
+
+            AssertTrue(!viewModel.FileCorrelationLoadFailed, "A successful request retained the failure state.");
+            AssertTrue(!viewModel.FileSensorStatus.Contains("unavailable", StringComparison.OrdinalIgnoreCase), "A successful request retained the unavailable status.");
+            AssertEqual(string.Empty, viewModel.FileCorrelationEmptyState);
+            viewModel.FileActivityFilter = MainWindowViewModel.FileActivityFilterReadOpen;
+            AssertTrue(
+                viewModel.FileCorrelationView.Cast<FileCorrelationRow>().Select(row => row.Operation).SequenceEqual([FileActivityOperation.Read]),
+                "The read/open filter regressed after failure recovery.");
+            viewModel.FileActivityFilter = MainWindowViewModel.FileActivityFilterModify;
+            AssertTrue(
+                viewModel.FileCorrelationView.Cast<FileCorrelationRow>().Select(row => row.Operation).SequenceEqual([FileActivityOperation.Write]),
+                "The modification filter regressed after failure recovery.");
+        }).ConfigureAwait(false);
+    }
+
+    private static (TaskCompletionSource<bool> Started, TaskCompletionSource<FileCorrelationsMessage> Response) NewControlledFileCorrelationRequest() =>
+        (new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously),
+         new TaskCompletionSource<FileCorrelationsMessage>(TaskCreationOptions.RunContinuationsAsynchronously));
+
+    private static ServiceStatusMessage EnabledFileCorrelationStatus(DateTimeOffset changedAt, long droppedEvents = 0) =>
+        new(
+            ProtectionMode.Learning,
+            true,
+            0,
+            droppedEvents,
+            "test.db",
+            changedAt,
+            new FileSensorStatus(FileSensorState.Running, droppedEvents, null, changedAt),
+            true);
+
+    private static FileCorrelationsMessage FileCorrelationPayload(
+        NetworkFlow flow,
+        DateTimeOffset changedAt,
+        params (int Index, FileActivityOperation Operation)[] correlations) =>
+        new(
+            flow.Id,
+            correlations.Select(item => CreateUiFileCorrelation(flow, item.Index, item.Operation)).ToArray(),
+            new FileSensorStatus(FileSensorState.Running, 0, null, changedAt));
+
+    private static FileCorrelation CreateUiFileCorrelation(NetworkFlow flow, int index, FileActivityOperation operation) =>
+        new(
+            new Guid(index, 0, 0, new byte[8]),
+            flow.Id,
+            flow.ProcessIdentity!.Value,
+            flow.ProcessName,
+            operation,
+            $"{index:X12}{new string('0', 52)}",
+            $"file-{index:X12}.txt",
+            ".txt",
+            flow.FirstSeen.AddSeconds(index),
+            index,
+            CorrelationConfidence.Medium,
+            $"Same process identity; file {operation} near outbound flow first-seen.",
+            flow.FirstSeen);
+
+    private static Task TestFileActivityDropAggregationAsync()
+    {
+        var changedAt = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var rawPath = "C:\\Synthetic\\private-observed-file.egfixture";
+        var combined = FlowCoordinator.CombineFileSensorStatus(
+            new FileSensorStatus(FileSensorState.Running, 7, rawPath, changedAt),
+            5);
+        AssertEqual(FileSensorState.OverflowDegraded, combined.State);
+        AssertEqual(12L, combined.DroppedEvents);
+        AssertTrue(!combined.Detail!.Contains(rawPath, StringComparison.OrdinalIgnoreCase), "Provider detail crossed the service boundary without sanitization.");
+
+        var saturated = FlowCoordinator.CombineFileSensorStatus(
+            new FileSensorStatus(FileSensorState.OverflowDegraded, long.MaxValue - 1, rawPath, changedAt),
+            10);
+        AssertEqual(long.MaxValue, saturated.DroppedEvents);
+        AssertEqual(FileSensorState.OverflowDegraded, saturated.State);
+
+        var denied = FlowCoordinator.CombineFileSensorStatus(
+            new FileSensorStatus(FileSensorState.AccessDenied, 3, rawPath, changedAt),
+            0);
+        AssertEqual(FileSensorState.AccessDenied, denied.State);
+        AssertEqual(3L, denied.DroppedEvents);
+        AssertTrue(!denied.Detail!.Contains(rawPath, StringComparison.OrdinalIgnoreCase), "AccessDenied detail leaked an observed path.");
+        return Task.CompletedTask;
+    }
+
+    private static async Task TestFileActivityPrivacyBoundariesAsync()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "EgressGuard-FilePrivacy-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var privateToken = "private-observed-" + Guid.NewGuid().ToString("N");
+        var observedPath = Path.Combine(directory, privateToken + ".egfixture");
+        var databasePath = Path.Combine(directory, "test.db");
+        try
+        {
+            await File.WriteAllTextAsync(observedPath, "synthetic non-sensitive fixture").ConfigureAwait(false);
+            var flow = SampleFlow();
+            var engine = NewCorrelationEngine();
+            AssertTrue(engine.Add(FileEvent(flow, 1, -1, FileActivityOperation.Read, observedPath)), "Synthetic privacy event was rejected.");
+            var correlation = engine.Correlate(flow, flow.FirstSeen).Single();
+            var malformed = correlation with
+            {
+                Id = Guid.NewGuid(),
+                ProtectedFileIdentifier = observedPath,
+                DisplayPath = observedPath,
+                Extension = "." + privateToken,
+                Reason = observedPath
+            };
+            var protectedMalformed = FileCorrelationPrivacy.ProtectForBoundary(malformed);
+            AssertEqual(string.Empty, protectedMalformed.Extension);
+            AssertTrue(!protectedMalformed.DisplayPath.Contains(privateToken, StringComparison.OrdinalIgnoreCase), "A filename-like extension survived boundary protection.");
+            AssertTrue(!protectedMalformed.Reason.Contains(observedPath, StringComparison.OrdinalIgnoreCase), "A path-bearing reason survived boundary protection.");
+            var status = FlowCoordinator.CombineFileSensorStatus(
+                new FileSensorStatus(FileSensorState.Running, 0, observedPath, flow.FirstSeen),
+                engine.DroppedEvents);
+            var envelope = MessageEnvelope.Create(
+                MessageTypes.GetFileCorrelations,
+                new FileCorrelationsMessage(flow.Id, [correlation, protectedMalformed], status));
+            var serialized = JsonSerializer.Serialize(envelope, JsonDefaults.Options);
+            AssertTrue(!serialized.Contains(observedPath, StringComparison.OrdinalIgnoreCase), "Named Pipe payload contained the observed path.");
+            AssertTrue(!serialized.Contains(privateToken, StringComparison.OrdinalIgnoreCase), "Named Pipe payload contained the observed file name.");
+
+            var row = new FileCorrelationRow(malformed);
+            var uiText = string.Join('|', row.OperationLabel, row.RedactedFileLabel, row.ActivityTime, row.RelativeTiming, row.Confidence, row.Reason, MainWindowViewModel.FormatFileSensor(status));
+            AssertTrue(!uiText.Contains(observedPath, StringComparison.OrdinalIgnoreCase), "UI projection contained the observed path.");
+            AssertTrue(!uiText.Contains(privateToken, StringComparison.OrdinalIgnoreCase), "UI projection contained the observed file name.");
+            AssertTrue(typeof(FileCorrelationRow).GetProperty("Path") is null, "UI projection exposed a raw Path property.");
+
+            var database = new EgressGuardDatabase(databasePath);
+            await database.InitializeAsync().ConfigureAwait(false);
+            await database.SaveFlowsAsync([flow]).ConfigureAwait(false);
+            await database.SaveFileCorrelationsAsync([correlation, malformed]).ConfigureAwait(false);
+            await using var connection = new SqliteConnection($"Data Source={databasePath};Pooling=False");
+            await connection.OpenAsync().ConfigureAwait(false);
+            var command = connection.CreateCommand();
+            command.CommandText = "SELECT protected_file_id,display_path,extension,reason FROM file_correlations;";
+            await using var reader = await command.ExecuteReaderAsync().ConfigureAwait(false);
+            var persistedValues = new List<string>();
+            while (await reader.ReadAsync().ConfigureAwait(false))
+            {
+                persistedValues.Add(string.Join('|', reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.GetString(3)));
+            }
+            AssertEqual(2, persistedValues.Count);
+            var persistedText = string.Join('|', persistedValues);
+            AssertTrue(!persistedText.Contains(observedPath, StringComparison.OrdinalIgnoreCase), "Persistence contained the observed path.");
+            AssertTrue(!persistedText.Contains(privateToken, StringComparison.OrdinalIgnoreCase), "Persistence contained the observed file name.");
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
         }
     }
 
@@ -6051,41 +6420,71 @@ internal static class Program
         var fetchCount = 0;
         var inFlight = 0;
         var maximumInFlight = 0;
-        var applied = new List<string>();
+        var countSync = new object();
+        var applied = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        var oldStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var oldResponse = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstNewStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstNewResponse = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondNewStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondNewResponse = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstApplied = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondApplied = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var newFetchCount = 0;
         await using var refresh = new BoundedSelectionRefresh<string>(
             async (flowId, cancellationToken) =>
             {
+                _ = cancellationToken;
                 var current = Interlocked.Increment(ref inFlight);
-                maximumInFlight = Math.Max(maximumInFlight, current);
+                lock (countSync) maximumInFlight = Math.Max(maximumInFlight, current);
                 var sequence = Interlocked.Increment(ref fetchCount);
                 try
                 {
-                    await Task.Delay(flowId == "old" ? 200 : 10, cancellationToken).ConfigureAwait(false);
-                    return $"{flowId}:{sequence}";
+                    if (flowId == "old")
+                    {
+                        oldStarted.TrySetResult(true);
+                        return await oldResponse.Task.ConfigureAwait(false);
+                    }
+
+                    var newSequence = Interlocked.Increment(ref newFetchCount);
+                    var started = newSequence == 1 ? firstNewStarted : secondNewStarted;
+                    var response = newSequence == 1 ? firstNewResponse : secondNewResponse;
+                    started.TrySetResult(true);
+                    return await response.Task.ConfigureAwait(false);
                 }
                 finally
                 {
                     Interlocked.Decrement(ref inFlight);
                 }
             },
-            (flowId, value) => applied.Add($"{flowId}|{value}"),
-            exception => throw new TestFailureException($"Refresh failed: {exception.Message}"),
-            TimeSpan.FromMilliseconds(50));
+            (flowId, value) =>
+            {
+                applied.Enqueue($"{flowId}|{value}");
+                if (applied.Count == 1) firstApplied.TrySetResult(true);
+                if (applied.Count == 2) secondApplied.TrySetResult(true);
+            },
+            (flowId, exception) => throw new TestFailureException($"Refresh for {flowId} failed: {exception.Message}"),
+            TimeSpan.Zero);
 
         refresh.Select("old");
-        await Task.Delay(20).ConfigureAwait(false);
+        await oldStarted.Task.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
         refresh.Select("new");
         for (var index = 0; index < 100; index++) refresh.NotifyFlowUpdated("new");
-        await Task.Delay(180).ConfigureAwait(false);
-        AssertTrue(applied.Count >= 1, "Selected flow was not refreshed.");
+        oldResponse.SetResult("old:1");
+        await firstNewStarted.Task.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+        firstNewResponse.SetResult("new:2");
+        await firstApplied.Task.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+        AssertEqual(1, applied.Count);
         AssertTrue(applied.All(item => item.StartsWith("new|", StringComparison.Ordinal)), "A stale selection overwrote current evidence.");
         AssertEqual(1, maximumInFlight);
-        AssertTrue(fetchCount <= 3, "FlowUpdated burst created a request storm.");
+        AssertEqual(2, fetchCount);
 
-        var beforeTrailing = applied.Count;
         refresh.NotifyFlowUpdated("new");
-        await Task.Delay(100).ConfigureAwait(false);
-        AssertTrue(applied.Count > beforeTrailing, "Evidence arriving after selection did not trigger a throttled refresh.");
+        await secondNewStarted.Task.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+        secondNewResponse.SetResult("new:3");
+        await secondApplied.Task.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+        AssertEqual(2, applied.Count);
+        AssertEqual(3, fetchCount);
     }
 
     private static async Task TestDatabaseLockAsync()

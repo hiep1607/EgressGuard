@@ -64,6 +64,48 @@ public sealed record FileCorrelation(
     string Reason,
     DateTimeOffset CreatedAtUtc);
 
+public static class FileCorrelationPrivacy
+{
+    public const int MaximumExtensionLength = 16;
+
+    public static string NormalizeExtension(string? extension)
+    {
+        if (string.IsNullOrEmpty(extension)
+            || extension.Length is < 2 or > MaximumExtensionLength
+            || extension[0] != '.')
+        {
+            return string.Empty;
+        }
+
+        var normalized = extension.ToLowerInvariant();
+        return normalized[1..].All(character => character is (>= 'a' and <= 'z') or (>= '0' and <= '9'))
+            ? normalized
+            : string.Empty;
+    }
+
+    public static FileCorrelation ProtectForBoundary(FileCorrelation correlation)
+    {
+        ArgumentNullException.ThrowIfNull(correlation);
+        var protectedIdentifier = IsSha256(correlation.ProtectedFileIdentifier)
+            ? correlation.ProtectedFileIdentifier.ToUpperInvariant()
+            : new string('0', 64);
+        var extension = NormalizeExtension(correlation.Extension);
+        var absolute = Math.Abs(correlation.TimeDeltaSeconds);
+        var direction = correlation.TimeDeltaSeconds < 0 ? "before" : "after";
+        var reason = $"Same process identity; file {correlation.Operation} {absolute:0.###} seconds {direction} outbound flow first-seen.";
+        return correlation with
+        {
+            ProtectedFileIdentifier = protectedIdentifier,
+            DisplayPath = $"file-{protectedIdentifier[..12].ToLowerInvariant()}{extension}",
+            Extension = extension,
+            Reason = reason
+        };
+    }
+
+    private static bool IsSha256(string? value) =>
+        value is { Length: 64 } && value.All(character => character is (>= '0' and <= '9') or (>= 'A' and <= 'F') or (>= 'a' and <= 'f'));
+}
+
 public interface IFileActivitySensor : IAsyncDisposable
 {
     FileSensorStatus Status { get; }
@@ -188,7 +230,7 @@ public sealed class FileCorrelationEngine
             return false;
         }
 
-        var normalized = activity with { Path = path, Extension = Path.GetExtension(path).ToLowerInvariant() };
+        var normalized = activity with { Path = path, Extension = FileCorrelationPrivacy.NormalizeExtension(Path.GetExtension(path)) };
         var key = $"{normalized.ProcessIdentity.ProcessId}|{normalized.ProcessIdentity.StartTime.UtcTicks}|{normalized.Operation}|{path}";
         lock (_sync)
         {
@@ -255,10 +297,10 @@ public sealed class FileCorrelationEngine
         var reason = $"Same process identity; file {activity.Operation} {absolute:0.###} seconds {direction} outbound flow first-seen.";
         var hash = Convert.ToHexString(SHA256.HashData(Combine(_pathSalt, Encoding.UTF8.GetBytes(activity.Path.ToUpperInvariant()))));
         var display = $"file-{hash[..12].ToLowerInvariant()}{activity.Extension}";
-        return new FileCorrelation(
+        return FileCorrelationPrivacy.ProtectForBoundary(new FileCorrelation(
             DeterministicId(flow.Id, activity), flow.Id, activity.ProcessIdentity, activity.ProcessName,
             activity.Operation, hash, display, activity.Extension, activity.TimestampUtc, delta,
-            confidence, reason, created);
+            confidence, reason, created));
     }
 
     private int CleanupCore(DateTimeOffset nowUtc)

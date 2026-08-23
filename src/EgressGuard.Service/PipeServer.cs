@@ -270,7 +270,10 @@ public sealed partial class PipeServer : BackgroundService
 
                 return MessageEnvelope.Create(
                     MessageTypes.GetFileCorrelations,
-                    new FileCorrelationsMessage(correlationRequest.FlowId, correlations.Take(correlationRequest.Limit).ToArray(), _state.FileSensorStatus),
+                    new FileCorrelationsMessage(
+                        correlationRequest.FlowId,
+                        correlations.Take(correlationRequest.Limit).Select(FileCorrelationPrivacy.ProtectForBoundary).ToArray(),
+                        _state.FileSensorStatus),
                     request.CorrelationId);
             case MessageTypes.CreateRule:
                 var rule = request.ReadPayload<CreateRuleMessage>().Rule;

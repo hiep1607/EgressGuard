@@ -339,7 +339,7 @@ public sealed class EtwFileActivitySensor : IFileActivitySensor, IFileActivityIn
 
         if (failure is not null || !sessionStopped)
         {
-            SetStatus(FileSensorState.Failed, failure?.Message ?? "Exact owned ETW session remained active after bounded stop.");
+            SetStatus(FileSensorState.Failed, "File activity sensor failed during bounded shutdown.");
             throw failure ?? new InvalidOperationException("Exact owned ETW session remained active after bounded stop.");
         }
 
