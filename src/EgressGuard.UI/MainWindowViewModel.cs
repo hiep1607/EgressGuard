@@ -54,7 +54,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     private bool _fileCorrelationRestartRequired;
     private bool _fileCorrelationLoading;
     private bool _fileCorrelationLoadFailed;
-    private CancellationTokenSource? _historyRequestCancellation;
+    private HistoryRequestHandle? _historyRequestCancellation;
     private Task _historyRefreshTask = Task.CompletedTask;
     private long _historyGeneration;
     private DateTimeOffset _historyEndUtc;
@@ -125,6 +125,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     internal bool FileCorrelationLoadFailed => _fileCorrelationLoadFailed;
     internal bool FileActivityHistoryLoading => _historyLoading;
     internal bool FileActivityHistoryLoadFailed => _historyLoadFailed;
+    internal bool FileActivityHistoryExporting => _historyExporting;
     internal Task FileActivityHistoryRefreshTask => _historyRefreshTask;
     public ObservableCollection<FlowRow> Flows { get; } = [];
     public ObservableCollection<FirewallRule> Rules { get; } = [];
@@ -302,7 +303,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     private async Task RefreshFileActivityHistoryAsync()
     {
         CancelHistoryRequest();
-        var requestCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellation.Token);
+        var requestCancellation = new HistoryRequestHandle(_lifetimeCancellation.Token);
         _historyRequestCancellation = requestCancellation;
         var generation = Interlocked.Increment(ref _historyGeneration);
         _historyEndUtc = DateTimeOffset.UtcNow;
@@ -340,7 +341,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
             return;
 
         CancelHistoryRequest();
-        var requestCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellation.Token);
+        var requestCancellation = new HistoryRequestHandle(_lifetimeCancellation.Token);
         _historyRequestCancellation = requestCancellation;
         var generation = Interlocked.Read(ref _historyGeneration);
         _historyLoading = true;
@@ -459,9 +460,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
     private void CancelHistoryRequest()
     {
         var previous = Interlocked.Exchange(ref _historyRequestCancellation, null);
-        if (previous is null)
-            return;
-        previous.Cancel();
+        previous?.Cancel();
     }
 
     public bool FileActivityHistoryCanLoadMore => _historyHasMore && _historyCursor is not null && !_historyLoading;
@@ -730,6 +729,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IAsyncDisposab
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested && _lifetimeCancellation.IsCancellationRequested)
         {
+        }
+        catch (OperationCanceledException) when (!cancellation.IsCancellationRequested)
+        {
+            FileActivityHistoryExportStatus = "Export failed; the report was not confirmed as written.";
+            LastOperation = "File activity history export failed.";
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException or TimeoutException)
         {
@@ -1094,5 +1098,101 @@ internal sealed class AsyncCommand(Func<Task> execute) : ICommand
         CanExecuteChanged?.Invoke(this, EventArgs.Empty);
         try { await execute().ConfigureAwait(true); }
         finally { _running = false; CanExecuteChanged?.Invoke(this, EventArgs.Empty); }
+    }
+}
+
+/// <summary>
+/// Owns one history request cancellation source so that cancel and dispose can
+/// never overlap on the same object, cancellation of a superseded request still
+/// reaches its owner, and every source is disposed exactly once.
+/// </summary>
+internal sealed class HistoryRequestHandle
+{
+    private readonly object _gate = new();
+    private readonly CancellationTokenSource _source;
+    private bool _canceled;
+    private bool _disposed;
+
+    public HistoryRequestHandle(CancellationToken linkedToken)
+    {
+        _source = CancellationTokenSource.CreateLinkedTokenSource(linkedToken);
+    }
+
+    public CancellationToken Token
+    {
+        get
+        {
+            lock (_gate)
+            {
+                ObjectDisposedException.ThrowIf(_disposed, _source);
+                return _source.Token;
+            }
+        }
+    }
+
+    public bool IsCancellationRequested
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _canceled || (!_disposed && _source.IsCancellationRequested);
+            }
+        }
+    }
+
+    public bool Disposed
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _disposed;
+            }
+        }
+    }
+
+    public void Cancel()
+    {
+        lock (_gate)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _canceled = true;
+            _source.Cancel();
+        }
+    }
+
+    public void Dispose() => DisposeCore(null, null, null);
+
+    internal void DisposeForTest(
+        TaskCompletionSource entered,
+        TaskCompletionSource release,
+        TaskCompletionSource disposingSource) => DisposeCore(entered, release, disposingSource);
+
+    private void DisposeCore(
+        TaskCompletionSource? entered,
+        TaskCompletionSource? release,
+        TaskCompletionSource? disposingSource)
+    {
+        CancellationTokenSource source;
+        lock (_gate)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            entered?.TrySetResult();
+            release?.Task.Wait();
+            _disposed = true;
+            source = _source;
+        }
+
+        disposingSource?.TrySetResult();
+        source.Dispose();
     }
 }

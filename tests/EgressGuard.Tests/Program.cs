@@ -242,6 +242,9 @@ internal static class Program
             ("UI file history cancels stale filter responses", TestUiFileHistoryStaleResponseAsync),
             ("UI file history accepts the Service final-page cursor", TestUiFileHistoryServiceCursorAsync),
             ("UI file history reports unexpected cancellation", TestUiFileHistoryUnexpectedCancellationAsync),
+            ("UI file history request handle survives overlapping cancel and dispose", TestHistoryRequestHandleConcurrencyAsync),
+            ("UI file history stale cancel completes without escaping", TestUiFileHistoryCancelDisposeRaceAsync),
+            ("UI file history export survives unexpected cancellation", TestUiFileHistoryExportUnexpectedCancellationAsync),
             ("Protocol rejects oversized message", TestOversizedMessageAsync),
             ("Protocol handles disconnect", TestProtocolDisconnectAsync),
             ("Event buffer preserves order and detects gaps and overflow", TestEventBufferAsync),
@@ -2539,6 +2542,158 @@ internal static class Program
         AssertTrue(!viewModel.FileActivityHistoryLoading, "Unexpected cancellation left history loading.");
         AssertTrue(viewModel.FileActivityHistoryLoadFailed, "Unexpected cancellation did not set the history error state.");
         AssertTrue(viewModel.FileActivityHistoryStatus.Contains("error", StringComparison.OrdinalIgnoreCase), "Unexpected cancellation did not report a history error.");
+    }
+
+    private static async Task TestHistoryRequestHandleConcurrencyAsync()
+    {
+        var lifetime = new CancellationTokenSource();
+        try
+        {
+            var handle = new HistoryRequestHandle(lifetime.Token);
+            AssertTrue(handle.Token.CanBeCanceled, "The history request token must support cancellation.");
+
+            // Overlap: dispose is in progress (holding the gate) while another
+            // caller cancels the same handle. This is the exact race that used
+            // to throw ObjectDisposedException from CancelHistoryRequest.
+            var disposeEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseDispose = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var disposingSource = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var disposeTask = Task.Run(() => handle.DisposeForTest(disposeEntered, releaseDispose, disposingSource));
+            await disposeEntered.Task.ConfigureAwait(false);
+            var cancelTask = Task.Run(handle.Cancel);
+            releaseDispose.TrySetResult();
+            await disposingSource.Task.ConfigureAwait(false);
+            await cancelTask.ConfigureAwait(false);
+            await disposeTask.ConfigureAwait(false);
+            AssertTrue(handle.Disposed, "The overlapping dispose must complete exactly once.");
+            handle.Cancel();
+            handle.Dispose();
+
+            // Correct order: cancel first must actually cancel the token.
+            var ordered = new HistoryRequestHandle(lifetime.Token);
+            ordered.Cancel();
+            AssertTrue(ordered.IsCancellationRequested, "A cancelled history request must report cancellation.");
+            ordered.Dispose();
+            AssertTrue(ordered.Disposed, "A disposed history request must report disposal.");
+
+            // Lifetime cancellation surfaces on live handles without Cancel().
+            var live = new HistoryRequestHandle(lifetime.Token);
+            lifetime.Cancel();
+            AssertTrue(live.IsCancellationRequested, "Lifetime cancellation must surface on existing handles.");
+            live.Dispose();
+        }
+        finally
+        {
+            lifetime.Dispose();
+        }
+    }
+
+    private static async Task TestUiFileHistoryCancelDisposeRaceAsync()
+    {
+        var firstFetchEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstFetchStarted = false;
+
+        Task<FileActivityHistoryMessage> FetchAsync(GetFileActivityHistoryMessage request, CancellationToken cancellationToken)
+        {
+            if (!firstFetchStarted)
+            {
+                firstFetchStarted = true;
+                firstFetchEntered.TrySetResult();
+                var neverCompleted = new TaskCompletionSource<FileActivityHistoryMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+                return neverCompleted.Task.WaitAsync(cancellationToken);
+            }
+
+            var item = HistoryItemForTest(0, request.EndUtc);
+            return Task.FromResult(new FileActivityHistoryMessage(
+                request.StartUtc,
+                request.EndUtc,
+                [item],
+                false,
+                null,
+                new FileSensorStatus(FileSensorState.Running, 0, null, request.EndUtc)));
+        }
+
+        await using var session = new MainWindowRequestSession("history-cancel-dispose-race-" + Guid.NewGuid().ToString("N"));
+        await using var viewModel = new MainWindowViewModel(session, null, historyFetcher: FetchAsync);
+        _ = viewModel.RefreshFileActivityHistoryForTestAsync();
+        await firstFetchEntered.Task.ConfigureAwait(false);
+        var staleTask = viewModel.FileActivityHistoryRefreshTask;
+
+        viewModel.FileHistorySearchText = "second";
+        await viewModel.FileActivityHistoryRefreshTask.ConfigureAwait(false);
+
+        AssertEqual(1, viewModel.FileActivityHistory.Count);
+        AssertTrue(!viewModel.FileActivityHistoryLoading, "The replacement request stayed loading.");
+        AssertTrue(!viewModel.FileActivityHistoryLoadFailed, "The replacement request reported a failure.");
+
+        await staleTask.ConfigureAwait(false);
+        AssertTrue(!viewModel.FileActivityHistoryLoading, "The stale task left the loading flag set.");
+    }
+
+    private static async Task TestUiFileHistoryExportUnexpectedCancellationAsync()
+    {
+        var fetchCalls = 0;
+        var writerCalls = 0;
+        var exportOceArmed = true;
+        var written = new List<FileCorrelationHistoryItem>();
+
+        Task<FileActivityHistoryMessage> FetchAsync(GetFileActivityHistoryMessage request, CancellationToken cancellationToken)
+        {
+            fetchCalls++;
+            if (request.Limit == 200 && exportOceArmed)
+            {
+                exportOceArmed = false;
+                throw new OperationCanceledException("service timeout surfaced as unexpected cancellation");
+            }
+
+            var item = HistoryItemForTest(0, request.EndUtc);
+            return Task.FromResult(new FileActivityHistoryMessage(
+                request.StartUtc,
+                request.EndUtc,
+                [item],
+                false,
+                null,
+                new FileSensorStatus(FileSensorState.Running, 0, null, request.EndUtc)));
+        }
+
+        await using var session = new MainWindowRequestSession("history-export-unexpected-cancel-" + Guid.NewGuid().ToString("N"));
+        await using var viewModel = new MainWindowViewModel(
+            session,
+            null,
+            historyFetcher: FetchAsync,
+            historyPathPicker: () => "controlled-history.csv",
+            historyWriter: (_, items, _) =>
+            {
+                writerCalls++;
+                written.AddRange(items);
+                return Task.CompletedTask;
+            });
+
+        await viewModel.RefreshFileActivityHistoryForTestAsync().ConfigureAwait(false);
+
+        var escapedMessage = string.Empty;
+        try
+        {
+            await viewModel.ExportFileActivityHistoryForTestAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            escapedMessage = exception.Message;
+        }
+
+        AssertEqual(string.Empty, escapedMessage);
+
+        AssertEqual(0, writerCalls);
+        AssertEqual(0, written.Count);
+        AssertTrue(viewModel.FileActivityHistoryExportStatus.Contains("failed", StringComparison.OrdinalIgnoreCase), "Unexpected cancellation was not reported as an export failure.");
+        AssertTrue(!viewModel.FileActivityHistoryExportStatus.Contains("complete", StringComparison.OrdinalIgnoreCase), "Unexpected cancellation was reported as a completed export.");
+        AssertTrue(!viewModel.FileActivityHistoryExporting, "The exporting flag stayed set after unexpected cancellation.");
+
+        await viewModel.ExportFileActivityHistoryForTestAsync().ConfigureAwait(false);
+        AssertEqual(1, writerCalls);
+        AssertEqual(1, written.Count);
+        AssertTrue(viewModel.FileActivityHistoryExportStatus.Contains("complete", StringComparison.OrdinalIgnoreCase), "A later export did not complete normally.");
+        AssertTrue(!viewModel.FileActivityHistoryExporting, "The exporting flag stayed set after the later export.");
     }
 
     private static async Task TestProtocolRoundTripAsync()
