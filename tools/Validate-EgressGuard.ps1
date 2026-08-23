@@ -139,6 +139,7 @@ Write-Host ('Repository root: ' + $repoRoot)
 
 Invoke-ValidationStep -Name 'dotnet tool restore' -Action { dotnet tool restore }
 Invoke-ValidationStep -Name 'restore solution (locked mode)' -Action { dotnet restore EgressGuard.sln --locked-mode }
+& dotnet build-server shutdown | Out-Null
 Invoke-ValidationStep -Name 'verify formatting (no rewrite)' -Action { dotnet format EgressGuard.sln --verify-no-changes --no-restore }
 Invoke-ValidationStep -Name 'build Release' -Action { dotnet build EgressGuard.sln -c Release --no-restore }
 Invoke-ValidationStep -Name 'run executable test suite' -Action { dotnet run --project tests\EgressGuard.Tests\EgressGuard.Tests.csproj -c Release --no-build }

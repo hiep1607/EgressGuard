@@ -18,6 +18,12 @@ jobs:
     name: Windows build and test
     runs-on: windows-latest
     timeout-minutes: 20
+    env:
+      # dotnet-format locates the CLI through DOTNET_ROOT/DOTNET_HOST_PATH;
+      # pinning both avoids the intermittent "Unable to locate dotnet CLI"
+      # discovery flake on hosted runners.
+      DOTNET_ROOT: 'C:\Program Files\dotnet'
+      DOTNET_HOST_PATH: 'C:\Program Files\dotnet\dotnet.exe'
 
     steps:
       - name: Check out source
