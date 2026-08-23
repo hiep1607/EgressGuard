@@ -6,15 +6,18 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot ".." )).Path
+$solution = Join-Path $repoRoot "EgressGuard.sln"
 $serviceProject = Join-Path $repoRoot "src\EgressGuard.Service\EgressGuard.Service.csproj"
 $uiProject = Join-Path $repoRoot "src\EgressGuard.UI\EgressGuard.UI.csproj"
+$serviceDll = Join-Path $repoRoot "src\EgressGuard.Service\bin\Release\net8.0-windows\EgressGuard.Service.dll"
+$uiDll = Join-Path $repoRoot "src\EgressGuard.UI\bin\Release\net8.0-windows\EgressGuard.UI.dll"
 $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
 
 if ($null -eq $dotnet) {
     throw "dotnet was not found on PATH. Install the required .NET SDK first."
 }
 
-foreach ($project in @($serviceProject, $uiProject)) {
+foreach ($project in @($solution, $serviceProject, $uiProject)) {
     if (-not (Test-Path -LiteralPath $project -PathType Leaf)) {
         throw "Required project was not found: $project"
     }
@@ -24,27 +27,35 @@ if ($ReadyTimeoutSeconds -lt 1 -or $ReadyTimeoutSeconds -gt 300) {
     throw "ReadyTimeoutSeconds must be between 1 and 300 seconds."
 }
 
+& $dotnet.Source build $solution --configuration Release --nologo -nodeReuse:false -p:UseSharedCompilation=false
+$buildExitCode = $LASTEXITCODE
+if ($buildExitCode -ne 0) {
+    throw "Local Release build failed with exit code $buildExitCode."
+}
+
+foreach ($applicationDll in @($serviceDll, $uiDll)) {
+    if (-not (Test-Path -LiteralPath $applicationDll -PathType Leaf)) {
+        throw "Required build output was not found: $applicationDll"
+    }
+}
+
 $dataRoot = Join-Path $repoRoot ".local\egressguard-$PID"
 $null = New-Item -ItemType Directory -Path $dataRoot -Force
 $pipeName = "EgressGuard.Local.$PID"
-$serviceLog = Join-Path $dataRoot "service.out.log"
-$serviceErrorLog = Join-Path $dataRoot "service.error.log"
-$uiLog = Join-Path $dataRoot "ui.out.log"
-$uiErrorLog = Join-Path $dataRoot "ui.error.log"
 $ownedProcesses = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
 $exitCode = 0
 $previousDataRoot = [Environment]::GetEnvironmentVariable("EGRESSGUARD_DATA_DIR", "Process")
 $previousPipeName = [Environment]::GetEnvironmentVariable("EGRESSGUARD_PIPE_NAME", "Process")
 
-function Stop-OwnedProcessTree {
+function Stop-OwnedProcess {
     param([System.Diagnostics.Process]$Root)
 
     if ($null -eq $Root) { return }
     try {
         if ($Root.HasExited) { return }
-        $Root.Kill($true)
+        $Root.Kill()
         if (-not $Root.WaitForExit(5000)) {
-            Write-Warning "Timed out waiting for owned process tree $($Root.Id) to exit."
+            Write-Warning "Timed out waiting for owned process $($Root.Id) to exit."
         }
     } catch [InvalidOperationException] { }
       catch [System.ComponentModel.Win32Exception] { }
@@ -93,25 +104,28 @@ function Wait-ForLocalPipe {
 try {
     $env:EGRESSGUARD_DATA_DIR = $dataRoot
     $env:EGRESSGUARD_PIPE_NAME = $pipeName
-    $serviceArguments = "run --project $(Quote-ProcessArgument $serviceProject) --configuration Release --no-launch-profile"
+    $serviceArguments = Quote-ProcessArgument $serviceDll
     $service = Start-Process -FilePath $dotnet.Source -ArgumentList $serviceArguments -WorkingDirectory $repoRoot `
-        -WindowStyle Hidden -PassThru -RedirectStandardOutput $serviceLog -RedirectStandardError $serviceErrorLog
+        -WindowStyle Hidden -PassThru
     $ownedProcesses.Add($service)
 
     Wait-ForLocalPipe -Name $pipeName -Service $service -TimeoutSeconds $ReadyTimeoutSeconds
 
-    $uiArguments = "run --project $(Quote-ProcessArgument $uiProject) --configuration Release --no-launch-profile"
+    $uiArguments = Quote-ProcessArgument $uiDll
     $ui = Start-Process -FilePath $dotnet.Source -ArgumentList $uiArguments -WorkingDirectory $repoRoot `
-        -PassThru -RedirectStandardOutput $uiLog -RedirectStandardError $uiErrorLog
+        -PassThru
     $ownedProcesses.Add($ui)
     $ui.WaitForExit()
     $exitCode = $ui.ExitCode
+    if ($exitCode -ne 0) {
+        throw "UI process exited with code $exitCode."
+    }
 } catch {
     Write-Error $_
     $exitCode = 1
 } finally {
-    foreach ($process in @($ownedProcesses | Select-Object -Reverse)) {
-        Stop-OwnedProcessTree -Root $process
+    for ($index = $ownedProcesses.Count - 1; $index -ge 0; $index--) {
+        Stop-OwnedProcess -Root $ownedProcesses[$index]
     }
     if ($null -eq $previousDataRoot) { Remove-Item Env:EGRESSGUARD_DATA_DIR -ErrorAction SilentlyContinue }
     else { $env:EGRESSGUARD_DATA_DIR = $previousDataRoot }

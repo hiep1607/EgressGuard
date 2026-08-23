@@ -6546,12 +6546,19 @@ internal static class Program
             "EgressGuard.Local.",
             "ReadyTimeoutSeconds",
             "Wait-ForLocalPipe",
-            "Stop-OwnedProcessTree",
+            "Stop-OwnedProcess",
             "function Quote-ProcessArgument",
+            "& $dotnet.Source build $solution --configuration Release --nologo -nodeReuse:false -p:UseSharedCompilation=false",
+            "$buildExitCode = $LASTEXITCODE",
+            "if ($buildExitCode -ne 0)",
+            "$serviceDll",
+            "$uiDll",
             "$Root.HasExited",
-            "$Root.Kill($true)",
+            "$Root.Kill()",
             "$Root.WaitForExit(5000)",
-            "$Root.Dispose()"
+            "$Root.Dispose()",
+            "for ($index = $ownedProcesses.Count - 1; $index -ge 0; $index--)",
+            "Stop-OwnedProcess -Root $ownedProcesses[$index]"
         })
             AssertTrue(script.Contains(required, StringComparison.Ordinal), $"Local startup script is missing '{required}'.");
         foreach (var forbidden in new[]
@@ -6565,6 +6572,13 @@ internal static class Program
             "$descendants",
             "$process.Kill(",
             "$process.Dispose()",
+            "dotnet run",
+            "run --project",
+            "Kill($true)",
+            "Select-Object -Reverse",
+            "pwsh",
+            "RedirectStandardOutput",
+            "RedirectStandardError",
             "New-Service",
             "Install-WindowsService",
             "sc.exe create",
@@ -6580,10 +6594,11 @@ internal static class Program
         AssertTrue(script.Contains("$service = Start-Process", StringComparison.Ordinal) && script.Contains("$ui = Start-Process", StringComparison.Ordinal), "The script did not create both owned root processes.");
         AssertEqual(2, script.Split("-PassThru", StringSplitOptions.None).Length - 1);
         AssertTrue(script.Contains("$ownedProcesses.Add($service)", StringComparison.Ordinal) && script.Contains("$ownedProcesses.Add($ui)", StringComparison.Ordinal), "The script did not retain only the current run's root Process objects.");
-        AssertTrue(script.Contains("run --project $(Quote-ProcessArgument $serviceProject) --configuration Release", StringComparison.Ordinal), "The Service project path is not explicitly quoted for Start-Process.");
-        AssertTrue(script.Contains("run --project $(Quote-ProcessArgument $uiProject) --configuration Release", StringComparison.Ordinal), "The UI project path is not explicitly quoted for Start-Process.");
+        AssertTrue(script.Contains("$serviceArguments = Quote-ProcessArgument $serviceDll", StringComparison.Ordinal), "The Service DLL path is not explicitly quoted for Start-Process.");
+        AssertTrue(script.Contains("$uiArguments = Quote-ProcessArgument $uiDll", StringComparison.Ordinal), "The UI DLL path is not explicitly quoted for Start-Process.");
         AssertTrue(script.Contains("-ArgumentList $serviceArguments", StringComparison.Ordinal) && script.Contains("-ArgumentList $uiArguments", StringComparison.Ordinal), "Start-Process does not receive the explicitly constructed command line.");
         AssertTrue(!script.Contains("$serviceArguments = @(", StringComparison.Ordinal) && !script.Contains("$uiArguments = @(", StringComparison.Ordinal), "The script still relies on Start-Process ArgumentList arrays.");
+        AssertTrue(script.IndexOf("& $dotnet.Source build $solution", StringComparison.Ordinal) < script.IndexOf("$service = Start-Process", StringComparison.Ordinal), "The synchronous build does not complete before the Service starts.");
         return Task.CompletedTask;
     }
 
