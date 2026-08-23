@@ -5,6 +5,7 @@ using System.Net.Sockets;
 using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Security.Principal;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Windows.Automation.Peers;
@@ -136,6 +137,8 @@ internal static class Program
             ("Baseline minimum samples and reset", TestBaselineAsync),
             ("SQLite migration and flow persistence", TestPersistenceAsync),
             ("SQLite persists every bounded correlation batch", TestCorrelationPersistenceBatchAsync),
+            ("File history query is bounded stable filtered and private", TestFileHistoryQueryAsync),
+            ("File history CSV uses BOM escaping and formula neutralization", TestFileHistoryCsvAsync),
             ("SQLite lock fails without unsafe fallback", TestDatabaseLockAsync),
             ("Service graceful cancellation completes without failure logs", TestGracefulCancellationAsync),
             ("Automatic firewall rule rolls back on persistence failure", TestAutomaticRuleRollbackAsync),
@@ -234,6 +237,7 @@ internal static class Program
             ("File tracking preference matches active state after restart", TestFileCorrelationPreferenceRestartApplyAsync),
             ("Local startup script isolates data pipe and owned process cleanup", TestLocalStartupScriptAsync),
             ("UI correlation refresh coalesces updates and cancels stale selection", TestUiCorrelationRefreshAsync),
+            ("UI file history cancels stale filter responses", TestUiFileHistoryStaleResponseAsync),
             ("Protocol rejects oversized message", TestOversizedMessageAsync),
             ("Protocol handles disconnect", TestProtocolDisconnectAsync),
             ("Event buffer preserves order and detects gaps and overflow", TestEventBufferAsync),
@@ -2154,6 +2158,139 @@ internal static class Program
             SqliteConnection.ClearAllPools();
             Directory.Delete(directory, recursive: true);
         }
+    }
+
+    private static async Task TestFileHistoryQueryAsync()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "EgressGuard-FileHistory-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var database = new EgressGuardDatabase(Path.Combine(directory, "test.db"));
+            await database.InitializeAsync().ConfigureAwait(false);
+            var flow = SampleFlow() with { Id = "history-flow" };
+            await database.SaveFlowsAsync([flow]).ConfigureAwait(false);
+            var start = flow.FirstSeen.AddMinutes(-1);
+            var correlations = Enumerable.Range(0, 205).Select(index => new FileCorrelation(
+                Guid.NewGuid(), flow.Id, flow.ProcessIdentity!.Value,
+                index == 204 ? "literal%_needle" : $"process-{index}",
+                index % 2 == 0 ? FileActivityOperation.Read : FileActivityOperation.Write,
+                new string('A', 64), $"C:\\secret\\real-{index}.txt", ".TXT",
+                start.AddSeconds(index), -index, index % 2 == 0 ? CorrelationConfidence.High : CorrelationConfidence.Low,
+                "untrusted reason", flow.FirstSeen)).ToArray();
+            await database.SaveFileCorrelationsAsync(correlations).ConfigureAwait(false);
+
+            var queryStart = flow.FirstSeen.AddMinutes(-2);
+            var queryEnd = flow.FirstSeen.AddMinutes(5);
+            var all = new List<FileCorrelationHistoryItem>();
+            FileCorrelationHistoryCursor? cursor = null;
+            do
+            {
+                var page = await database.GetFileCorrelationHistoryAsync(new FileCorrelationHistoryQuery(
+                    queryStart, queryEnd, null, null, null, 100, cursor)).ConfigureAwait(false);
+                AssertTrue(page.Items.Count <= 100, "History page exceeded the requested limit.");
+                AssertTrue(page.Items.All(item => !item.DisplayPath.Contains("secret", StringComparison.OrdinalIgnoreCase)), "Real file path leaked into history output.");
+                all.AddRange(page.Items);
+                cursor = page.NextCursor;
+                if (!page.HasMore) break;
+                AssertTrue(cursor is not null, "A page with more rows did not return a cursor.");
+            } while (true);
+
+            AssertEqual(205, all.Count);
+            AssertEqual(205, all.Select(item => item.Id).Distinct().Count());
+            AssertTrue(all.Zip(all.Skip(1)).All(pair =>
+                pair.First.ActivityTimestampUtc > pair.Second.ActivityTimestampUtc
+                || (pair.First.ActivityTimestampUtc == pair.Second.ActivityTimestampUtc && pair.First.Id.CompareTo(pair.Second.Id) > 0)), "History order was not stable.");
+            AssertTrue(all.All(item => item.DisplayPath.StartsWith("file-", StringComparison.Ordinal) && item.Extension == ".txt"), "History privacy projection was not applied.");
+
+            var literalSearch = await database.GetFileCorrelationHistoryAsync(new FileCorrelationHistoryQuery(
+                queryStart, queryEnd, "%_", null, null, 100)).ConfigureAwait(false);
+            AssertEqual(1, literalSearch.Items.Count);
+            AssertEqual("literal%_needle", literalSearch.Items[0].ProcessName);
+            var readOnly = await database.GetFileCorrelationHistoryAsync(new FileCorrelationHistoryQuery(
+                queryStart, queryEnd, null, FileActivityOperation.Read, CorrelationConfidence.High, 100)).ConfigureAwait(false);
+            AssertTrue(readOnly.Items.All(item => item.Operation == FileActivityOperation.Read && item.Confidence == CorrelationConfidence.High), "History operation/confidence filters were ignored.");
+            AssertThrows<ArgumentOutOfRangeException>(() => database.GetFileCorrelationHistoryAsync(new FileCorrelationHistoryQuery(queryStart, queryEnd, null, null, null, 201)).GetAwaiter().GetResult());
+            AssertThrows<ArgumentException>(() => database.GetFileCorrelationHistoryAsync(new FileCorrelationHistoryQuery(queryStart, queryEnd.AddDays(31), null, null, null, 100)).GetAwaiter().GetResult());
+            AssertThrows<ArgumentException>(() => database.GetFileCorrelationHistoryAsync(new FileCorrelationHistoryQuery(queryStart, queryEnd, null, null, null, 100, new FileCorrelationHistoryCursor(queryStart.AddDays(-1), Guid.NewGuid()))).GetAwaiter().GetResult());
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    private static async Task TestFileHistoryCsvAsync()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "EgressGuard-FileHistoryCsv-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var path = Path.Combine(directory, "history.csv");
+            var item = new FileCorrelationHistoryItem(
+                Guid.NewGuid(), "flow,1", "=SUM(A1)", FileActivityOperation.Read, "file-deadbeef1234.txt", ".txt",
+                DateTimeOffset.UtcNow, -1.5, CorrelationConfidence.High, "reason, \"quoted\"\r\nnext");
+            await FileActivityHistoryCsvExporter.WriteAsync(path, [item], CancellationToken.None).ConfigureAwait(false);
+            var bytes = await File.ReadAllBytesAsync(path).ConfigureAwait(false);
+            AssertTrue(bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF, "CSV did not contain a UTF-8 BOM.");
+            var csv = Encoding.UTF8.GetString(bytes);
+            AssertTrue(csv.Contains("'=SUM(A1)", StringComparison.Ordinal), "CSV formula neutralization was missing.");
+            AssertTrue(csv.Contains("\"reason, \"\"quoted\"\"\r\nnext\"", StringComparison.Ordinal), "CSV quoting did not preserve commas, quotes, and newlines.");
+            AssertTrue(!csv.Contains("ProtectedFileIdentifier", StringComparison.Ordinal), "CSV exposed a protected identifier field.");
+            await AssertThrowsAsync<ArgumentOutOfRangeException>(() => FileActivityHistoryCsvExporter.WriteAsync(
+                path,
+                Enumerable.Repeat(item, FileActivityHistoryCsvExporter.MaximumRows + 1).ToArray(),
+                CancellationToken.None)).ConfigureAwait(false);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    private static async Task TestUiFileHistoryStaleResponseAsync()
+    {
+        var requests = new List<(GetFileActivityHistoryMessage Request, TaskCompletionSource<FileActivityHistoryMessage> Response)>();
+        async Task<FileActivityHistoryMessage> FetchAsync(GetFileActivityHistoryMessage request, CancellationToken cancellationToken)
+        {
+            var response = new TaskCompletionSource<FileActivityHistoryMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (requests) requests.Add((request, response));
+            return await response.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        await using var session = new MainWindowRequestSession("history-ui-" + Guid.NewGuid().ToString("N"));
+        await using var viewModel = new MainWindowViewModel(session, null, historyFetcher: FetchAsync);
+        var firstLoad = viewModel.RefreshFileActivityHistoryForTestAsync();
+        while (true)
+        {
+            lock (requests)
+            {
+                if (requests.Count == 1) break;
+            }
+            await Task.Delay(10).ConfigureAwait(false);
+        }
+
+        viewModel.FileHistorySearchText = "new-filter";
+        while (true)
+        {
+            lock (requests)
+            {
+                if (requests.Count == 2) break;
+            }
+            await Task.Delay(10).ConfigureAwait(false);
+        }
+
+        var fresh = new FileCorrelationHistoryItem(Guid.NewGuid(), "new-flow", "new-process", FileActivityOperation.Read, "file-new.txt", ".txt", DateTimeOffset.UtcNow, 0, CorrelationConfidence.High, "safe");
+        lock (requests)
+        {
+            requests[1].Response.SetResult(new FileActivityHistoryMessage(requests[1].Request.StartUtc, requests[1].Request.EndUtc, [fresh], false, null, new FileSensorStatus(FileSensorState.Running, 0, null, DateTimeOffset.UtcNow)));
+            requests[0].Response.SetResult(new FileActivityHistoryMessage(requests[0].Request.StartUtc, requests[0].Request.EndUtc, [fresh with { ProcessName = "stale-process" }], false, null, new FileSensorStatus(FileSensorState.Running, 0, null, DateTimeOffset.UtcNow)));
+        }
+
+        await firstLoad.ConfigureAwait(false);
+        await WaitUntilAsync(() => viewModel.FileActivityHistory.Count == 1 && viewModel.FileActivityHistory[0].ProcessName == "new-process").ConfigureAwait(false);
+        AssertEqual("new-process", viewModel.FileActivityHistory[0].ProcessName);
     }
 
     private static async Task TestProtocolRoundTripAsync()
@@ -7490,6 +7627,15 @@ internal static class Program
 
                 await Task.Delay(250).ConfigureAwait(false);
             }
+        }
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (!condition())
+        {
+            await Task.Delay(10, timeout.Token).ConfigureAwait(false);
         }
     }
 

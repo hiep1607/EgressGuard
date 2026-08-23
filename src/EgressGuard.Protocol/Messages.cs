@@ -26,6 +26,7 @@ public static class MessageTypes
     public const string GetRules = "GetRules";
     public const string GetAlerts = "GetAlerts";
     public const string GetFileCorrelations = "GetFileCorrelations";
+    public const string GetFileActivityHistory = "GetFileActivityHistory";
     public const string GetFileCorrelationPreference = "GetFileCorrelationPreference";
     public const string SetFileCorrelationPreference = "SetFileCorrelationPreference";
     public const string SubscribeEvents = "SubscribeEvents";
@@ -70,6 +71,22 @@ public sealed record RulesMessage(IReadOnlyList<FirewallRule> Rules);
 public sealed record AlertsMessage(IReadOnlyList<SecurityAlert> Alerts);
 public sealed record GetFileCorrelationsMessage(string FlowId, int Limit = 20);
 public sealed record FileCorrelationsMessage(string FlowId, IReadOnlyList<FileCorrelation> Correlations, FileSensorStatus SensorStatus);
+public sealed record FileActivityHistoryCursorMessage(DateTimeOffset ActivityTimestampUtc, Guid Id);
+public sealed record GetFileActivityHistoryMessage(
+    DateTimeOffset StartUtc,
+    DateTimeOffset EndUtc,
+    string? Search = null,
+    FileActivityOperation? Operation = null,
+    CorrelationConfidence? Confidence = null,
+    int Limit = 100,
+    FileActivityHistoryCursorMessage? Cursor = null);
+public sealed record FileActivityHistoryMessage(
+    DateTimeOffset StartUtc,
+    DateTimeOffset EndUtc,
+    IReadOnlyList<FileCorrelationHistoryItem> Items,
+    bool HasMore,
+    FileActivityHistoryCursorMessage? NextCursor,
+    FileSensorStatus SensorStatus);
 public sealed record GetFileCorrelationPreferenceMessage;
 public sealed record SetFileCorrelationPreferenceMessage(bool Enabled);
 public sealed record FileCorrelationPreferenceResultMessage(bool SavedEnabled, bool ActiveEnabled, bool RestartRequired);

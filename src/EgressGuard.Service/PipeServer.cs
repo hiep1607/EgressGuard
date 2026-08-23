@@ -291,6 +291,32 @@ public sealed partial class PipeServer : BackgroundService
                         correlations.Take(correlationRequest.Limit).Select(FileCorrelationPrivacy.ProtectForBoundary).ToArray(),
                         _state.FileSensorStatus),
                     request.CorrelationId);
+            case MessageTypes.GetFileActivityHistory:
+                var historyRequest = request.ReadPayload<GetFileActivityHistoryMessage>();
+                var history = await _database.GetFileCorrelationHistoryAsync(
+                    new FileCorrelationHistoryQuery(
+                        historyRequest.StartUtc,
+                        historyRequest.EndUtc,
+                        historyRequest.Search,
+                        historyRequest.Operation,
+                        historyRequest.Confidence,
+                        historyRequest.Limit,
+                        historyRequest.Cursor is null
+                            ? null
+                            : new FileCorrelationHistoryCursor(historyRequest.Cursor.ActivityTimestampUtc, historyRequest.Cursor.Id)),
+                    cancellationToken).ConfigureAwait(false);
+                return MessageEnvelope.Create(
+                    MessageTypes.GetFileActivityHistory,
+                    new FileActivityHistoryMessage(
+                        historyRequest.StartUtc,
+                        historyRequest.EndUtc,
+                        history.Items,
+                        history.HasMore,
+                        history.NextCursor is null
+                            ? null
+                            : new FileActivityHistoryCursorMessage(history.NextCursor.ActivityTimestampUtc, history.NextCursor.Id),
+                        _state.FileSensorStatus),
+                    request.CorrelationId);
             case MessageTypes.CreateRule:
                 var rule = request.ReadPayload<CreateRuleMessage>().Rule;
                 var result = await _firewallRuleCreateCoordinator.ApplyAsync(rule, cancellationToken, failOpen: false).ConfigureAwait(false);

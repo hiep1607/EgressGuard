@@ -11,7 +11,7 @@ public sealed record PersistedBaseline(string ExecutableSha256, string Destinati
 
 public sealed class EgressGuardDatabase
 {
-    public const int CurrentSchemaVersion = 3;
+    public const int CurrentSchemaVersion = 4;
     public const string FileCorrelationPreferenceKey = "enable_file_correlation";
     private readonly string _connectionString;
 
@@ -58,6 +58,12 @@ public sealed class EgressGuardDatabase
         {
             await ApplyVersion3Async(connection, cancellationToken).ConfigureAwait(false);
             version = 3;
+        }
+
+        if (version < 4)
+        {
+            await ApplyVersion4Async(connection, cancellationToken).ConfigureAwait(false);
+            version = 4;
         }
 
         if (version > CurrentSchemaVersion)
@@ -304,6 +310,59 @@ public sealed class EgressGuardDatabase
         return result;
     }
 
+    public async Task<FileCorrelationHistoryPage> GetFileCorrelationHistoryAsync(
+        FileCorrelationHistoryQuery query,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        ValidateHistoryQuery(query);
+        await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT id,flow_id,pid,process_start_ticks,process_name,file_operation,protected_file_id,display_path,extension,activity_timestamp,time_delta_seconds,confidence,reason,created_at
+            FROM file_correlations
+            WHERE activity_timestamp >= $start AND activity_timestamp <= $end
+              AND ($search IS NULL OR process_name LIKE $search ESCAPE '\' COLLATE NOCASE
+                   OR display_path LIKE $search ESCAPE '\' COLLATE NOCASE
+                   OR extension LIKE $search ESCAPE '\' COLLATE NOCASE)
+              AND ($operation IS NULL OR file_operation = $operation)
+              AND ($confidence IS NULL OR confidence = $confidence)
+              AND ($cursorTime IS NULL OR activity_timestamp < $cursorTime
+                   OR (activity_timestamp = $cursorTime AND id < $cursorId))
+            ORDER BY activity_timestamp DESC, id DESC
+            LIMIT $limit;
+            """;
+        Add(command, "$start", query.StartUtc.ToString("O", CultureInfo.InvariantCulture));
+        Add(command, "$end", query.EndUtc.ToString("O", CultureInfo.InvariantCulture));
+        Add(command, "$search", string.IsNullOrEmpty(query.Search) ? null : $"%{EscapeLike(query.Search)}%");
+        Add(command, "$operation", query.Operation?.ToString());
+        Add(command, "$confidence", query.Confidence?.ToString());
+        Add(command, "$cursorTime", query.Cursor?.ActivityTimestampUtc.ToString("O", CultureInfo.InvariantCulture));
+        Add(command, "$cursorId", query.Cursor?.Id.ToString("D"));
+        Add(command, "$limit", query.Limit + 1);
+
+        var rows = new List<FileCorrelation>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            rows.Add(ReadFileCorrelation(reader));
+        }
+
+        var hasMore = rows.Count > query.Limit;
+        if (hasMore)
+        {
+            rows.RemoveAt(rows.Count - 1);
+        }
+
+        var nextCursor = rows.Count == 0
+            ? null
+            : new FileCorrelationHistoryCursor(rows[^1].ActivityTimestampUtc, rows[^1].Id);
+        return new FileCorrelationHistoryPage(
+            rows.Select(FileCorrelationPrivacy.ProjectForHistory).ToArray(),
+            hasMore,
+            nextCursor);
+    }
+
     public async Task<string?> GetSettingAsync(string key, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(key);
@@ -457,6 +516,54 @@ public sealed class EgressGuardDatabase
         await ExecuteAsync(connection, transaction, sql, cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
+
+    private static async Task ApplyVersion4Async(SqliteConnection connection, CancellationToken cancellationToken)
+    {
+        await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        const string sql = """
+            CREATE INDEX IF NOT EXISTS ix_file_correlations_history_order ON file_correlations(activity_timestamp DESC, id DESC);
+            INSERT INTO schema_versions(version,applied_at) VALUES(4,strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+            """;
+        await ExecuteAsync(connection, transaction, sql, cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static void ValidateHistoryQuery(FileCorrelationHistoryQuery query)
+    {
+        if (query.Limit is < 1 or > 200)
+            throw new ArgumentOutOfRangeException(nameof(query));
+        if (query.Search is { Length: > 96 })
+            throw new ArgumentException("History search text is limited to 96 characters.", nameof(query));
+        if (query.StartUtc.Offset != TimeSpan.Zero || query.EndUtc.Offset != TimeSpan.Zero)
+            throw new ArgumentException("History timestamps must be UTC.", nameof(query));
+        var duration = query.EndUtc - query.StartUtc;
+        if (duration <= TimeSpan.Zero || duration > TimeSpan.FromDays(31))
+            throw new ArgumentOutOfRangeException(nameof(query), "History range must be between 0 and 31 days.");
+        if (query.Operation is not null && !Enum.IsDefined(query.Operation.Value))
+            throw new ArgumentException("Unknown file activity operation.", nameof(query));
+        if (query.Confidence is not null && !Enum.IsDefined(query.Confidence.Value))
+            throw new ArgumentException("Unknown correlation confidence.", nameof(query));
+        if (query.Cursor is { } cursor
+            && (cursor.Id == Guid.Empty
+                || cursor.ActivityTimestampUtc.Offset != TimeSpan.Zero
+                || cursor.ActivityTimestampUtc < query.StartUtc
+                || cursor.ActivityTimestampUtc > query.EndUtc))
+        {
+            throw new ArgumentException("History cursor is outside the requested range.", nameof(query));
+        }
+    }
+
+    private static string EscapeLike(string value) => value
+        .Replace("\\", "\\\\", StringComparison.Ordinal)
+        .Replace("%", "\\%", StringComparison.Ordinal)
+        .Replace("_", "\\_", StringComparison.Ordinal);
+
+    private static FileCorrelation ReadFileCorrelation(SqliteDataReader reader) => new(
+        Guid.Parse(reader.GetString(0)), reader.GetString(1),
+        new ProcessIdentity(reader.GetInt32(2), new DateTimeOffset(reader.GetInt64(3), TimeSpan.Zero)),
+        reader.GetString(4), Enum.Parse<FileActivityOperation>(reader.GetString(5)), reader.GetString(6), reader.GetString(7), reader.GetString(8),
+        DateTimeOffset.Parse(reader.GetString(9), CultureInfo.InvariantCulture), reader.GetDouble(10),
+        Enum.Parse<CorrelationConfidence>(reader.GetString(11)), reader.GetString(12), DateTimeOffset.Parse(reader.GetString(13), CultureInfo.InvariantCulture));
 
     private static async Task<long?> UpsertExecutableAsync(SqliteConnection connection, SqliteTransaction transaction, ExecutableInfo? executable, CancellationToken cancellationToken)
     {
