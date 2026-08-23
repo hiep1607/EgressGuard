@@ -31,6 +31,18 @@ Never disable Windows Defender Firewall or use a blanket outbound block for deve
 
 ## Build, test, and format
 
+Run the complete local validation with one command (tool restore, locked restore, format check, Release build, executable test suite, vulnerable-package audit, `git diff --check`, `AGENT_HANDOFF.md` checks):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\Validate-EgressGuard.ps1 -RequireClean
+```
+
+The script requires no administrator rights and changes no system state; details are in the [testing guide](docs/testing.md). It covers the default test suite only; the opt-in Administrator Windows scenarios remain separate tasks.
+
+CI runs the same script for pushes to `main` and for **every** pull request, including stacked feature-branch PRs targeting other branches. A concurrency group supersedes older runs of the same PR. Pre-existing pull requests receive this configuration only after they take the workflow commit into their branch or their base branch includes it. Do not treat CI as green until a real run of this configuration has succeeded.
+
+The individual commands behind the script remain available:
+
 ```powershell
 dotnet tool restore
 dotnet restore --locked-mode

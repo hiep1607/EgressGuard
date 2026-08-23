@@ -1,5 +1,19 @@
 # Testing
 
+## One-command validation
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\Validate-EgressGuard.ps1 -RequireClean
+```
+
+`tools/Validate-EgressGuard.ps1` is the single entry point used locally and by CI. It runs, in order: `dotnet tool restore`, locked solution restore, format verification (never rewrites files), Release build, the executable test suite, the vulnerable-package audit and `git diff --check`; it then displays `git status --short`, validates `AGENT_HANDOFF.md` against its size/line/session limits and common secret patterns, and finally enforces `-RequireClean`. It stops at the first failing step and exits with that step's exit code. The script locates the repository root from its own location, needs no administrator rights, changes no firewall/Defender/registry/service state, writes nothing into the repository, avoids `Invoke-Expression`, and never prints matched secret values.
+
+`-RequireClean` fails the run when tracked files change during validation; gitignored build output does not count. CI always passes this switch.
+
+This command does not replace the opt-in Administrator Windows integration scenarios described below; those still require elevation and separate execution.
+
+CI (`.github/workflows/ci.yml`) invokes this script for pushes to `main` and for **every** pull request regardless of base branch, so stacked feature-branch PRs are checked too. A concurrency group cancels superseded runs of the same pull request. Existing pull requests only pick up this configuration once their branch contains the workflow change or their base branch includes it, because `pull_request` workflows resolve from the merge ref. Do not claim a green CI result for any configuration until a real run of it completes successfully.
+
 ## Commands
 
 ```powershell
