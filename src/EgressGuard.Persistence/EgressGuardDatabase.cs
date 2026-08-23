@@ -12,6 +12,7 @@ public sealed record PersistedBaseline(string ExecutableSha256, string Destinati
 public sealed class EgressGuardDatabase
 {
     public const int CurrentSchemaVersion = 3;
+    public const string FileCorrelationPreferenceKey = "enable_file_correlation";
     private readonly string _connectionString;
 
     public EgressGuardDatabase(string databasePath)
@@ -313,6 +314,12 @@ public sealed class EgressGuardDatabase
         return await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) as string;
     }
 
+    public async Task<bool?> GetFileCorrelationPreferenceAsync(CancellationToken cancellationToken = default)
+    {
+        var value = await GetSettingAsync(FileCorrelationPreferenceKey, cancellationToken).ConfigureAwait(false);
+        return bool.TryParse(value, out var enabled) ? enabled : null;
+    }
+
     public async Task SetSettingAsync(string key, string value, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(key);
@@ -325,6 +332,9 @@ public sealed class EgressGuardDatabase
         command.Parameters.AddWithValue("$updated", DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture));
         _ = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
+
+    public Task SetFileCorrelationPreferenceAsync(bool enabled, CancellationToken cancellationToken = default) =>
+        SetSettingAsync(FileCorrelationPreferenceKey, enabled ? bool.TrueString : bool.FalseString, cancellationToken);
 
     public async Task ResetBaselineAsync(string? executableSha256, CancellationToken cancellationToken = default)
     {

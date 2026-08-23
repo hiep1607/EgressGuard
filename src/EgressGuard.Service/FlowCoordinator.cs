@@ -95,9 +95,10 @@ public sealed partial class FlowCoordinator : BackgroundService
             return;
         }
 
-        var enabledSetting = await _database.GetSettingAsync("enable_file_correlation", stoppingToken).ConfigureAwait(false);
-        var configured = enabledSetting ?? Environment.GetEnvironmentVariable("EGRESSGUARD_ENABLE_FILE_CORRELATION") ?? "false";
-        _state.FileCorrelationEnabled = bool.TryParse(configured, out var enabled) && enabled;
+        var enabledSetting = await _database.GetFileCorrelationPreferenceAsync(stoppingToken).ConfigureAwait(false);
+        var enabled = enabledSetting
+            ?? (bool.TryParse(Environment.GetEnvironmentVariable("EGRESSGUARD_ENABLE_FILE_CORRELATION"), out var legacyEnabled) && legacyEnabled);
+        _state.FileCorrelationEnabled = enabled;
         Task filePumpTask = Task.CompletedTask;
         if (_state.FileCorrelationEnabled)
         {
