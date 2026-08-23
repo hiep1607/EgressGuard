@@ -1,0 +1,100 @@
+name: Preview package
+
+on:
+  pull_request:
+    paths:
+      - 'src/EgressGuard.Launcher/**'
+      - 'src/EgressGuard.Service/**'
+      - 'src/EgressGuard.UI/**'
+      - '.github/workflows/preview-package.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preview-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-smoke:
+    name: Build portable preview and smoke test
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Build preview package (locked restore inside)
+        shell: powershell
+        run: ./tools/Build-PreviewPackage.ps1 -OutputDirectory "$env:RUNNER_TEMP\preview out"
+
+      - name: Extract package into a path with spaces
+        shell: powershell
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'preview out\EgressGuard-Preview-win-x64.zip'
+          $dest = Join-Path $env:RUNNER_TEMP 'Egress Guard Preview Dir With Spaces'
+          Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
+          "PREVIEW_DEST=$dest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "extracted to: $dest"
+
+      - name: Verify extracted layout
+        shell: powershell
+        run: |
+          foreach ($required in @(
+            'EgressGuard.Launcher.exe',
+            'service\EgressGuard.Service.exe',
+            'ui\EgressGuard.UI.exe',
+            'HUONG-DAN.txt',
+            'commit-info.txt')) {
+            $path = Join-Path $env:PREVIEW_DEST $required
+            if (-not (Test-Path -LiteralPath $path)) {
+              Write-Host "::error::missing in package: $required"
+              exit 1
+            }
+          }
+          Write-Host 'layout ok'
+
+      - name: Smoke test launcher (starts service, waits for pipe, stops everything)
+        id: smoke
+        shell: powershell
+        env:
+          EGRESSGUARD_LAUNCHER_SMOKE_EXIT_AFTER_SECONDS: '15'
+        run: |
+          $exe = Join-Path $env:PREVIEW_DEST 'EgressGuard.Launcher.exe'
+          & $exe '--smoke-exit-after' '15'
+          $code = $LASTEXITCODE
+          Write-Host "launcher exit code: $code"
+          if ($code -ne 0) {
+            Write-Host "::error::launcher smoke test failed with exit code $code"
+            exit 1
+          }
+
+      - name: Assert every launched process is gone
+        shell: powershell
+        run: |
+          Start-Sleep -Seconds 3
+          $left = @(Get-Process -Name 'EgressGuard.Service','EgressGuard.UI' -ErrorAction SilentlyContinue)
+          if ($left.Count -gt 0) {
+            foreach ($process in $left) { Write-Host ("::error::leftover process: " + $process.Name + " pid=" + $process.Id) }
+            exit 1
+          }
+          Write-Host 'no leftover service or UI processes.'
+
+      - name: Re-verify packaged ZIP contents
+        shell: powershell
+        run: ./tools/Build-PreviewPackage.ps1 -VerifyZipPath "$env:RUNNER_TEMP\preview out\EgressGuard-Preview-win-x64.zip"
+
+      - name: Upload preview ZIP artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: EgressGuard-Preview-win-x64
+          path: ${{ runner.temp }}\preview out\EgressGuard-Preview-win-x64.zip
+          if-no-files-found: error
+          retention-days: 7

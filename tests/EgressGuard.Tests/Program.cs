@@ -13,6 +13,7 @@ using System.Windows.Automation.Provider;
 using System.Windows.Controls;
 using System.Windows.Media;
 using EgressGuard.Core;
+using EgressGuard.Launcher;
 using EgressGuard.Persistence;
 using EgressGuard.Protocol;
 using EgressGuard.Service;
@@ -245,6 +246,11 @@ internal static class Program
             ("UI file history request handle survives overlapping cancel and dispose", TestHistoryRequestHandleConcurrencyAsync),
             ("UI file history stale cancel completes without escaping", TestUiFileHistoryCancelDisposeRaceAsync),
             ("UI file history export survives unexpected cancellation", TestUiFileHistoryExportUnexpectedCancellationAsync),
+            ("Preview launch options keep paths with spaces intact", TestPreviewLaunchOptionsWithSpacesInPathsAsync),
+            ("Preview single-instance guard blocks a second session", TestPreviewSingleInstanceGuardBlocksSecondSessionAsync),
+            ("Preview engine fails fast when a component is missing", TestPreviewEngineFailsFastWhenComponentMissingAsync),
+            ("Preview engine stops only owned processes when the service is not ready", TestPreviewEngineStopsOnlyOwnedProcessesWhenServiceNotReadyAsync),
+            ("Preview engine stops exactly the launched processes after the UI exits", TestPreviewEngineStopsExactlyLaunchedProcessesAfterUiExitAsync),
             ("Protocol rejects oversized message", TestOversizedMessageAsync),
             ("Protocol handles disconnect", TestProtocolDisconnectAsync),
             ("Event buffer preserves order and detects gaps and overflow", TestEventBufferAsync),
@@ -2694,6 +2700,225 @@ internal static class Program
         AssertEqual(1, written.Count);
         AssertTrue(viewModel.FileActivityHistoryExportStatus.Contains("complete", StringComparison.OrdinalIgnoreCase), "A later export did not complete normally.");
         AssertTrue(!viewModel.FileActivityHistoryExporting, "The exporting flag stayed set after the later export.");
+    }
+
+    private sealed class FakePreviewProcess : IPreviewProcess
+    {
+        public FakePreviewProcess(int id)
+        {
+            Id = id;
+        }
+
+        public int Id { get; }
+
+        public int KillCount { get; private set; }
+
+        public bool WaitForExitCalled { get; private set; }
+
+        public bool WaitForExit(int milliseconds)
+        {
+            WaitForExitCalled = true;
+            return true;
+        }
+
+        public void KillEntireTree()
+        {
+            KillCount++;
+        }
+
+        public void Dispose()
+        {
+        }
+    }
+
+    private sealed class FakePipeProbe : IPipeReadinessProbe
+    {
+        public FakePipeProbe(bool ready)
+        {
+            Ready = ready;
+        }
+
+        public bool Ready { get; }
+
+        public Task<bool> WaitUntilReadyAsync(string pipeName, TimeSpan timeout) => Task.FromResult(Ready);
+    }
+
+    private static Task TestPreviewLaunchOptionsWithSpacesInPathsAsync()
+    {
+        var root = @"C:\Temp Dir With Spaces\Preview Package";
+        var options = LaunchOptionsFactory.Create(
+            rootDirectory: root,
+            dataDirectory: @"C:\Users With Spaces\Data\Preview",
+            pipeName: "pipe-under-test",
+            smokeExitAfterSeconds: 7);
+
+        AssertEqual(@"C:\Temp Dir With Spaces\Preview Package\service\EgressGuard.Service.exe", options.ServiceExecutablePath);
+        AssertEqual(@"C:\Temp Dir With Spaces\Preview Package\ui\EgressGuard.UI.exe", options.UiExecutablePath);
+        AssertEqual("pipe-under-test", options.PipeName);
+        AssertEqual(7, options.SmokeExitAfterSeconds);
+        AssertTrue(options.MutexName.StartsWith("EgressGuard.Preview.", StringComparison.Ordinal), "The mutex name must use the preview prefix.");
+        AssertTrue(options.MutexName.Length > "EgressGuard.Preview.".Length, "The mutex name must include a data-folder hash.");
+
+        var other = LaunchOptionsFactory.Create(
+            rootDirectory: root,
+            dataDirectory: @"C:\A Completely Different Data Folder");
+        AssertTrue(options.MutexName != other.MutexName, "Different data folders must derive different mutex names.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestPreviewSingleInstanceGuardBlocksSecondSessionAsync()
+    {
+        var tempData = Path.Combine(Path.GetTempPath(), "EgressGuard-Preview-Guard-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(tempData);
+            var mutexName = LaunchOptionsFactory.BuildMutexName(tempData);
+
+            using var first = new SingleInstanceGuard(mutexName);
+            AssertTrue(first.Acquired, "The first preview session must acquire the data-folder guard.");
+
+            using var second = new SingleInstanceGuard(mutexName);
+            AssertTrue(!second.Acquired, "A second preview session on the same data folder must be blocked.");
+
+            var thirdData = tempData + "-other";
+            using var third = new SingleInstanceGuard(LaunchOptionsFactory.BuildMutexName(thirdData));
+            AssertTrue(third.Acquired, "A different data folder must not be blocked by another session's guard.");
+        }
+        finally
+        {
+            Directory.Delete(tempData, recursive: true);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private static async Task TestPreviewEngineFailsFastWhenComponentMissingAsync()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "EgressGuard-Launch-Missing-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var options = LaunchOptionsFactory.Create(
+                rootDirectory: root,
+                dataDirectory: Path.Combine(root, "data"),
+                smokeExitAfterSeconds: 0);
+
+            var startedSpecs = new List<ProcessSpec>();
+            ProcessStarter starter = spec =>
+            {
+                startedSpecs.Add(spec);
+                throw new InvalidOperationException("no process may start when a component is missing");
+            };
+
+            using var log = new StringWriter();
+            var result = await LauncherEngine.RunAsync(
+                options,
+                fileExists: _ => false,
+                startProcess: starter,
+                probe: new FakePipeProbe(ready: true),
+                log).ConfigureAwait(false);
+
+            AssertEqual(ExitCodes.MissingComponent, result.ExitCode);
+            AssertEqual(0, startedSpecs.Count);
+            AssertTrue(log.ToString().Contains("missing", StringComparison.OrdinalIgnoreCase), "The log must explain the missing component.");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    private static async Task TestPreviewEngineStopsOnlyOwnedProcessesWhenServiceNotReadyAsync()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "EgressGuard-Launch-NotReady-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, "service"));
+        Directory.CreateDirectory(Path.Combine(root, "ui"));
+        try
+        {
+            var service = new FakePreviewProcess(101);
+            var ui = new FakePreviewProcess(202);
+            var canary = new FakePreviewProcess(999);
+            var started = new List<IPreviewProcess>();
+
+            ProcessStarter starter = spec =>
+            {
+                if (spec.ExecutablePath.EndsWith("EgressGuard.Service.exe", StringComparison.OrdinalIgnoreCase))
+                {
+                    started.Add(service);
+                    return service;
+                }
+
+                started.Add(ui);
+                return ui;
+            };
+
+            var options = LaunchOptionsFactory.Create(
+                rootDirectory: root,
+                dataDirectory: Path.Combine(root, "data"),
+                smokeExitAfterSeconds: 0);
+
+            using var log = new StringWriter();
+            var result = await LauncherEngine.RunAsync(
+                options,
+                fileExists: _ => true,
+                startProcess: starter,
+                probe: new FakePipeProbe(ready: false),
+                log).ConfigureAwait(false);
+
+            AssertEqual(ExitCodes.ServiceNotReady, result.ExitCode);
+            AssertEqual(1, service.KillCount);
+            AssertTrue(service.WaitForExitCalled, "The launcher must wait for the stopped Service to exit.");
+            AssertEqual(0, ui.KillCount);
+            AssertEqual(1, started.Count);
+            AssertEqual(0, canary.KillCount);
+            AssertTrue(!ReferenceEquals(canary, started.FirstOrDefault()), "The canary process was never started by the engine.");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    private static async Task TestPreviewEngineStopsExactlyLaunchedProcessesAfterUiExitAsync()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "EgressGuard-Launch-Happy-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, "service"));
+        Directory.CreateDirectory(Path.Combine(root, "ui"));
+        try
+        {
+            var service = new FakePreviewProcess(301);
+            var ui = new FakePreviewProcess(404);
+            var canary = new FakePreviewProcess(999);
+
+            ProcessStarter starter = spec => spec.ExecutablePath.EndsWith("EgressGuard.UI.exe", StringComparison.OrdinalIgnoreCase)
+                ? ui
+                : service;
+
+            var options = LaunchOptionsFactory.Create(
+                rootDirectory: root,
+                dataDirectory: Path.Combine(root, "data"),
+                smokeExitAfterSeconds: 0);
+
+            using var log = new StringWriter();
+            var result = await LauncherEngine.RunAsync(
+                options,
+                fileExists: _ => true,
+                startProcess: starter,
+                probe: new FakePipeProbe(ready: true),
+                log).ConfigureAwait(false);
+
+            AssertEqual(ExitCodes.Ok, result.ExitCode);
+            AssertEqual(service.Id, result.ServiceProcessId!.Value);
+            AssertEqual(ui.Id, result.UiProcessId!.Value);
+            AssertTrue(service.WaitForExitCalled, "The launcher must confirm the Service stopped after the UI closed.");
+            AssertEqual(1, service.KillCount);
+            AssertEqual(0, ui.KillCount);
+            AssertEqual(0, canary.KillCount);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
     }
 
     private static async Task TestProtocolRoundTripAsync()

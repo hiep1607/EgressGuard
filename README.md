@@ -57,6 +57,20 @@ dotnet format EgressGuard.sln --verify-no-changes --no-restore
 
 The test project uses a custom executable runner, not `dotnet test`.
 
+## Windows preview package (unsigned)
+
+`tools/Build-PreviewPackage.ps1` publishes self-contained win-x64 builds of the launcher, service and UI into `artifacts\preview\EgressGuard-Preview-win-x64.zip` together with a Vietnamese quick-start guide (`HUONG-DAN.txt`) and the exact source commit (`commit-info.txt`). The CI workflow `.github/workflows/preview-package.yml` builds the same package for every PR that touches it and uploads the ZIP as an artifact kept for 7 days.
+
+To try it:
+
+1. Download the `EgressGuard-Preview-win-x64` artifact from a run of the *Preview package* workflow.
+2. Extract every file into any folder.
+3. Double-click `EgressGuard.Launcher.exe` - no .NET SDK or runtime install is needed.
+
+The launcher starts the packaged Service and UI from that folder, keeps data in `%LOCALAPPDATA%\EgressGuard-Preview`, gives every run its own named pipe, refuses to start twice against the same data folder, waits until the Service pipe is ready before opening the UI, and stops exactly the Service it started when the UI closes.
+
+This is an **internal unsigned preview**: binaries are not signed, SmartScreen may show a warning, and there is no installer, GitHub Release or tag. Opening a watched file for auditing can ask for administrator consent - the launcher never elevates on its own. If a Windows policy blocks execution, report the exact error message; do not disable any security feature to work around it.
+
 ## Run locally
 
 Terminal 1:

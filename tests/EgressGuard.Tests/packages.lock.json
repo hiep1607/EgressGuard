@@ -450,6 +450,9 @@
       "egressguard.core": {
         "type": "Project"
       },
+      "egressguard.launcher": {
+        "type": "Project"
+      },
       "egressguard.persistence": {
         "type": "Project",
         "dependencies": {
