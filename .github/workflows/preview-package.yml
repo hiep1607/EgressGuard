@@ -61,7 +61,7 @@ jobs:
       - name: Extract exactly once into a path with spaces
         shell: powershell
         run: |
-          $downloadDir = '${{ github.workspace }}\artifact download'
+          $downloadDir = Join-Path $env:RUNNER_TEMP 'artifact download'
           $zip = Get-ChildItem $downloadDir -Filter '*.zip' -Recurse | Select-Object -First 1
           if ($zip) {
             $dest = Join-Path $env:RUNNER_TEMP 'Egress Guard Preview Dir With Spaces'
