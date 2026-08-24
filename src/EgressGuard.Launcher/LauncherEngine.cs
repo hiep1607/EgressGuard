@@ -39,6 +39,21 @@ internal static class LauncherEngine
             return new LaunchResult(ExitCodes.MissingComponent, null, null, []);
         }
 
+        try
+        {
+            Directory.CreateDirectory(options.DataDirectory);
+        }
+        catch (Exception exception) when (
+            exception is IOException
+                or UnauthorizedAccessException
+                or ArgumentException
+                or System.IO.PathTooLongException
+                or NotSupportedException)
+        {
+            await log.WriteLineAsync("[error] Cannot create the data folder '" + options.DataDirectory + "': " + exception.Message).ConfigureAwait(false);
+            return new LaunchResult(ExitCodes.InvalidDataFolder, null, null, ["cannot create the data folder"]);
+        }
+
         using var dataLock = new DataFolderLock();
         dataLock.Acquire(options.DataDirectory);
         if (!dataLock.Acquired)

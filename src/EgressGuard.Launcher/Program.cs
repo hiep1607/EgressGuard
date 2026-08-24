@@ -7,12 +7,23 @@ internal static class Program
     private static int Main(string[] args)
     {
         Console.OutputEncoding = Encoding.UTF8;
-        var options = LaunchOptionsFactory.Create(
-            rootDirectory: GetOption(args, "--root"),
-            dataDirectory: GetOption(args, "--data-dir"),
-            pipeName: GetOption(args, "--pipe-name"),
-            smokeExitAfterSeconds: GetIntOption(args, "--smoke-exit-after")
-                ?? ParseIntEnvironment("EGRESSGUARD_LAUNCHER_SMOKE_EXIT_AFTER_SECONDS") ?? 0);
+
+        LaunchOptions options;
+        try
+        {
+            options = LaunchOptionsFactory.Create(
+                rootDirectory: GetOption(args, "--root"),
+                dataDirectory: GetOption(args, "--data-dir"),
+                pipeName: GetOption(args, "--pipe-name"),
+                smokeExitAfterSeconds: GetIntOption(args, "--smoke-exit-after")
+                    ?? ParseIntEnvironment("EGRESSGUARD_LAUNCHER_SMOKE_EXIT_AFTER_SECONDS") ?? 0);
+        }
+        catch (LaunchOptionsException exception)
+        {
+            Console.Error.WriteLine("[error] " + exception.Message);
+            Console.Error.WriteLine("[error ] Fix the path and run the launcher again.");
+            return ExitCodes.InvalidDataFolder;
+        }
 
         using var logWriter = new StreamWriter(Console.OpenStandardOutput(), Encoding.UTF8) { AutoFlush = true };
         var result = LauncherEngine.RunAsync(

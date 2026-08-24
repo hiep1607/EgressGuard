@@ -164,8 +164,8 @@ $publishCommon = @(
     '--nologo'
 )
 
-Write-Step 'restoring solution dependencies (locked mode)'
-& dotnet restore EgressGuard.sln --locked-mode
+Write-Step 'restoring solution dependencies (locked mode, win-x64 graph)'
+& dotnet restore EgressGuard.sln --locked-mode -r win-x64
 if ($LASTEXITCODE -ne 0) { Write-Host '[fail] locked-mode solution restore failed.'; exit 13 }
 
 # The win-x64 publish needs its own dependency graph, which differs from the
@@ -200,9 +200,9 @@ $publishFailed = $false
 try {
     foreach ($projectName in $projectsToPublish) {
         $projectPath = Join-Path $repoRoot ('src\' + $projectName + '\' + $projectName + '.csproj')
-        Write-Step ("restoring win-x64 graph: " + $projectName)
-        & dotnet restore $projectPath -r win-x64
-        if ($LASTEXITCODE -ne 0) { throw ($projectName + ': win-x64 restore failed.') }
+        Write-Step ("restoring win-x64 graph (locked mode): " + $projectName)
+        & dotnet restore $projectPath --locked-mode -r win-x64
+        if ($LASTEXITCODE -ne 0) { throw ($projectName + ': locked win-x64 restore failed.') }
     }
 
     if ($InjectPublishFailureForTest) {

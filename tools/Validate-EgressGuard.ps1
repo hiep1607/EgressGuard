@@ -146,7 +146,7 @@ function Get-AgentHandoffViolations {
 Write-Host ('Repository root: ' + $repoRoot)
 
 Invoke-ValidationStep -Name 'dotnet tool restore' -Action { dotnet tool restore }
-Invoke-ValidationStep -Name 'restore solution (locked mode)' -Action { dotnet restore EgressGuard.sln --locked-mode }
+Invoke-ValidationStep -Name 'restore solution (locked mode, win-x64 graph)' -Action { dotnet restore EgressGuard.sln --locked-mode -r win-x64 }
 Invoke-ValidationStep -Name 'shutdown build servers' -Action { dotnet build-server shutdown }
 Invoke-ValidationStep -Name 'verify formatting (no rewrite)' -Action { dotnet format EgressGuard.sln --verify-no-changes --no-restore }
 Invoke-ValidationStep -Name 'build Release' -Action { dotnet build EgressGuard.sln -c Release --no-restore }
