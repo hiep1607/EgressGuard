@@ -59,7 +59,6 @@ jobs:
           path: ${{ runner.temp }}\artifact download
 
       - name: Extract exactly once into a path with spaces
-        id: extract
         shell: powershell
         run: |
           $downloadDir = '${{ github.workspace }}\artifact download'
@@ -69,12 +68,23 @@ jobs:
             Expand-Archive -LiteralPath $zip.FullName -DestinationPath $dest -Force
           }
           else {
-            # The artifact already contains the extracted layout.
+            # The uploaded artifact already contains the extracted layout.
             $dest = $downloadDir
           }
 
+          # download-artifact may nest the contents inside a folder named after
+          # the artifact; locate the real package root before validating.
+          $launcher = Get-ChildItem $dest -Filter 'EgressGuard.Launcher.exe' -Recurse |
+            Select-Object -First 1
+          if ($launcher) {
+            $dest = $launcher.DirectoryName
+          }
+          else {
+            Write-Host '::error::EgressGuard.Launcher.exe was not found in the downloaded artifact.'
+            exit 1
+          }
+
           foreach ($required in @(
-            'EgressGuard.Launcher.exe',
             'service\EgressGuard.Service.exe',
             'ui\EgressGuard.UI.exe',
             'HUONG-DAN.txt',
