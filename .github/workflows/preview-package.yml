@@ -1,0 +1,399 @@
+name: Preview package
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'Directory.Build.props'
+      - 'EgressGuard.sln'
+      - '**/packages.lock.json'
+      - 'tools/Build-PreviewPackage.ps1'
+      - '.github/workflows/preview-package.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preview-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-smoke:
+    name: Build portable preview and smoke test
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Prove injected publish failure preserves package locks
+        shell: powershell
+        run: |
+          $failureOutput = Join-Path $env:RUNNER_TEMP 'preview injected failure out'
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\Build-PreviewPackage.ps1 `
+            -OutputDirectory $failureOutput -InjectPublishFailureForTest
+          $failureCode = $LASTEXITCODE
+          Write-Host "injected publish failure exit code: $failureCode (expected 15)"
+          if ($failureCode -ne 15) {
+            Write-Host "::error::injected publish failure returned $failureCode instead of 15."
+            exit 1
+          }
+
+          $trackedChanges = @(git status --short --untracked-files=no)
+          if ($trackedChanges.Count -gt 0) {
+            $trackedChanges | ForEach-Object { Write-Host "::error::tracked worktree change after injected failure: $_" }
+            exit 1
+          }
+          Write-Host 'tracked worktree is clean after injected failure; lock-file list and SHA256 were verified by the script.'
+
+      - name: Build preview package after injected failure test
+        shell: powershell
+        run: |
+          $successOutput = Join-Path $env:RUNNER_TEMP 'preview out'
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\Build-PreviewPackage.ps1 `
+            -OutputDirectory $successOutput
+          $buildCode = $LASTEXITCODE
+          Write-Host "successful package build exit code: $buildCode (expected 0)"
+          if ($buildCode -ne 0) {
+            Write-Host "::error::package build failed with exit code $buildCode."
+            exit 1
+          }
+
+          $trackedChanges = @(git status --short --untracked-files=no)
+          if ($trackedChanges.Count -gt 0) {
+            $trackedChanges | ForEach-Object { Write-Host "::error::tracked worktree change after successful build: $_" }
+            exit 1
+          }
+          Write-Host 'tracked worktree is clean after successful build; lock-file list and SHA256 were verified by the script.'
+
+      - name: Upload extracted package contents as artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: EgressGuard-Preview-win-x64
+          path: ${{ runner.temp }}\preview out\stage\
+          if-no-files-found: error
+          retention-days: 7
+
+  verify-downloaded-artifact:
+    name: Verify downloaded artifact and run launcher smoke test
+    needs: build-and-smoke
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Download the artifact that was just uploaded
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: EgressGuard-Preview-win-x64
+          path: ${{ runner.temp }}\artifact download
+
+      - name: Extract exactly once into a path with spaces
+        shell: powershell
+        run: |
+          $downloadDir = Join-Path $env:RUNNER_TEMP 'artifact download'
+          $zip = Get-ChildItem $downloadDir -Filter '*.zip' -Recurse | Select-Object -First 1
+          if ($zip) {
+            $dest = Join-Path $env:RUNNER_TEMP 'Egress Guard Preview Dir With Spaces'
+            Expand-Archive -LiteralPath $zip.FullName -DestinationPath $dest -Force
+          }
+          else {
+            # The uploaded artifact already contains the extracted layout.
+            $dest = $downloadDir
+          }
+
+          # download-artifact may nest the contents inside a folder named after
+          # the artifact; locate the real package root before validating.
+          $launcher = Get-ChildItem $dest -Filter 'EgressGuard.Launcher.exe' -Recurse |
+            Select-Object -First 1
+          if ($launcher) {
+            $dest = $launcher.DirectoryName
+          }
+          else {
+            Write-Host '::error::EgressGuard.Launcher.exe was not found in the downloaded artifact.'
+            exit 1
+          }
+
+          foreach ($required in @(
+            'service\EgressGuard.Service.exe',
+            'ui\EgressGuard.UI.exe',
+            'HUONG-DAN.txt',
+            'commit-info.txt')) {
+            $path = Join-Path $dest $required
+            if (-not (Test-Path -LiteralPath $path)) {
+              Write-Host "::error::missing in extracted package: $required"
+              exit 1
+            }
+          }
+
+          "PREVIEW_DEST=$dest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "package ready at: $dest"
+
+      - name: Start an unrelated canary process
+        shell: powershell
+        run: |
+          $statePath = Join-Path $env:RUNNER_TEMP 'preview-owned-processes.txt'
+          $canary = $null
+          try {
+            $canary = Start-Process -FilePath "$env:ComSpec" -ArgumentList '/c', 'ping -n 300 127.0.0.1 > nul' -PassThru -WindowStyle Hidden
+            "Canary|$($canary.Id)|$([System.IO.Path]::GetFullPath($env:ComSpec))" | Set-Content -LiteralPath $statePath -Encoding ASCII
+            "CANARY_PID=$($canary.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "OWNED_PID_STATE=$statePath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            Write-Host "canary PID: $($canary.Id)"
+          }
+          catch {
+            if ($null -ne $canary -and -not $canary.HasExited) {
+              & taskkill.exe /PID $canary.Id /T /F
+              Write-Host "canary PID $($canary.Id) cleaned after state-recording failure."
+            }
+            throw
+          }
+
+      - name: Run two real launchers against the same data folder
+        shell: powershell
+        run: |
+          function Add-OwnedProcess([string]$role, [int]$processId, [string]$expectedPath) {
+            "$role|$processId|$([System.IO.Path]::GetFullPath($expectedPath))" |
+              Add-Content -LiteralPath $env:OWNED_PID_STATE -Encoding ASCII
+          }
+
+          function Start-Launcher([string]$executable, [string]$dataDirectory, [int]$smokeSeconds, [string]$logPrefix) {
+            $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+            $startInfo.FileName = $executable
+            $startInfo.WorkingDirectory = Split-Path -Parent $executable
+            $startInfo.Arguments = '--data-dir "' + $dataDirectory + '" --smoke-exit-after ' + $smokeSeconds
+            $startInfo.UseShellExecute = $false
+            $startInfo.CreateNoWindow = $true
+            $startInfo.RedirectStandardOutput = $true
+            $startInfo.RedirectStandardError = $true
+            $process = New-Object System.Diagnostics.Process
+            $process.StartInfo = $startInfo
+            if (-not $process.Start()) {
+              throw "failed to start $logPrefix launcher."
+            }
+            return $process
+          }
+
+          function Find-ExactChildProcess([int]$parentId, [string]$expectedPath) {
+            $children = @(Get-CimInstance Win32_Process -Filter ("ParentProcessId = " + $parentId) -ErrorAction Stop)
+            foreach ($child in $children) {
+              if ($child.ExecutablePath -and
+                  [string]::Equals(
+                    [System.IO.Path]::GetFullPath($child.ExecutablePath),
+                    [System.IO.Path]::GetFullPath($expectedPath),
+                    [StringComparison]::OrdinalIgnoreCase)) {
+                return $child
+              }
+            }
+            return $null
+          }
+
+          function Test-SessionLockHeld([string]$lockPath) {
+            if (-not (Test-Path -LiteralPath $lockPath -PathType Leaf)) {
+              return $false
+            }
+            try {
+              $probe = [System.IO.File]::Open(
+                $lockPath,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::ReadWrite,
+                [System.IO.FileShare]::ReadWrite)
+              $probe.Dispose()
+              return $false
+            }
+            catch [System.IO.IOException] {
+              return $true
+            }
+          }
+
+          $exe = Join-Path $env:PREVIEW_DEST 'EgressGuard.Launcher.exe'
+          $serviceExe = Join-Path $env:PREVIEW_DEST 'service\EgressGuard.Service.exe'
+          $uiExe = Join-Path $env:PREVIEW_DEST 'ui\EgressGuard.UI.exe'
+          $dataDirectory = [System.IO.Path]::GetFullPath((Join-Path $env:RUNNER_TEMP 'Egress Guard Data Dir With Spaces'))
+          [System.IO.Directory]::CreateDirectory($dataDirectory) | Out-Null
+          $lockPath = Join-Path $dataDirectory 'session.lock'
+          Write-Host "absolute shared data directory: $dataDirectory"
+
+          $first = Start-Launcher -executable $exe -dataDirectory $dataDirectory -smokeSeconds 30 -logPrefix 'first'
+          Add-OwnedProcess -role 'Launcher1' -processId $first.Id -expectedPath $exe
+          Write-Host "first real launcher PID: $($first.Id)"
+
+          $service = $null
+          $readyDeadline = [DateTime]::UtcNow.AddSeconds(30)
+          do {
+            if ($first.HasExited) {
+              throw "first launcher exited before readiness with code $($first.ExitCode)."
+            }
+            $lockHeld = Test-SessionLockHeld -lockPath $lockPath
+            $service = Find-ExactChildProcess -parentId $first.Id -expectedPath $serviceExe
+            if ($lockHeld -and $null -ne $service) {
+              break
+            }
+            Start-Sleep -Milliseconds 250
+          } while ([DateTime]::UtcNow -lt $readyDeadline)
+
+          if (-not $lockHeld) {
+            throw 'timed out waiting for session.lock to be held exclusively.'
+          }
+          if ($null -eq $service) {
+            throw 'timed out waiting for the first launcher service process.'
+          }
+          Add-OwnedProcess -role 'Service' -processId $service.ProcessId -expectedPath $serviceExe
+          Write-Host "session.lock is held; first launcher is alive; service PID: $($service.ProcessId)"
+
+          $ui = $null
+          $uiDeadline = [DateTime]::UtcNow.AddSeconds(15)
+          do {
+            if ($first.HasExited) {
+              throw "first launcher exited before starting the UI with code $($first.ExitCode)."
+            }
+            $ui = Find-ExactChildProcess -parentId $first.Id -expectedPath $uiExe
+            if ($null -ne $ui) { break }
+            Start-Sleep -Milliseconds 250
+          } while ([DateTime]::UtcNow -lt $uiDeadline)
+          if ($null -eq $ui) {
+            throw 'timed out waiting for the first launcher UI process.'
+          }
+          Add-OwnedProcess -role 'UI' -processId $ui.ProcessId -expectedPath $uiExe
+          Write-Host "first launcher UI PID: $($ui.ProcessId)"
+
+          $second = Start-Launcher -executable $exe -dataDirectory $dataDirectory -smokeSeconds 5 -logPrefix 'second'
+          Add-OwnedProcess -role 'Launcher2' -processId $second.Id -expectedPath $exe
+          Write-Host "second real launcher PID: $($second.Id)"
+          if (-not $second.WaitForExit(15000)) {
+            throw 'second launcher did not exit within 15 seconds.'
+          }
+          $secondOutput = $second.StandardOutput.ReadToEnd()
+          $secondError = $second.StandardError.ReadToEnd()
+          if ($secondOutput) { Write-Host $secondOutput.TrimEnd() }
+          if ($secondError) { Write-Host $secondError.TrimEnd() }
+          Write-Host "second launcher exit code: $($second.ExitCode) (AlreadyRunning expected 1)"
+          if ($second.ExitCode -ne 1) {
+            throw "second launcher returned $($second.ExitCode) instead of AlreadyRunning (1)."
+          }
+          if ($first.HasExited) {
+            throw "first launcher was not alive after rejecting the second launcher; exit code $($first.ExitCode)."
+          }
+          Write-Host "first launcher PID $($first.Id) is still alive after the rejection."
+
+          if (-not $first.WaitForExit(60000)) {
+            throw 'first launcher did not finish its smoke session within 60 seconds.'
+          }
+          $firstOutput = $first.StandardOutput.ReadToEnd()
+          $firstError = $first.StandardError.ReadToEnd()
+          if ($firstOutput) { Write-Host $firstOutput.TrimEnd() }
+          if ($firstError) { Write-Host $firstError.TrimEnd() }
+          Write-Host "first launcher exit code: $($first.ExitCode) (expected 0)"
+          if ($first.ExitCode -ne 0) {
+            throw "first launcher returned $($first.ExitCode) instead of 0."
+          }
+
+          foreach ($owned in @(
+            @($first.Id, $exe),
+            @($second.Id, $exe),
+            @([int]$service.ProcessId, $serviceExe),
+            @([int]$ui.ProcessId, $uiExe))) {
+            $current = Get-CimInstance Win32_Process -Filter ("ProcessId = " + $owned[0]) -ErrorAction SilentlyContinue
+            if ($current -and $current.ExecutablePath -and
+                [string]::Equals($current.ExecutablePath, $owned[1], [StringComparison]::OrdinalIgnoreCase)) {
+              throw "test-owned process is still alive: PID $($owned[0]) path $($owned[1])."
+            }
+          }
+
+          if (-not (Get-Process -Id ([int]$env:CANARY_PID) -ErrorAction SilentlyContinue)) {
+            throw 'the unrelated canary died before the cleanup step.'
+          }
+          Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'preview-contention-success.txt') -Value 'success' -Encoding ASCII
+          Write-Host 'contention test passed: launcher exit codes were 1/0, all test-owned EgressGuard processes exited, and canary remains alive.'
+
+      - name: Always verify and clean only test-owned process trees
+        if: always()
+        shell: powershell
+        run: |
+          $cleanupFailed = $false
+          $statePath = Join-Path $env:RUNNER_TEMP 'preview-owned-processes.txt'
+          $successMarker = Join-Path $env:RUNNER_TEMP 'preview-contention-success.txt'
+          $entries = @()
+          if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+            foreach ($line in @(Get-Content -LiteralPath $statePath)) {
+              $parts = @($line -split '\|', 3)
+              if ($parts.Count -eq 3) {
+                $entries += [PSCustomObject]@{ Role = $parts[0]; Id = [int]$parts[1]; Path = $parts[2] }
+              }
+            }
+          }
+
+          function Get-RecordedProcess($entry) {
+            $process = Get-CimInstance Win32_Process -Filter ("ProcessId = " + $entry.Id) -ErrorAction SilentlyContinue
+            if ($null -eq $process) { return $null }
+            if (-not $process.ExecutablePath -or
+                -not [string]::Equals(
+                  [System.IO.Path]::GetFullPath($process.ExecutablePath),
+                  [System.IO.Path]::GetFullPath($entry.Path),
+                  [StringComparison]::OrdinalIgnoreCase)) {
+              Write-Host "::error::PID $($entry.Id) no longer matches recorded $($entry.Role) path; refusing to kill an unrelated process."
+              $script:cleanupFailed = $true
+              return $null
+            }
+            return $process
+          }
+
+          $ownedEntries = @($entries | Where-Object { $_.Role -ne 'Canary' })
+          $liveOwned = @($ownedEntries | Where-Object { $null -ne (Get-RecordedProcess $_) })
+          if ((Test-Path -LiteralPath $successMarker) -and $liveOwned.Count -gt 0) {
+            foreach ($entry in $liveOwned) {
+              Write-Host "::error::test reported success but $($entry.Role) PID $($entry.Id) is still alive."
+            }
+            $cleanupFailed = $true
+          }
+
+          foreach ($entry in $ownedEntries) {
+            $process = Get-RecordedProcess $entry
+            if ($null -eq $process) { continue }
+            Write-Host "cleanup: taskkill exact $($entry.Role) PID $($entry.Id) with its child tree."
+            & taskkill.exe /PID $entry.Id /T /F
+            $process = Get-RecordedProcess $entry
+            if ($null -ne $process) {
+              Write-Host "::error::cleanup could not stop $($entry.Role) PID $($entry.Id)."
+              $cleanupFailed = $true
+            }
+          }
+
+          $canaryEntry = $entries | Where-Object { $_.Role -eq 'Canary' } | Select-Object -First 1
+          if ($null -ne $canaryEntry) {
+            $canary = Get-RecordedProcess $canaryEntry
+            if ($null -eq $canary) {
+              Write-Host '::error::the unrelated canary did not survive until the cleanup step.'
+              $cleanupFailed = $true
+            }
+            else {
+              Write-Host "canary PID $($canaryEntry.Id) survived until cleanup, as required."
+              & taskkill.exe /PID $canaryEntry.Id /T /F
+              if ($null -ne (Get-RecordedProcess $canaryEntry)) {
+                Write-Host "::error::canary PID $($canaryEntry.Id) could not be cleaned."
+                $cleanupFailed = $true
+              }
+              else {
+                Write-Host "canary PID $($canaryEntry.Id) cleaned."
+              }
+            }
+          }
+          else {
+            Write-Host 'no canary PID was recorded; the canary step did not create one.'
+          }
+
+          $remainingOwned = @($ownedEntries | Where-Object { $null -ne (Get-RecordedProcess $_) })
+          if ($remainingOwned.Count -gt 0) {
+            $cleanupFailed = $true
+          }
+          if ($cleanupFailed) {
+            Write-Host '::error::test-owned process cleanup FAILED.'
+            exit 1
+          }
+          Write-Host 'test-owned process cleanup PASSED; no recorded Launcher, Service, UI or canary process remains.'

@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>EgressGuard.Launcher</AssemblyName>
+    <!-- The launcher has no package references; keeping it out of the lock-file
+         graph lets RID-specific publishes run without touching any lock file. -->
+    <RestorePackagesWithLockFile>false</RestorePackagesWithLockFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="EgressGuard.Tests" />
+  </ItemGroup>
+
+</Project>
