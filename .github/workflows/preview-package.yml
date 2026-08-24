@@ -3,9 +3,11 @@ name: Preview package
 on:
   pull_request:
     paths:
-      - 'src/EgressGuard.Launcher/**'
-      - 'src/EgressGuard.Service/**'
-      - 'src/EgressGuard.UI/**'
+      - 'src/**'
+      - 'Directory.Build.props'
+      - 'EgressGuard.sln'
+      - '**/packages.lock.json'
+      - 'tools/Build-PreviewPackage.ps1'
       - '.github/workflows/preview-package.yml'
   workflow_dispatch:
 
@@ -31,38 +33,70 @@ jobs:
         with:
           dotnet-version: 8.0.x
 
-      - name: Build preview package (locked restore inside)
+      - name: Build preview package
         shell: powershell
         run: ./tools/Build-PreviewPackage.ps1 -OutputDirectory "$env:RUNNER_TEMP\preview out"
 
-      - name: Extract package into a path with spaces
-        shell: powershell
-        run: |
-          $zip = Join-Path $env:RUNNER_TEMP 'preview out\EgressGuard-Preview-win-x64.zip'
-          $dest = Join-Path $env:RUNNER_TEMP 'Egress Guard Preview Dir With Spaces'
-          Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
-          "PREVIEW_DEST=$dest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "extracted to: $dest"
+      - name: Upload extracted package contents as artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: EgressGuard-Preview-win-x64
+          path: ${{ runner.temp }}\preview out\stage\
+          if-no-files-found: error
+          retention-days: 7
 
-      - name: Verify extracted layout
+  verify-downloaded-artifact:
+    name: Verify downloaded artifact and run launcher smoke test
+    needs: build-and-smoke
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Download the artifact that was just uploaded
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: EgressGuard-Preview-win-x64
+          path: ${{ runner.temp }}\artifact download
+
+      - name: Extract exactly once into a path with spaces
+        id: extract
         shell: powershell
         run: |
+          $downloadDir = '${{ github.workspace }}\artifact download'
+          $zip = Get-ChildItem $downloadDir -Filter '*.zip' -Recurse | Select-Object -First 1
+          if ($zip) {
+            $dest = Join-Path $env:RUNNER_TEMP 'Egress Guard Preview Dir With Spaces'
+            Expand-Archive -LiteralPath $zip.FullName -DestinationPath $dest -Force
+          }
+          else {
+            # The artifact already contains the extracted layout.
+            $dest = $downloadDir
+          }
+
           foreach ($required in @(
             'EgressGuard.Launcher.exe',
             'service\EgressGuard.Service.exe',
             'ui\EgressGuard.UI.exe',
             'HUONG-DAN.txt',
             'commit-info.txt')) {
-            $path = Join-Path $env:PREVIEW_DEST $required
+            $path = Join-Path $dest $required
             if (-not (Test-Path -LiteralPath $path)) {
-              Write-Host "::error::missing in package: $required"
+              Write-Host "::error::missing in extracted package: $required"
               exit 1
             }
           }
-          Write-Host 'layout ok'
 
-      - name: Smoke test launcher (starts service, waits for pipe, stops everything)
-        id: smoke
+          "PREVIEW_DEST=$dest" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "package ready at: $dest"
+
+      - name: Start an unrelated canary process
+        shell: powershell
+        run: |
+          $canary = Start-Process -FilePath "$env:ComSpec" -ArgumentList '/c', 'ping -n 300 127.0.0.1 > nul' -PassThru -WindowStyle Hidden
+          "CANARY_PID=$($canary.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "canary PID: $($canary.Id)"
+
+      - name: Run the real launcher from the downloaded artifact
         shell: powershell
         env:
           EGRESSGUARD_LAUNCHER_SMOKE_EXIT_AFTER_SECONDS: '15'
@@ -76,25 +110,29 @@ jobs:
             exit 1
           }
 
-      - name: Assert every launched process is gone
+      - name: Assert canary survived and owned processes are gone (finally cleans the canary)
         shell: powershell
         run: |
-          Start-Sleep -Seconds 3
-          $left = @(Get-Process -Name 'EgressGuard.Service','EgressGuard.UI' -ErrorAction SilentlyContinue)
-          if ($left.Count -gt 0) {
-            foreach ($process in $left) { Write-Host ("::error::leftover process: " + $process.Name + " pid=" + $process.Id) }
-            exit 1
+          try {
+            Start-Sleep -Seconds 3
+            $left = @(Get-Process -Name 'EgressGuard.Service','EgressGuard.UI','EgressGuard.Launcher' -ErrorAction SilentlyContinue)
+            if ($left.Count -gt 0) {
+              foreach ($process in $left) { Write-Host ("::error::leftover process: " + $process.Name + " pid=" + $process.Id) }
+              exit 1
+            }
+            Write-Host 'no leftover service, UI or launcher processes.'
+
+            $canaryPid = [int]$env:CANARY_PID
+            $canary = Get-Process -Id $canaryPid -ErrorAction SilentlyContinue
+            if ($null -eq $canary) {
+              Write-Host '::error::the unrelated canary process was killed by mistake.'
+              exit 1
+            }
+            Write-Host 'canary process is still alive, as required.'
           }
-          Write-Host 'no leftover service or UI processes.'
-
-      - name: Re-verify packaged ZIP contents
-        shell: powershell
-        run: ./tools/Build-PreviewPackage.ps1 -VerifyZipPath "$env:RUNNER_TEMP\preview out\EgressGuard-Preview-win-x64.zip"
-
-      - name: Upload preview ZIP artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: EgressGuard-Preview-win-x64
-          path: ${{ runner.temp }}\preview out\EgressGuard-Preview-win-x64.zip
-          if-no-files-found: error
-          retention-days: 7
+          finally {
+            if ($env:CANARY_PID) {
+              Stop-Process -Id ([int]$env:CANARY_PID) -Force -ErrorAction SilentlyContinue
+              Write-Host 'canary cleaned up in finally.'
+            }
+          }

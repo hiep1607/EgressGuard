@@ -247,10 +247,13 @@ internal static class Program
             ("UI file history stale cancel completes without escaping", TestUiFileHistoryCancelDisposeRaceAsync),
             ("UI file history export survives unexpected cancellation", TestUiFileHistoryExportUnexpectedCancellationAsync),
             ("Preview launch options keep paths with spaces intact", TestPreviewLaunchOptionsWithSpacesInPathsAsync),
-            ("Preview single-instance guard blocks a second session", TestPreviewSingleInstanceGuardBlocksSecondSessionAsync),
+            ("Preview single-instance guard blocks a second session", TestPreviewDataFolderLockBlocksSecondSessionAsync),
             ("Preview engine fails fast when a component is missing", TestPreviewEngineFailsFastWhenComponentMissingAsync),
             ("Preview engine stops only owned processes when the service is not ready", TestPreviewEngineStopsOnlyOwnedProcessesWhenServiceNotReadyAsync),
             ("Preview engine stops exactly the launched processes after the UI exits", TestPreviewEngineStopsExactlyLaunchedProcessesAfterUiExitAsync),
+            ("Preview engine reports a cleanup failure when a kill throws", TestPreviewEngineReportsCleanupFailureWhenKillThrowsAsync),
+            ("Preview engine reports a cleanup failure when exit is not confirmed", TestPreviewEngineReportsCleanupFailureWhenExitNotConfirmedAsync),
+            ("Preview engine stops one process and reports the other", TestPreviewEngineStopsOneProcessAndReportsTheOtherAsync),
             ("Protocol rejects oversized message", TestOversizedMessageAsync),
             ("Protocol handles disconnect", TestProtocolDisconnectAsync),
             ("Event buffer preserves order and detects gaps and overflow", TestEventBufferAsync),
@@ -2713,16 +2716,27 @@ internal static class Program
 
         public int KillCount { get; private set; }
 
-        public bool WaitForExitCalled { get; private set; }
+        public int WaitForExitCount { get; private set; }
+
+        public bool WaitForExitCalled => WaitForExitCount > 0;
+
+        public bool KillThrows { get; set; }
+
+        public bool WaitSucceeds { get; set; } = true;
 
         public bool WaitForExit(int milliseconds)
         {
-            WaitForExitCalled = true;
-            return true;
+            WaitForExitCount++;
+            return WaitSucceeds;
         }
 
         public void KillEntireTree()
         {
+            if (KillThrows)
+            {
+                throw new IOException("injected kill failure");
+            }
+
             KillCount++;
         }
 
@@ -2756,40 +2770,52 @@ internal static class Program
         AssertEqual(@"C:\Temp Dir With Spaces\Preview Package\ui\EgressGuard.UI.exe", options.UiExecutablePath);
         AssertEqual("pipe-under-test", options.PipeName);
         AssertEqual(7, options.SmokeExitAfterSeconds);
-        AssertTrue(options.MutexName.StartsWith("EgressGuard.Preview.", StringComparison.Ordinal), "The mutex name must use the preview prefix.");
-        AssertTrue(options.MutexName.Length > "EgressGuard.Preview.".Length, "The mutex name must include a data-folder hash.");
 
-        var other = LaunchOptionsFactory.Create(
-            rootDirectory: root,
-            dataDirectory: @"C:\A Completely Different Data Folder");
-        AssertTrue(options.MutexName != other.MutexName, "Different data folders must derive different mutex names.");
+        // Equivalent spellings of one folder must normalize to the same lock.
+        // Windows paths are case-insensitive, so ownership comparison ignores
+        // casing as well.
+        var plain = DataFolderLock.GetLockPath(@"C:\Preview Data");
+        var cased = DataFolderLock.GetLockPath(@"c:\PREVIEW DATA");
+        var dotted = DataFolderLock.GetLockPath(@"C:\Preview Data\.\");
+        var trailing = DataFolderLock.GetLockPath(@"C:\Preview Data\");
+        AssertTrue(string.Equals(plain, cased, StringComparison.OrdinalIgnoreCase), "Different casing must resolve to the same lock ownership.");
+        AssertEqual(plain, dotted);
+        AssertEqual(plain, trailing);
+        AssertTrue(plain.EndsWith("session.lock", StringComparison.OrdinalIgnoreCase), "The lock must be a file inside the data folder.");
         return Task.CompletedTask;
     }
 
-    private static Task TestPreviewSingleInstanceGuardBlocksSecondSessionAsync()
+    private static async Task TestPreviewDataFolderLockBlocksSecondSessionAsync()
     {
-        var tempData = Path.Combine(Path.GetTempPath(), "EgressGuard-Preview-Guard-" + Guid.NewGuid().ToString("N"));
+        var tempData = Path.Combine(Path.GetTempPath(), "EgressGuard-Preview-Lock-" + Guid.NewGuid().ToString("N"));
         try
         {
-            Directory.CreateDirectory(tempData);
-            var mutexName = LaunchOptionsFactory.BuildMutexName(tempData);
+            // The lock is taken on a different thread and released on the main
+            // thread to prove it does not depend on thread affinity.
+            DataFolderLock? acquiredOnOtherThread = null;
+            await Task.Run(() =>
+            {
+                acquiredOnOtherThread = new DataFolderLock();
+                acquiredOnOtherThread.Acquire(tempData);
+            }).ConfigureAwait(false);
+            AssertTrue(acquiredOnOtherThread!.Acquired, "The first preview session must acquire the data-folder lock.");
 
-            using var first = new SingleInstanceGuard(mutexName);
-            AssertTrue(first.Acquired, "The first preview session must acquire the data-folder guard.");
+            using var second = new DataFolderLock();
+            second.Acquire(tempData);
+            AssertTrue(!second.Acquired, "A second session on the same data folder must be blocked.");
+            AssertTrue(!string.IsNullOrEmpty(second.Error), "A blocked second session must report a clear reason.");
 
-            using var second = new SingleInstanceGuard(mutexName);
-            AssertTrue(!second.Acquired, "A second preview session on the same data folder must be blocked.");
+            var otherData = tempData + "-other";
+            using var third = new DataFolderLock();
+            third.Acquire(otherData);
+            AssertTrue(third.Acquired, "A different data folder must not be blocked by another session's lock.");
 
-            var thirdData = tempData + "-other";
-            using var third = new SingleInstanceGuard(LaunchOptionsFactory.BuildMutexName(thirdData));
-            AssertTrue(third.Acquired, "A different data folder must not be blocked by another session's guard.");
+            acquiredOnOtherThread.Dispose();
         }
         finally
         {
             Directory.Delete(tempData, recursive: true);
         }
-
-        return Task.CompletedTask;
     }
 
     private static async Task TestPreviewEngineFailsFastWhenComponentMissingAsync()
@@ -2912,13 +2938,120 @@ internal static class Program
             AssertEqual(ui.Id, result.UiProcessId!.Value);
             AssertTrue(service.WaitForExitCalled, "The launcher must confirm the Service stopped after the UI closed.");
             AssertEqual(1, service.KillCount);
-            AssertEqual(0, ui.KillCount);
+            AssertEqual(0, result.CleanupFailures.Count);
             AssertEqual(0, canary.KillCount);
         }
         finally
         {
             Directory.Delete(root, recursive: true);
         }
+    }
+
+    private static async Task TestPreviewEngineReportsCleanupFailureWhenKillThrowsAsync()
+    {
+        var root = CreateLauncherTestRoot("EgressGuard-Launch-KillThrows-");
+        try
+        {
+            var service = new FakePreviewProcess(501) { KillThrows = true };
+            var ui = new FakePreviewProcess(602);
+            ProcessStarter starter = spec => spec.ExecutablePath.EndsWith("EgressGuard.UI.exe", StringComparison.OrdinalIgnoreCase) ? ui : service;
+
+            var options = LaunchOptionsFactory.Create(
+                rootDirectory: root,
+                dataDirectory: Path.Combine(root, "data"),
+                smokeExitAfterSeconds: 0);
+
+            using var log = new StringWriter();
+            var result = await LauncherEngine.RunAsync(
+                options,
+                fileExists: _ => true,
+                startProcess: starter,
+                probe: new FakePipeProbe(ready: true),
+                log).ConfigureAwait(false);
+
+            AssertEqual(ExitCodes.StopFailed, result.ExitCode);
+            AssertTrue(result.CleanupFailures.Count > 0, "A failed kill must be reported as a cleanup failure.");
+            AssertTrue(!log.ToString().Contains("stopped cleanly", StringComparison.Ordinal), "A cleanup failure must never be reported as a clean stop.");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    private static async Task TestPreviewEngineReportsCleanupFailureWhenExitNotConfirmedAsync()
+    {
+        var root = CreateLauncherTestRoot("EgressGuard-Launch-WaitFails-");
+        try
+        {
+            var service = new FakePreviewProcess(701) { WaitSucceeds = false };
+            var ui = new FakePreviewProcess(802);
+            ProcessStarter starter = spec => spec.ExecutablePath.EndsWith("EgressGuard.UI.exe", StringComparison.OrdinalIgnoreCase) ? ui : service;
+
+            var options = LaunchOptionsFactory.Create(
+                rootDirectory: root,
+                dataDirectory: Path.Combine(root, "data"),
+                smokeExitAfterSeconds: 0);
+
+            using var log = new StringWriter();
+            var result = await LauncherEngine.RunAsync(
+                options,
+                fileExists: _ => true,
+                startProcess: starter,
+                probe: new FakePipeProbe(ready: true),
+                log).ConfigureAwait(false);
+
+            AssertEqual(ExitCodes.StopFailed, result.ExitCode);
+            AssertTrue(result.CleanupFailures.Count > 0, "An unconfirmed exit must be reported as a cleanup failure.");
+            AssertTrue(log.ToString().Contains("did not confirm exit", StringComparison.Ordinal), "The log must state that the exit was not confirmed.");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    private static async Task TestPreviewEngineStopsOneProcessAndReportsTheOtherAsync()
+    {
+        var root = CreateLauncherTestRoot("EgressGuard-Launch-MixedStop-");
+        try
+        {
+            // Smoke mode: the engine stops the UI first, then the Service. The
+            // UI refuses to die while the Service stops fine - the launcher
+            // must report exactly one failure and still confirm the Service.
+            var service = new FakePreviewProcess(901);
+            var ui = new FakePreviewProcess(902) { KillThrows = true };
+            ProcessStarter starter = spec => spec.ExecutablePath.EndsWith("EgressGuard.UI.exe", StringComparison.OrdinalIgnoreCase) ? ui : service;
+
+            var options = LaunchOptionsFactory.Create(
+                rootDirectory: root,
+                dataDirectory: Path.Combine(root, "data"),
+                smokeExitAfterSeconds: 1);
+
+            using var log = new StringWriter();
+            var result = await LauncherEngine.RunAsync(
+                options,
+                fileExists: _ => true,
+                startProcess: starter,
+                probe: new FakePipeProbe(ready: true),
+                log).ConfigureAwait(false);
+
+            AssertEqual(ExitCodes.StopFailed, result.ExitCode);
+            AssertTrue(result.CleanupFailures.Any(failure => failure.StartsWith("UI ", StringComparison.Ordinal)), "The failing UI stop must be reported.");
+            AssertTrue(service.KillCount == 1 && service.WaitForExitCalled, "The Service stop must still be attempted and confirmed.");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    private static string CreateLauncherTestRoot(string prefix)
+    {
+        var root = Path.Combine(Path.GetTempPath(), prefix + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, "service"));
+        Directory.CreateDirectory(Path.Combine(root, "ui"));
+        return root;
     }
 
     private static async Task TestProtocolRoundTripAsync()

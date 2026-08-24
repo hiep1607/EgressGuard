@@ -12,7 +12,6 @@ internal sealed record LaunchOptions(
     string ServiceExecutablePath,
     string UiExecutablePath,
     string PipeName,
-    string MutexName,
     int ServiceReadyTimeoutSeconds,
     int SmokeExitAfterSeconds);
 
@@ -26,6 +25,7 @@ internal static class ExitCodes
     public const int MissingComponent = 2;
     public const int ServiceNotReady = 3;
     public const int StartFailed = 4;
+    public const int StopFailed = 5;
 }
 
 /// <summary>
@@ -56,25 +56,13 @@ internal static class LaunchOptionsFactory
         var servicePath = Path.Combine(root, "service", "EgressGuard.Service.exe");
         var uiPath = Path.Combine(root, "ui", "EgressGuard.UI.exe");
         var pipe = pipeName ?? $"EgressGuard.Service.preview-{Guid.NewGuid():N}";
-        var mutexName = BuildMutexName(dataDir);
         return new LaunchOptions(
             root,
             dataDir,
             servicePath,
             uiPath,
             pipe,
-            mutexName,
             serviceReadyTimeoutSeconds,
             Math.Max(0, smokeExitAfterSeconds));
-    }
-
-    /// <summary>
-    /// Derives a stable per-data-folder mutex name so two preview sessions can
-    /// never share one data folder.
-    /// </summary>
-    public static string BuildMutexName(string dataDirectory)
-    {
-        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(dataDirectory.ToLowerInvariant()));
-        return "EgressGuard.Preview." + Convert.ToHexString(hash)[..16];
     }
 }

@@ -69,7 +69,7 @@ To try it:
 
 The launcher starts the packaged Service and UI from that folder, keeps data in `%LOCALAPPDATA%\EgressGuard-Preview`, gives every run its own named pipe, refuses to start twice against the same data folder, waits until the Service pipe is ready before opening the UI, and stops exactly the Service it started when the UI closes.
 
-This is an **internal unsigned preview**: binaries are not signed, SmartScreen may show a warning, and there is no installer, GitHub Release or tag. Opening a watched file for auditing can ask for administrator consent - the launcher never elevates on its own. If a Windows policy blocks execution, report the exact error message; do not disable any security feature to work around it.
+This is an **internal unsigned preview**: binaries are not signed, SmartScreen may show a warning, and there is no installer, GitHub Release or tag. The launcher never shows an elevation prompt on its own. When run normally, outbound connection tracking works while file activity tracking may report itself unavailable because it needs administrator rights; to try that feature you must deliberately start the preview yourself from an elevated terminal. If a Windows policy blocks execution, report the exact error message instead of disabling any security feature.
 
 ## Run locally
 

@@ -19,12 +19,17 @@
 
 .PARAMETER VerifyZipPath
     When set, only verifies an existing ZIP and skips building entirely.
+
+.PARAMETER InjectPublishFailureForTest
+    Test-only switch that makes the win-x64 publish step fail on purpose so
+    the try/finally lock-file restoration can be verified end to end.
 #>
 
 [CmdletBinding()]
 param(
     [string]$OutputDirectory,
-    [string]$VerifyZipPath
+    [string]$VerifyZipPath,
+    [switch]$InjectPublishFailureForTest
 )
 
 $ErrorActionPreference = 'Stop'
@@ -159,35 +164,77 @@ $publishCommon = @(
     '--nologo'
 )
 
-Write-Step 'detaching package lock files for RID-specific publish'
+Write-Step 'restoring solution dependencies (locked mode)'
+& dotnet restore EgressGuard.sln --locked-mode
+if ($LASTEXITCODE -ne 0) { Write-Host '[fail] locked-mode solution restore failed.'; exit 13 }
+
+# The win-x64 publish needs its own dependency graph, which differs from the
+# neutral solution graph. Package lock files are therefore backed up OUTSIDE
+# the repository and always restored in the finally block, byte-for-byte,
+# whether publishing succeeds or fails.
+$tempLockDir = Join-Path ([System.IO.Path]::GetTempPath()) ('EgressGuard-Package-Locks-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $tempLockDir -Force | Out-Null
 $lockBackups = @()
 foreach ($lockRelative in @(git ls-files '*packages.lock.json')) {
     $lockPath = Join-Path $repoRoot $lockRelative
-    if (Test-Path -LiteralPath $lockPath) {
-        $backupPath = $lockPath + '.preview-backup'
+    if (Test-Path -LiteralPath $lockPath -PathType Leaf) {
+        $backupPath = Join-Path $tempLockDir ($lockRelative.Replace('\', '__'))
+        $backupParent = Split-Path -Parent $backupPath
+        if (-not (Test-Path -LiteralPath $backupParent)) {
+            New-Item -ItemType Directory -Path $backupParent -Force | Out-Null
+        }
+
         Copy-Item -LiteralPath $lockPath -Destination $backupPath -Force
         $lockBackups += ,@($lockPath, $backupPath)
     }
 }
 
-Write-Step 'publishing launcher (self-contained win-x64)'
-& dotnet publish (Join-Path $repoRoot 'src\EgressGuard.Launcher\EgressGuard.Launcher.csproj') @publishCommon -o $stage
-if ($LASTEXITCODE -ne 0) { Write-Host '[fail] launcher publish failed.'; exit 10 }
-
-Write-Step 'publishing service (self-contained win-x64)'
-& dotnet publish (Join-Path $repoRoot 'src\EgressGuard.Service\EgressGuard.Service.csproj') @publishCommon -o (Join-Path $stage 'service')
-if ($LASTEXITCODE -ne 0) { Write-Host '[fail] service publish failed.'; exit 11 }
-
-Write-Step 'publishing UI (self-contained win-x64)'
-& dotnet publish (Join-Path $repoRoot 'src\EgressGuard.UI\EgressGuard.UI.csproj') @publishCommon -o (Join-Path $stage 'ui')
-if ($LASTEXITCODE -ne 0) { Write-Host '[fail] UI publish failed.'; exit 12 }
-
-Write-Step 'restoring package lock files'
-foreach ($pair in $lockBackups) {
-    Copy-Item -LiteralPath $pair[1] -Destination $pair[0] -Force
-    Remove-Item -LiteralPath $pair[1] -Force
+$projectsToPublish = @('EgressGuard.Launcher', 'EgressGuard.Service', 'EgressGuard.UI')
+$outputByProject = @{
+    'EgressGuard.Launcher' = $stage
+    'EgressGuard.Service' = (Join-Path $stage 'service')
+    'EgressGuard.UI' = (Join-Path $stage 'ui')
 }
-Write-Host ("[ok  ] restored " + $lockBackups.Count + " package lock file(s).")
+
+$publishFailed = $false
+try {
+    foreach ($projectName in $projectsToPublish) {
+        $projectPath = Join-Path $repoRoot ('src\' + $projectName + '\' + $projectName + '.csproj')
+        Write-Step ("restoring win-x64 graph: " + $projectName)
+        & dotnet restore $projectPath -r win-x64
+        if ($LASTEXITCODE -ne 0) { throw ($projectName + ': win-x64 restore failed.') }
+    }
+
+    if ($InjectPublishFailureForTest) {
+        Write-Step 'INJECTED publish failure requested for verification'
+        & dotnet publish 'Z:\definitely\missing\project.csproj' @publishCommon -o $stage
+        throw ('injected publish failure; dotnet exit code ' + $LASTEXITCODE)
+    }
+
+    foreach ($projectName in $projectsToPublish) {
+        $projectPath = Join-Path $repoRoot ('src\' + $projectName + '\' + $projectName + '.csproj')
+        Write-Step ("publishing without restore: " + $projectName)
+        & dotnet publish $projectPath @publishCommon --no-restore -o $outputByProject[$projectName]
+        if ($LASTEXITCODE -ne 0) { throw ($projectName + ': publish failed.') }
+    }
+}
+catch {
+    $publishFailed = $true
+    Write-Host ('[fail] ' + $_.Exception.Message)
+}
+finally {
+    foreach ($pair in $lockBackups) {
+        Copy-Item -LiteralPath $pair[1] -Destination $pair[0] -Force
+        Remove-Item -LiteralPath $pair[1] -Force
+    }
+    Remove-Item -LiteralPath $tempLockDir -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Host ("[ok  ] package lock files restored byte-for-byte (" + $lockBackups.Count + " file(s)).")
+}
+
+if ($publishFailed) {
+    Write-Host '[fail] one or more publish steps failed.'
+    exit 15
+}
 
 Write-Step 'writing Vietnamese quick-start guide and commit information'
 $guideText = @"
@@ -211,9 +258,12 @@ Dung chuong trinh
 Luu y quan trong
 ----------------
 - Day la BAN DUNG THU CHUA KY SO. Windows SmartScreen co the hien canh bao;
-  day la hanh vi binh thuong voi ung dung chua ky so.
-- Khi mo tep theo doi lan dau tien, Windows co the yeu cau quyen quan tri;
-  trinh khoi dong KHONG tu nang quyen - ban tu quyet dinh.
+  day la hanh vi binh thuong voi ung dung chua ky so. Trinh khoi dong khong
+  tu hien yeu cau quyen quan tri va cung khong tu nang quyen.
+- Khi chay binh thuong, viec theo doi ket noi mang hoat dong day du; tinh
+  nang theo doi tep (ETW) co the bao khong kha dung vi can quyen quan tri.
+- Neu MUON thu theo doi tep, ban tu mo PowerShell/terminal voi quyen quan tri
+  roi tu khoi dong ban dung thu trong cua so do. Quyet dinh nay thuoc ve ban.
 - Neu chinh sach Windows chan ung dung, hay bao cao loi ban thay; khong tat
   bat ky tinh nang bao mat nao cua Windows.
 
