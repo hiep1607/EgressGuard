@@ -22,7 +22,7 @@
 
 .PARAMETER InjectPublishFailureForTest
     Test-only switch that makes the win-x64 publish step fail on purpose so
-    the try/finally lock-file restoration can be verified end to end.
+    the try/finally lock-file integrity check can be verified end to end.
 #>
 
 [CmdletBinding()]
@@ -39,6 +39,104 @@ Set-Location -LiteralPath $repoRoot
 
 function Write-Step([string]$message) {
     Write-Host ('[step] ' + $message)
+}
+
+function Get-TrackedLockFiles {
+    $paths = @(& git ls-files -- '*packages.lock.json')
+    if ($LASTEXITCODE -ne 0) {
+        throw 'git ls-files failed while enumerating tracked package lock files.'
+    }
+
+    return @($paths | Sort-Object)
+}
+
+function Get-RepositoryLockFiles {
+    $paths = @(& git ls-files --cached --others --exclude-standard -- '*packages.lock.json')
+    if ($LASTEXITCODE -ne 0) {
+        throw 'git ls-files failed while enumerating Git-visible package lock files.'
+    }
+
+    return @($paths | Sort-Object)
+}
+
+function New-LockFileSnapshot {
+    $trackedPaths = @(Get-TrackedLockFiles)
+    $repositoryPaths = @(Get-RepositoryLockFiles)
+    $unexpectedPaths = @($repositoryPaths | Where-Object { $trackedPaths -cnotcontains $_ })
+    if ($unexpectedPaths.Count -gt 0) {
+        throw ('untracked package lock file(s) exist before restore: ' + ($unexpectedPaths -join ', '))
+    }
+
+    $hashes = @{}
+    Write-Host ("[lock] tracked package lock files before restore: " + $trackedPaths.Count)
+    foreach ($relativePath in $trackedPaths) {
+        $fullPath = Join-Path $repoRoot $relativePath
+        if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
+            throw ('tracked package lock file is missing before restore: ' + $relativePath)
+        }
+
+        $hash = (Get-FileHash -LiteralPath $fullPath -Algorithm SHA256).Hash
+        $hashes[$relativePath] = $hash
+        Write-Host ("[lock] SHA256 " + $hash + "  " + $relativePath)
+    }
+
+    return [PSCustomObject]@{
+        Paths = $trackedPaths
+        Hashes = $hashes
+    }
+}
+
+function Test-LockFileSnapshot {
+    param([Parameter(Mandatory = $true)]$Snapshot)
+
+    $problems = New-Object System.Collections.Generic.List[string]
+    try {
+        $currentTrackedPaths = @(Get-TrackedLockFiles)
+        foreach ($expectedPath in $Snapshot.Paths) {
+            if ($currentTrackedPaths -cnotcontains $expectedPath) {
+                [void]$problems.Add(('tracked package lock file disappeared from Git: ' + $expectedPath))
+            }
+        }
+        foreach ($currentPath in $currentTrackedPaths) {
+            if ($Snapshot.Paths -cnotcontains $currentPath) {
+                [void]$problems.Add(('new tracked package lock file appeared: ' + $currentPath))
+            }
+        }
+
+        $repositoryPaths = @(Get-RepositoryLockFiles)
+        foreach ($expectedPath in $Snapshot.Paths) {
+            $fullPath = Join-Path $repoRoot $expectedPath
+            if (($repositoryPaths -cnotcontains $expectedPath) -or -not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
+                [void]$problems.Add(('package lock file is missing after build: ' + $expectedPath))
+                continue
+            }
+
+            $currentHash = (Get-FileHash -LiteralPath $fullPath -Algorithm SHA256).Hash
+            if (-not [string]::Equals($Snapshot.Hashes[$expectedPath], $currentHash, [StringComparison]::Ordinal)) {
+                $message = 'package lock file SHA256 changed: ' + $expectedPath +
+                    ' expected=' + $Snapshot.Hashes[$expectedPath] + ' actual=' + $currentHash
+                [void]$problems.Add($message)
+            }
+        }
+        foreach ($currentPath in $repositoryPaths) {
+            if ($Snapshot.Paths -cnotcontains $currentPath) {
+                [void]$problems.Add(('new package lock file appeared after build: ' + $currentPath))
+            }
+        }
+    }
+    catch {
+        [void]$problems.Add(('package lock verification failed: ' + $_.Exception.Message))
+    }
+
+    if ($problems.Count -eq 0) {
+        Write-Host ("[ok  ] package lock files unchanged (" + $Snapshot.Paths.Count + " tracked file(s); exact list and SHA256 match).")
+        return $true
+    }
+
+    foreach ($problem in $problems) {
+        Write-Host ('[fail] ' + $problem)
+    }
+    return $false
 }
 
 $requiredEntries = @(
@@ -164,31 +262,6 @@ $publishCommon = @(
     '--nologo'
 )
 
-Write-Step 'restoring solution dependencies (locked mode, win-x64 graph)'
-& dotnet restore EgressGuard.sln --locked-mode -r win-x64
-if ($LASTEXITCODE -ne 0) { Write-Host '[fail] locked-mode solution restore failed.'; exit 13 }
-
-# The win-x64 publish needs its own dependency graph, which differs from the
-# neutral solution graph. Package lock files are therefore backed up OUTSIDE
-# the repository and always restored in the finally block, byte-for-byte,
-# whether publishing succeeds or fails.
-$tempLockDir = Join-Path ([System.IO.Path]::GetTempPath()) ('EgressGuard-Package-Locks-' + [Guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Path $tempLockDir -Force | Out-Null
-$lockBackups = @()
-foreach ($lockRelative in @(git ls-files '*packages.lock.json')) {
-    $lockPath = Join-Path $repoRoot $lockRelative
-    if (Test-Path -LiteralPath $lockPath -PathType Leaf) {
-        $backupPath = Join-Path $tempLockDir ($lockRelative.Replace('\', '__'))
-        $backupParent = Split-Path -Parent $backupPath
-        if (-not (Test-Path -LiteralPath $backupParent)) {
-            New-Item -ItemType Directory -Path $backupParent -Force | Out-Null
-        }
-
-        Copy-Item -LiteralPath $lockPath -Destination $backupPath -Force
-        $lockBackups += ,@($lockPath, $backupPath)
-    }
-}
-
 $projectsToPublish = @('EgressGuard.Launcher', 'EgressGuard.Service', 'EgressGuard.UI')
 $outputByProject = @{
     'EgressGuard.Launcher' = $stage
@@ -196,8 +269,17 @@ $outputByProject = @{
     'EgressGuard.UI' = (Join-Path $stage 'ui')
 }
 
-$publishFailed = $false
+$lockSnapshot = New-LockFileSnapshot
+$buildExitCode = 0
+$lockFilesUnchanged = $false
 try {
+    Write-Step 'restoring solution dependencies (locked mode, win-x64 graph)'
+    & dotnet restore EgressGuard.sln --locked-mode -r win-x64
+    if ($LASTEXITCODE -ne 0) {
+        $buildExitCode = 13
+        throw 'locked-mode solution restore failed.'
+    }
+
     foreach ($projectName in $projectsToPublish) {
         $projectPath = Join-Path $repoRoot ('src\' + $projectName + '\' + $projectName + '.csproj')
         Write-Step ("restoring win-x64 graph (locked mode): " + $projectName)
@@ -219,21 +301,23 @@ try {
     }
 }
 catch {
-    $publishFailed = $true
+    if ($buildExitCode -eq 0) {
+        $buildExitCode = 15
+    }
     Write-Host ('[fail] ' + $_.Exception.Message)
 }
 finally {
-    foreach ($pair in $lockBackups) {
-        Copy-Item -LiteralPath $pair[1] -Destination $pair[0] -Force
-        Remove-Item -LiteralPath $pair[1] -Force
-    }
-    Remove-Item -LiteralPath $tempLockDir -Recurse -Force -ErrorAction SilentlyContinue
-    Write-Host ("[ok  ] package lock files restored byte-for-byte (" + $lockBackups.Count + " file(s)).")
+    $lockFilesUnchanged = Test-LockFileSnapshot -Snapshot $lockSnapshot
 }
 
-if ($publishFailed) {
+if (-not $lockFilesUnchanged) {
+    Write-Host '[fail] package lock integrity verification failed; no files were restored or overwritten.'
+    exit 16
+}
+
+if ($buildExitCode -ne 0) {
     Write-Host '[fail] one or more publish steps failed.'
-    exit 15
+    exit $buildExitCode
 }
 
 Write-Step 'writing Vietnamese quick-start guide and commit information'
